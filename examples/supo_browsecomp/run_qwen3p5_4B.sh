@@ -180,10 +180,14 @@ CUSTOM_ARGS=(
    # reward_func returns a dict; `score` is the training signal, other keys
    # (n_turns, n_search, n_open, finished, truncated) are rollout diagnostics.
    --reward-key score
-   # reward_post_process aggregates the diagnostic keys into bcplus/* wandb
-   # metrics per rollout batch, then falls through to slime's default GRPO
-   # group-normalized reward math.
+   # reward_post_process runs slime's default GRPO group-normalized advantage
+   # math. It does NOT log wandb — that's done in log_bcplus below, which is
+   # the only hook that receives slime's driver-side rollout_id.
    --custom-reward-post-process-path examples.supo_browsecomp.generate_with_bcplus.reward_post_process
+   # log_bcplus aggregates the reward-dict diagnostic keys into bcplus/*
+   # wandb metrics, using the driver's rollout_id as rollout/step. Called
+   # uniformly for sync and async training paths.
+   --custom-rollout-log-function-path examples.supo_browsecomp.generate_with_bcplus.log_bcplus
 )
 
 MISC_ARGS+=(

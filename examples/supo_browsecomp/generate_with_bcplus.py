@@ -1,9 +1,17 @@
 """Multi-turn ReAct rollout + reward for BrowseComp-Plus, following the SUPO
 paper's workflow="search" recipe (arXiv 2510.11967).
 
-Two callables are exported and wired into slime via:
-    --custom-generate-function-path examples.supo_browsecomp.generate_with_bcplus.generate
-    --custom-rm-path                 examples.supo_browsecomp.generate_with_bcplus.reward_func
+Four callables are exported and wired into slime via:
+    --custom-generate-function-path      examples.supo_browsecomp.generate_with_bcplus.generate
+    --custom-rm-path                     examples.supo_browsecomp.generate_with_bcplus.reward_func
+    --custom-reward-post-process-path    examples.supo_browsecomp.generate_with_bcplus.reward_post_process
+    --custom-rollout-log-function-path   examples.supo_browsecomp.generate_with_bcplus.log_bcplus
+
+log_bcplus is where per-rollout wandb metrics are emitted — it's the only
+hook slime passes the driver's rollout_id to, so it's the correct place for
+wandb ``rollout/step``-aligned logging (works uniformly for sync and async
+training). See rollout_id_data_model.md at the repo root for the full
+mental model.
 
 The BrowseComp-Plus parquet already carries a fully rendered chat prompt (system
 prompt with tool descriptions + user turn with the question and few-shot
@@ -55,6 +63,11 @@ BCPLUS_CONFIGS = {
 
 _SEARCH_SEM = asyncio.Semaphore(BCPLUS_CONFIGS["search_concurrency"])
 _JUDGE_SEM = asyncio.Semaphore(BCPLUS_CONFIGS["judge_concurrency"])
+
+# One-time flag so we register the bcplus/* -> rollout/step binding once per
+# process. Guarded here (not in module import) because wandb.run only exists
+# after slime's init_tracking has run inside this Ray actor.
+_BCPLUS_METRIC_DEFINED = False
 
 # module-level singleton created lazily on first rollout (needs an event loop)
 _SEARCH_CLIENT: AsyncSearchClient | None = None
@@ -543,18 +556,23 @@ async def reward_func(args, sample: Sample, **kwargs) -> dict:
     }
 
 
-def reward_post_process(args, samples):
-    """Custom post-process hook: log rollout diagnostics to wandb, then run
-    slime's default group-normalized GRPO advantage math.
+def log_bcplus(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
+    """Custom rollout log hook wired via ``--custom-rollout-log-function-path``.
 
-    Wired via `--custom-reward-post-process-path`. Runs on Ray driver rank so
-    it's safe to call wandb.log() directly.
+    ``rollout_id`` is slime's driver-side step counter (the true wandb
+    ``rollout/step`` value). It's passed uniformly for sync and async paths, so
+    this hook works identically under both. See rollout_id_data_model.md for
+    why this is the right hook rather than reward_post_process — the latter
+    receives no rollout_id and its ``sample.rollout_id`` is a
+    trajectory-level identifier, not the driver's step counter.
+
+    Returns False so slime's default rollout logging still runs afterwards.
     """
-    import torch
     import wandb
 
-    # 1. Aggregate rollout diagnostics from sample.reward dicts (the primary
-    #    "score" is one of the fields; others are metrics-only).
+    if wandb.run is None:
+        return False
+
     flat_samples = []
     for s in samples:
         if isinstance(s, list):
@@ -576,15 +594,41 @@ def reward_post_process(args, samples):
         else:
             scores.append(float(r) if r is not None else 0.0)
 
-    if diag_count > 0 and wandb.run is not None:
-        log = {f"bcplus/{k}_mean": diag_sums[k] / diag_count for k in diag_keys}
-        log["bcplus/score_mean"] = sum(scores) / len(scores) if scores else 0.0
-        log["bcplus/score_max"] = max(scores) if scores else 0.0
-        log["bcplus/score_hits"] = sum(1 for x in scores if x > 0)
-        log["bcplus/n_samples"] = diag_count
-        wandb.log(log)
+    if diag_count == 0:
+        return False
 
-    # 2. Standard GRPO group-normalized reward (copy of slime's default logic).
+    global _BCPLUS_METRIC_DEFINED
+    if not _BCPLUS_METRIC_DEFINED:
+        wandb.define_metric("bcplus/*", step_metric="rollout/step")
+        _BCPLUS_METRIC_DEFINED = True
+
+    log = {f"bcplus/{k}_mean": diag_sums[k] / diag_count for k in diag_keys}
+    log["bcplus/score_mean"] = sum(scores) / len(scores) if scores else 0.0
+    log["bcplus/score_max"] = max(scores) if scores else 0.0
+    log["bcplus/score_hits"] = sum(1 for x in scores if x > 0)
+    log["bcplus/n_samples"] = diag_count
+    log["rollout/step"] = rollout_id
+    wandb.log(log)
+    return False
+
+
+def reward_post_process(args, samples):
+    """Custom post-process hook wired via ``--custom-reward-post-process-path``.
+
+    Only responsibility: run slime's default group-normalized GRPO advantage
+    math over the reward dicts returned by reward_func. Wandb logging of
+    bcplus diagnostics happens in log_bcplus (custom-rollout-log-function-path)
+    which is the only hook that gets the driver's rollout_id.
+    """
+    import torch
+
+    flat_samples = []
+    for s in samples:
+        if isinstance(s, list):
+            flat_samples.extend(s)
+        else:
+            flat_samples.append(s)
+
     raw_rewards = [s.get_reward_value(args) for s in flat_samples]
     if (
         args.advantage_estimator in ("grpo", "gspo", "cispo", "reinforce_plus_plus_baseline")

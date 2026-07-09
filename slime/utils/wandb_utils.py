@@ -20,11 +20,27 @@ def _is_offline_mode(args) -> bool:
 
 
 def init_wandb_primary(args):
+    """Driver-side wandb bootstrap. No-op body — the training driver process
+    itself does not call wandb.log(). All logging happens from the
+    RolloutManager and Megatron actors, each of which creates its OWN wandb
+    run in init_wandb_secondary(), all joined by shared group=args.wandb_group.
+
+    This avoids the wandb SDK design pitfall where multiple offline processes
+    sharing one run_id have their _step counters collide during `wandb sync`
+    (see aws-cluster/README.md for the full story). wandb officially
+    recommends the multi-run + same-group pattern for distributed logging:
+    https://docs.wandb.ai/guides/track/log/distributed-training/
+
+    We still set args.wandb_run_id = None so downstream code that reads it
+    (currently only init_wandb_secondary) doesn't NameError.
+    """
+    args.wandb_run_id = None
+
     if not args.use_wandb:
-        args.wandb_run_id = None
         return
 
-    # Set W&B mode if specified (overrides WANDB_MODE env var)
+    # Set W&B mode env var if specified (so secondary actors inherit it via
+    # the WANDB_MODE env var if their args.wandb_mode is unset for any reason).
     if args.wandb_mode:
         os.environ["WANDB_MODE"] = args.wandb_mode
         if args.wandb_mode == "offline":
@@ -33,66 +49,6 @@ def init_wandb_primary(args):
             logger.info("W&B disabled mode enabled. No data will be logged.")
         elif args.wandb_mode == "online":
             logger.info("W&B online mode enabled. Data will be uploaded to cloud.")
-
-    offline = _is_offline_mode(args)
-
-    # Only perform explicit login when NOT offline
-    if (not offline) and args.wandb_key is not None:
-        wandb.login(key=args.wandb_key, host=args.wandb_host)
-
-    # Prepare wandb init parameters
-    # add random 6 length string with characters
-    if args.wandb_random_suffix:
-        group = args.wandb_group + "_" + wandb.util.generate_id()
-        run_name = f"{group}-RANK_{args.rank}"
-    else:
-        group = args.wandb_group
-        run_name = args.wandb_group
-
-    # Prepare wandb init parameters
-    init_kwargs = {
-        "entity": args.wandb_team,
-        "project": args.wandb_project,
-        "group": group,
-        "name": run_name,
-        "config": _compute_config_for_logging(args),
-    }
-
-    # Configure settings based on offline/online mode
-    if offline:
-        init_kwargs["settings"] = wandb.Settings(mode="offline")
-    else:
-        init_kwargs["settings"] = wandb.Settings(mode="shared", x_primary=True)
-
-    # Add custom directory if specified
-    if args.wandb_dir:
-        # Ensure directory exists to avoid backend crashes
-        os.makedirs(args.wandb_dir, exist_ok=True)
-        init_kwargs["dir"] = args.wandb_dir
-        logger.info(f"W&B logs will be stored in: {args.wandb_dir}")
-
-    wandb.init(**init_kwargs)
-
-    _init_wandb_common()
-
-    # Set wandb_run_id in args for easy access throughout the training process
-    args.wandb_run_id = wandb.run.id
-
-
-def _compute_config_for_logging(args):
-    output = _args_to_config_dict(args)
-
-    whitelist_env_vars = [
-        "SLURM_JOB_ID",
-        # We may insert more default values here, and may also allow users to configure a whitelist
-    ]
-    output["env_vars"] = {k: v for k, v in os.environ.items() if k in whitelist_env_vars}
-
-    if getattr(args, "use_critic", False):
-        critic_args = _get_role_args_for_logging(args, role="critic")
-        output.update(_prefix_config_keys(_args_to_config_dict(critic_args), "critic"))
-
-    return output
 
 
 def _args_to_config_dict(args):
@@ -103,15 +59,6 @@ def _prefix_config_keys(config, prefix):
     return {f"{prefix}/{key}": value for key, value in config.items()}
 
 
-def _get_role_args_for_logging(args, role):
-    if getattr(args, "megatron_config_path", None) is None:
-        return args
-
-    from slime.utils.arguments import parse_megatron_role_args
-
-    return parse_megatron_role_args(args, args.megatron_config_path, role=role)
-
-
 def _compute_secondary_config_for_logging(args, role=None):
     config = _args_to_config_dict(args)
     if role == "critic":
@@ -119,10 +66,27 @@ def _compute_secondary_config_for_logging(args, role=None):
     return config
 
 
-# https://docs.wandb.ai/guides/track/log/distributed-training/#track-all-processes-to-a-single-run
+# Map slime's role string -> wandb job_type (shown in the group view).
+# role=None: RolloutManager (see slime/ray/rollout.py:457 init_tracking(args, primary=False))
+# role="actor": Megatron train actor (slime/backends/megatron_utils/actor.py:65)
+# role="critic": Megatron critic actor
+_ROLE_TO_JOB_TYPE = {
+    None: "rollout",
+    "actor": "train",
+    "critic": "critic",
+}
+
+
+# https://docs.wandb.ai/guides/track/log/distributed-training/#track-all-processes-independently
 def init_wandb_secondary(args, role=None):
-    wandb_run_id = getattr(args, "wandb_run_id", None)
-    if wandb_run_id is None:
+    """Each Ray actor calls this to create its OWN wandb run, joined to the
+    shared group=args.wandb_group. wandb UI auto-groups runs with matching
+    group names — no manual grouping needed.
+
+    We deliberately do NOT pass id=<shared>/resume="allow" here. See
+    init_wandb_primary docstring and aws-cluster/README.md for why.
+    """
+    if not args.use_wandb:
         return
 
     # Set W&B mode if specified (same as primary)
@@ -134,23 +98,18 @@ def init_wandb_secondary(args, role=None):
     if (not offline) and args.wandb_key is not None:
         wandb.login(key=args.wandb_key, host=args.wandb_host)
 
-    # Configure settings based on offline/online mode
-    if offline:
-        settings_kwargs = dict(mode="offline")
-    else:
-        settings_kwargs = dict(
-            mode="shared",
-            x_primary=False,
-            x_update_finish_state=False,
-        )
+    settings_kwargs = dict(mode="offline") if offline else dict(mode="online")
+
+    job_type = _ROLE_TO_JOB_TYPE.get(role, role or "rollout")
+    run_name = f"{args.wandb_group}-{job_type}"
 
     init_kwargs = {
-        "id": wandb_run_id,
         "entity": args.wandb_team,
         "project": args.wandb_project,
+        "group": args.wandb_group,
+        "job_type": job_type,
+        "name": run_name,
         "config": _compute_secondary_config_for_logging(args, role=role),
-        "resume": "allow",
-        "reinit": True,
         "settings": wandb.Settings(**settings_kwargs),
     }
 

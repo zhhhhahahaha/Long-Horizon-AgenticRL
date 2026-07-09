@@ -11,6 +11,12 @@
 #
 # The API key is read from /home/hhzhang01/.wandb-key (chmod 600). Never
 # passed on the command line or exported into shell history.
+#
+# Uses stock `python3 -m wandb sync`. Slime now creates ONE offline dir per
+# Ray actor (RolloutManager + Megatron), each a distinct wandb run joined by
+# group=RUN_NAME. Cloud UI auto-groups them, no shared run_id / no _step
+# collision. See slime/utils/wandb_utils.py + aws-cluster/README.md for
+# the multi-run-per-group design.
 
 set -eu
 
@@ -39,5 +45,5 @@ if [[ ${#matches[@]} -eq 0 ]]; then
   exit 0
 fi
 
-echo "wandb-sync.sh: syncing ${#matches[@]} run(s)..."
+echo "wandb-sync.sh: syncing ${#matches[@]} offline dir(s) as independent runs..."
 python3 -m wandb sync "${matches[@]}"
