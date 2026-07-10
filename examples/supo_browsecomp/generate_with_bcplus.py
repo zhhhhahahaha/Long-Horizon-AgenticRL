@@ -10,19 +10,24 @@ Four callables are exported and wired into slime via:
 log_bcplus is where per-rollout wandb metrics are emitted — it's the only
 hook slime passes the driver's rollout_id to, so it's the correct place for
 wandb ``rollout/step``-aligned logging (works uniformly for sync and async
-training). See rollout_id_data_model.md at the repo root for the full
+training). See notes/rollout_id_data_model.md at the repo root for the full
 mental model.
 
-The BrowseComp-Plus parquet already carries a fully rendered chat prompt (system
-prompt with tool descriptions + user turn with the question and few-shot
-example), so this file does not re-render prompts. Each rollout turn calls
-SGLang /generate, parses the `<function=...><parameter=...></function>` XML,
-executes it against the search server (or terminates on `finish`), and feeds the
-observation back as a loss-masked user turn until the model finishes / hits
---rollout-max-turns / runs out of budget.
+The BrowseComp-Plus parquet carries the trimmed task-role system prompt +
+user question. We render the initial prompt via ``apply_chat_template(...,
+tools=TOOLS)`` so Qwen3.5's chat template auto-emits the ``<tools>`` schema
+block + ``<tool_call>`` format instructions. Each rollout turn calls
+SGLang /generate with input_ids, parses the
+``<tool_call><function=NAME><parameter=k>v</parameter></function></tool_call>``
+XML, executes it against the search server (or terminates on ``finish``),
+and appends the observation as a hand-shaped ``<tool_response>`` block plus
+the next-turn generation prompt. Loop stops on ``finish`` /
+``--rollout-max-turns`` / length budget.
 
-The reward is the OpenAI judge from the SUPO reference implementation
-(gpt-4o-mini with a gpt-4.1 fallback for near-miss cases).
+The reward is a single-model judge routed through the internal MetaGen gateway
+(default: gpt-5-4-genai-dss4). SUPO's original two-model fallback path
+(gpt-4o-mini primary + gpt-4.1 relaxed-EM fallback) was collapsed because
+our primary is already stronger than SUPO's fallback.
 """
 
 from __future__ import annotations
@@ -33,7 +38,6 @@ import os
 import re
 import unicodedata
 from collections import Counter
-from difflib import SequenceMatcher
 
 import httpx
 
@@ -42,6 +46,7 @@ from slime.utils.http_utils import post
 from slime.utils.types import Sample
 
 from .local_search_client import AsyncSearchClient
+from .tool_schemas import TOOLS
 
 BCPLUS_CONFIGS = {
     "max_turns": int(os.environ.get("BCPLUS_MAX_TURNS", "20")),
@@ -56,7 +61,6 @@ BCPLUS_CONFIGS = {
     # not raw OpenAI ids. Requires LLAMA_API_KEY (a "LLM|..." key) entitled to
     # the target model — see README for the entitlement setup.
     "judge_model": os.environ.get("BCPLUS_JUDGE_MODEL", "gpt-5-4-genai-dss4"),
-    "judge_fallback_model": os.environ.get("BCPLUS_JUDGE_FALLBACK_MODEL", "gpt-5-4-genai-dss4"),
     "judge_base_url": os.environ.get("BCPLUS_JUDGE_BASE_URL", "https://api.llama.com/compat/v1/"),
     "judge_max_retries": 3,
 }
@@ -91,7 +95,15 @@ def _extract_fn_call(text: str) -> list[dict] | None:
         return None
     # strip any inline session-tag markers used by SUPO (harmless otherwise)
     text = re.split(r"<\[[^\]]+\]>", text)[-1].strip()
-    matches = list(re.finditer(r"(?m)^[ \t]*<function=([^>]+)>\s*(.*?)\s*</function>", text, re.DOTALL))
+    # Qwen3.5 official format: <tool_call>\n<function=NAME>...\n</function>\n</tool_call>.
+    # Sampling stops AT </tool_call> (kept via no_stop_trim=True in GenerateState),
+    # so most calls end with the closing tag. Fall back to end-of-string in case
+    # the model emitted a truncated tool call.
+    matches = list(re.finditer(
+        r"<tool_call>\s*<function=([^>]+)>\s*(.*?)\s*</function>\s*(?:</tool_call>|$)",
+        text,
+        re.DOTALL,
+    ))
     if not matches:
         return None
     # group consecutive calls; take the last group (last block emitted by the model)
@@ -107,10 +119,57 @@ def _extract_fn_call(text: str) -> list[dict] | None:
     return [
         {
             "function": m.group(1),
-            "arguments": dict(re.findall(r"<parameter=([^>]+)>(.*?)</parameter>", m.group(2), re.DOTALL)),
+            "arguments": {
+                # Qwen prefers <parameter=k>\n{v}\n</parameter> but the model
+                # doesn't always emit the surrounding newlines. Strip so both
+                # forms produce identical arg values.
+                name: value.strip()
+                for name, value in re.findall(
+                    r"<parameter=([^>]+)>(.*?)</parameter>", m.group(2), re.DOTALL
+                )
+            },
         }
         for m in last
     ]
+
+
+def _wrap_observation_and_reopen_assistant(obs: str) -> str:
+    """Byte-exact reproduction of what Qwen3.5 chat template emits for
+    ``{"role": "tool", "content": obs}`` followed by
+    ``add_generation_prompt=True``.
+
+    Derivation from ``chat_template.jinja`` in the Qwen3.5 checkpoint:
+      * role=tool renders to
+        ``<|im_start|>user\\n<tool_response>\\n{content}\\n</tool_response><|im_end|>\\n``
+        (the template only emits a fresh ``<|im_start|>user`` when the previous
+        message is not also role=tool, which is always true in our loop).
+      * ``add_generation_prompt=True`` appends
+        ``<|im_start|>assistant\\n<think>\\n`` (thinking is on).
+      * A leading ``<|im_end|>\\n`` closes the previous assistant turn — sglang
+        stopped at ``</tool_call>`` so the model did not emit ``<|im_end|>``
+        itself; the template WOULD have appended it at the turn boundary.
+
+    Why hardcoded instead of calling ``apply_chat_template`` each turn:
+    every existing slime multi-turn rollout (retool, search-r1, tau-bench,
+    geo3k) uses token-list append. Re-rendering + re-tokenizing per turn
+    introduces BPE boundary drift (sglang emits token ids autoregressively;
+    tokenizing the decoded conversation as a whole can pick different BPE
+    boundaries at seams) plus chat-template whitespace normalization (Qwen
+    rewrites ``<think>...</think>...`` with fixed ``\\n`` counts). Both would
+    silently desync ``sample.tokens`` from what sglang actually receives.
+    See ``notes/QWEN35_CHAT_FORMAT.md`` for details.
+
+    If Qwen3.5 ever changes the tool-response wrapper or the generation
+    prompt, update this function. Any smoke test's turn-tail print will
+    surface the drift immediately.
+    """
+    return (
+        "<|im_end|>\n"
+        "<|im_start|>user\n"
+        f"<tool_response>\n{obs}\n</tool_response><|im_end|>\n"
+        "<|im_start|>assistant\n"
+        "<think>\n"
+    )
 
 
 def _keep_first_n_words(text: str, n: int) -> str:
@@ -193,18 +252,6 @@ def _em_score(label: str, pred: str) -> bool:
     return head(label) == head(pred)
 
 
-def _relaxed_em(label: str, pred: str) -> bool:
-    strip = lambda s: re.sub(r"\s+", "", _norm(s))
-    if not label or not pred:
-        return False
-    a, b = strip(label), strip(pred)
-    if a == b or a in b or b in a:
-        return True
-    if SequenceMatcher(None, a, b).ratio() >= 0.9:
-        return True
-    ca, cb = Counter(a), Counter(b)
-    return sum((ca & cb).values()) / min(len(a), len(b) or 1) >= 0.9
-
 
 def _extract_q_dict(s: str) -> dict:
     return {k: v.strip() for k, v in re.findall(r"<(q\d+)>(.*?)</\1>", s, flags=re.S)}
@@ -236,7 +283,37 @@ async def _call_openai(messages, model, max_retries=3):
     return ""
 
 
+def _patch_browsecomp_typos(correct_answer: str, predicted_answer: str) -> tuple[str, str]:
+    """Fix three known typos in BrowseComp gold answers before judging.
+
+    BrowseComp (OpenAI's benchmark that BrowseComp-Plus is built on) shipped
+    with 3 misspellings in its gold answers. If the model produces the
+    correct spelling, exact-match scoring fails and the LLM judge is likely
+    to mark it wrong for a "meaningful difference". Rather than mutate the
+    parquet (which would break cross-paper comparability), we normalize
+    inputs to the judge, matching SUPO's `FoldAgent/envs/local_search.py:214-216`.
+
+    Reversed-string checks avoid this function pattern-matching against
+    itself in future edits.
+    """
+    if "tellomS saiboT"[::-1] in correct_answer:
+        correct_answer = correct_answer.replace(
+            "tellomS saiboT"[::-1], "ttellomS saiboT"[::-1]
+        )
+    if "yayhdapattahC najnarawsiB"[::-1] in correct_answer:
+        correct_answer = correct_answer.replace(
+            "yayhdapattahC najnarawsiB"[::-1], "yayhdapottahC najnarawsiB"[::-1]
+        )
+    if "yrtnuoC a fo htaP ehT :sedirelC socfalG"[::-1] in predicted_answer:
+        predicted_answer = predicted_answer.replace(
+            "yrtnuoC a fo htaP ehT :sedirelC socfalG"[::-1],
+            "yrtnuoC a fo htaP ehT :sedirelC sokfalG"[::-1],
+        )
+    return correct_answer, predicted_answer
+
+
 async def _judge_one(question: str, correct_answer: str, predicted_answer: str) -> int:
+    correct_answer, predicted_answer = _patch_browsecomp_typos(correct_answer, predicted_answer)
     if _em_score(correct_answer, predicted_answer):
         return 1
     if not predicted_answer.strip():
@@ -254,10 +331,6 @@ async def _judge_one(question: str, correct_answer: str, predicted_answer: str) 
                 continue
             score = int(bool(g["correct"]))
             break
-        if score == 0 and _relaxed_em(correct_answer, predicted_answer):
-            resp = await _call_openai(messages, model=BCPLUS_CONFIGS["judge_fallback_model"])
-            g = _parse_judge_response(resp)
-            score = int(bool(g.get("correct")))
     return score
 
 
@@ -357,11 +430,13 @@ async def _run_action(fn_calls: list[dict], visited: set[str]) -> tuple[str, str
             else:
                 observation += (
                     "Fail to parse answer. Please resubmit with the correct tool call format, eg\n"
+                    "<tool_call>\n"
                     "<function=finish>\n"
-                    "<parameter=answer>YOUR ANSWER</parameter>\n"
-                    "<parameter=explanation>YOUR EXPLANATION</parameter>\n"
-                    "<parameter=confidence>YOUR CONFIDENCE</parameter>\n"
+                    "<parameter=answer>\nYOUR ANSWER\n</parameter>\n"
+                    "<parameter=explanation>\nYOUR EXPLANATION\n</parameter>\n"
+                    "<parameter=confidence>\nYOUR CONFIDENCE\n</parameter>\n"
                     "</function>\n"
+                    "</tool_call>\n"
                 )
 
         else:
@@ -388,24 +463,31 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     tokenizer = state.tokenizer
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
-    # sample.prompt is a list of chat messages (system + user), rendered to string
-    # via the model's chat template. Re-render with an assistant prefix so the
-    # model directly generates the assistant turn.
-    if isinstance(sample.prompt, list):
-        prompt_text = tokenizer.apply_chat_template(
-            sample.prompt, tokenize=False, add_generation_prompt=True
+    # Initial prompt: render via Qwen chat template with tools=TOOLS so the
+    # template auto-emits the <tools> schema block + <tool_call> format
+    # instructions in the system message. Parquet system prompt is trimmed
+    # to just the task role; the tool teaching comes from here.
+    if not isinstance(sample.prompt, list):
+        raise TypeError(
+            f"BC+ generate expects sample.prompt to be list[dict]; got {type(sample.prompt)}"
         )
-    else:
-        prompt_text = sample.prompt
-
+    prompt_text = tokenizer.apply_chat_template(
+        sample.prompt, tools=TOOLS, tokenize=False, add_generation_prompt=True,
+    )
     prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
     sample.tokens = list(prompt_ids)
     sample.loss_mask = []
     sample.response = ""
 
-    # Stop the sampler at the tool-call boundary so we can inject an observation
-    # without wasting tokens on hallucinated tool responses.
-    stop_tags = ["</function>"]
+    # Track response tokens separately so we can build the input_ids payload
+    # each turn without touching sample.tokens directly. Invariant maintained:
+    # sample.tokens == prompt_ids + response_token_ids at all times.
+    response_token_ids: list[int] = []
+
+    # Stop at </tool_call> (not </function>) so the outer wrapper is complete
+    # when the sampler cuts. no_stop_trim=True (default in GenerateState)
+    # keeps the tag in output["text"] so _extract_fn_call can match it.
+    stop_tags = ["</tool_call>"]
     existing_stop = sampling_params.get("stop") or []
     if isinstance(existing_stop, str):
         existing_stop = [existing_stop]
@@ -419,10 +501,32 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     n_open = 0
     finish_answer: str | None = None
     finish_reason_last: str | None = None
+    _turn = -1  # guard against BCPLUS_MAX_TURNS == 0 (_stash_bcplus reads _turn)
+
+    def _stash_bcplus() -> None:
+        # Called before every return so metadata is populated even on the
+        # abort early-exit path (previously only the normal-completion path
+        # wrote it, and downstream diagnostics under-counted aborts).
+        if not isinstance(sample.metadata, dict):
+            sample.metadata = {}
+        sample.metadata["_bcplus"] = {
+            "n_search": n_search,
+            "n_open": n_open,
+            "finished": finish_answer is not None,
+            "finish_answer": finish_answer or "",
+            "final_stop_reason": finish_reason_last or "",
+            "n_turns_used": _turn + 1,
+        }
+        # slime's log_multi_turn_data picks this up as multi_turn_metric/round_number_*
+        sample.metadata["round_number"] = _turn + 1
 
     for _turn in range(BCPLUS_CONFIGS["max_turns"]):
+        # sglang gets input_ids (not text). The payload is exactly what
+        # sample.tokens equals right now — sglang input ≡ sample.tokens
+        # invariant, no re-tokenization anywhere in the loop.
+        current_ids = list(prompt_ids) + response_token_ids
         payload = {
-            "text": prompt_text + sample.response,
+            "input_ids": current_ids,
             "sampling_params": sampling_params,
             "return_logprob": True,
         }
@@ -432,12 +536,17 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         finish_reason_last = finish_reason
         if finish_reason == "abort":
             sample.status = Sample.Status.ABORTED
+            _stash_bcplus()
             return sample
 
+        # Raw sglang token ids. Never re-tokenize the decoded text — BPE
+        # boundaries in decode+re-tokenize aren't guaranteed to match the
+        # autoregressive sampling boundaries.
         cur_text = output["text"]
         cur_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
         cur_logps = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
 
+        response_token_ids += cur_tokens
         sample.append_response_tokens(
             args,
             tokens=cur_tokens,
@@ -468,29 +577,18 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         if finish_answer is not None:
             break
 
-        # Append the observation to the running response as raw text (loss_mask=0).
-        # We wrap it in a lightweight sentinel so the model can distinguish tool
-        # output from its own reasoning without having to re-run the chat
-        # template every turn. The SUPO reference impl feeds the same wrapping
-        # in the {role: user} conversation position; here we inline it because
-        # slime's SGLang endpoint is token-appending, not chat-history-diffing.
-        obs_wrapped = f"\n\n<observation>\n{observation}\n</observation>\n\n"
+        # Append the observation as the exact byte sequence Qwen chat template
+        # would emit for {role: tool, content: obs} + add_generation_prompt=True.
+        # Tokenized once here and appended raw — this is the only tokenization
+        # step in the loop after the initial prompt render above.
+        obs_wrapped = _wrap_observation_and_reopen_assistant(observation)
         obs_tokens = tokenizer(obs_wrapped, add_special_tokens=False)["input_ids"]
-        sample.append_response_tokens(args, tokens=obs_tokens, trainable=False, text=obs_wrapped)
+        response_token_ids += obs_tokens
+        sample.append_response_tokens(
+            args, tokens=obs_tokens, trainable=False, text=obs_wrapped,
+        )
 
-    # Stash rollout stats on the sample so reward_func / wandb can log them.
-    if not isinstance(sample.metadata, dict):
-        sample.metadata = {}
-    sample.metadata["_bcplus"] = {
-        "n_search": n_search,
-        "n_open": n_open,
-        "finished": finish_answer is not None,
-        "finish_answer": finish_answer or "",
-        "final_stop_reason": finish_reason_last or "",
-        "n_turns_used": _turn + 1,
-    }
-    # slime's log_multi_turn_data picks this up as multi_turn_metric/round_number_*
-    sample.metadata["round_number"] = _turn + 1
+    _stash_bcplus()
 
     match finish_reason_last:
         case "length":
@@ -561,7 +659,7 @@ def log_bcplus(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
 
     ``rollout_id`` is slime's driver-side step counter (the true wandb
     ``rollout/step`` value). It's passed uniformly for sync and async paths, so
-    this hook works identically under both. See rollout_id_data_model.md for
+    this hook works identically under both. See notes/rollout_id_data_model.md for
     why this is the right hook rather than reward_post_process — the latter
     receives no rollout_id and its ``sample.rollout_id`` is a
     trajectory-level identifier, not the driver's step counter.

@@ -43,6 +43,27 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
         fi
     fi
 
+    # Auto-discover the sglang rollout server (external). launch_all.sh calls
+    # launch_sglang_server.sh first, which writes hostname:port to HOST_FILE.
+    if [[ -z "${SGLANG_SERVER_URL:-}" ]]; then
+        HOST_FILE=/genai/fsx-project/hhzhang01/logs/sglang-server.hostname
+        if [[ -f "${HOST_FILE}" ]]; then
+            SGL_TARGET=$(cat "${HOST_FILE}")
+            if curl -sf --max-time 5 "http://${SGL_TARGET}/health" > /dev/null; then
+                export SGLANG_SERVER_URL="http://${SGL_TARGET}"
+                echo "auto-discovered SGLANG_SERVER_URL=${SGLANG_SERVER_URL}"
+            else
+                echo "ERROR: sglang server at ${SGL_TARGET} not responding." >&2
+                echo "       Run examples/supo_browsecomp/launch_sglang_server.sh first." >&2
+                exit 1
+            fi
+        else
+            echo "ERROR: SGLANG_SERVER_URL not set and ${HOST_FILE} missing." >&2
+            echo "       Run examples/supo_browsecomp/launch_sglang_server.sh first." >&2
+            exit 1
+        fi
+    fi
+
     export RUN_NAME="${RUN_NAME:-supo-bcplus-qwen3p5-4b-smoke-$(date +%Y%m%d-%H%M)}"
     echo "RUN_NAME=${RUN_NAME}"
 
@@ -51,6 +72,10 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
     SLURM_ACCOUNT="${SLURM_ACCOUNT:-genai_interns}"
     QOS="${QOS:-a100_genai_shared}"
     TRAIN_WALLTIME="${TRAIN_WALLTIME:-24:00:00}"
+    # TRAIN_LOG_PATH lets launch_all.sh route this into the per-run log dir.
+    # Fall back to the legacy top-level path when not set.
+    TRAIN_LOG_PATH="${TRAIN_LOG_PATH:-/genai/fsx-project/hhzhang01/logs/${RUN_NAME}.log}"
+    mkdir -p "$(dirname "${TRAIN_LOG_PATH}")"
 
     exec srun \
         --nodes=1 --gpus-per-node=8 --ntasks-per-node=1 --exclusive \
@@ -59,7 +84,7 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
         --time="${TRAIN_WALLTIME}" \
         --mpi=none \
         --job-name="${RUN_NAME}" \
-        --output="/genai/fsx-project/hhzhang01/logs/${RUN_NAME}.log" \
+        --output="${TRAIN_LOG_PATH}" \
         bash -c "
             ENROOT_TEMP_PATH=/dev/shm \
             ENROOT_DATA_PATH=/storage/home/hhzhang01/.local/share/enroot \
@@ -72,6 +97,7 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
                 --env RUN_NAME='${RUN_NAME}' \
                 --env SLIME_INNER=1 \
                 --env LOCAL_SEARCH_URL='${LOCAL_SEARCH_URL}' \
+                --env SGLANG_SERVER_URL='${SGLANG_SERVER_URL}' \
                 --env LLAMA_API_KEY='${LLAMA_API_KEY}' \
                 ${ENROOT_ROOTFS} \
                 bash /slime/examples/supo_browsecomp/run_qwen3p5_4B.sh
@@ -83,6 +109,7 @@ fi
 # ---------------------------------------------------------------------------
 : "${RUN_NAME:?RUN_NAME must be set (populated by outer part)}"
 : "${LOCAL_SEARCH_URL:?LOCAL_SEARCH_URL must be forwarded into the container}"
+: "${SGLANG_SERVER_URL:?SGLANG_SERVER_URL must be forwarded into the container}"
 : "${LLAMA_API_KEY:?LLAMA_API_KEY must be forwarded into the container}"
 
 pkill -9 sglang || true
@@ -115,7 +142,11 @@ ROLLOUT_ARGS=(
    --input-key prompt
    --label-key answer
    --metadata-key extra_info
-   --apply-chat-template
+   # NOTE: no --apply-chat-template flag. Our generate() function calls
+   # apply_chat_template(tools=TOOLS) itself so Qwen3.5's <tools> schema block
+   # + <tool_call> format instructions get injected into the system message.
+   # If slime pre-renders, the tools argument is dropped and the model won't
+   # know the tool schemas.
    --rollout-shuffle
    --num-rollout 20
    --rollout-batch-size 8
@@ -127,10 +158,15 @@ ROLLOUT_ARGS=(
 )
 
 PERF_ARGS=(
+   # Actor is 8 GPUs (external SGLang lives on a separate slurm job/node).
+   # TP=4 × CP=2 × PP=1 × DP=1 = 8. CP splits each sample along the seq
+   # dimension across 2 ranks (ring attention keeps context correct), which
+   # halves activation memory per rank — necessary because rollouts can
+   # reach 32k tokens (--rollout-max-response-len 32768).
    --tensor-model-parallel-size 4
    --sequence-parallel
    --pipeline-model-parallel-size 1
-   --context-parallel-size 1
+   --context-parallel-size 2
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 2
@@ -146,6 +182,17 @@ GRPO_ARGS=(
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
+   # Truncated Importance Sampling (Yao et al., https://fengyao.notion.site/off-policy-rl).
+   # Corrects for train/rollout distribution mismatch when the Megatron actor
+   # and the external SGLang sampler produce different token-level probabilities
+   # for the same context. Per-token IS ratio exp(log π_train - log π_rollout)
+   # is clamped to [tis-clip-low, tis-clip] and multiplied onto pg_loss.
+   # Both clip values below are the argparse defaults — pinned here so the
+   # training config is self-documenting.
+   # Adds train/tis, train/tis_abs, train/tis_clipfrac, train/ois to wandb.
+   --use-tis
+   --tis-clip 2.0
+   --tis-clip-low 0.0
 )
 
 OPTIMIZER_ARGS=(
@@ -158,11 +205,12 @@ OPTIMIZER_ARGS=(
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 4
-   --sglang-mem-fraction-static 0.85
-   # Custom all-reduce fails on this cluster's A100 topology at tp=4
-   # ("custom_all_reduce.cuh:37: CUDA error: invalid argument" during CUDA
-   # graph capture). Fall back to NCCL all-reduce.
+   # External SGLang: rollout runs on a separate slurm job (see
+   # launch_sglang_server.sh). Slime auto-discovers tp size etc. from the
+   # server's /get_server_info. Weight sync goes via NCCL over InfiniBand.
+   --rollout-external-engine-addrs "${SGLANG_SERVER_URL}"
+   # Server-side we set --disable-custom-all-reduce; slime's external-engine
+   # sanity check compares this field, so we must set it here too.
    --sglang-disable-custom-all-reduce
 )
 
@@ -208,9 +256,11 @@ RUNTIME_ENV_JSON="{
   \"env_vars\": {
     \"PYTHONPATH\": \"/root/Megatron-LM/:/slime\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
+    \"PYTORCH_CUDA_ALLOC_CONF\": \"expandable_segments:True\",
     \"LOCAL_SEARCH_URL\": \"${LOCAL_SEARCH_URL}\",
+    \"SGLANG_SERVER_URL\": \"${SGLANG_SERVER_URL}\",
     \"LLAMA_API_KEY\": \"${LLAMA_API_KEY}\",
-    \"BCPLUS_MAX_TURNS\": \"5\"
+    \"BCPLUS_MAX_TURNS\": \"64\"
   }
 }"
 
@@ -218,8 +268,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train.py \
    --actor-num-nodes 1 \
-   --actor-num-gpus-per-node 4 \
-   --rollout-num-gpus 4 \
+   --actor-num-gpus-per-node 8 \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \
