@@ -103,6 +103,39 @@ FINISH_SCHEMA = {
 
 TOOLS = [SEARCH_SCHEMA, OPEN_PAGE_SCHEMA, FINISH_SCHEMA]
 
+# Future-facing: compress is not yet exposed to the model. When we later
+# support model-driven compression (policy decides *when* to summarize), we
+# will add this to TOOLS and _run_action will grow a `compress` branch that
+# routes the model's summary through the same _start_new_subtrajectory hook
+# the heuristic path already uses. For now the heuristic in generate() emits
+# a bare <summary>...</summary> block instead of a <tool_call>, but the sub-
+# trajectory data model is identical, so migration will be a small delta.
+COMPRESS_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "compress",
+        "description": (
+            "Compress the context by producing a summary of the work so far. Use "
+            "this when the context is getting long and you want to continue with "
+            "just the essential state."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": (
+                        "A comprehensive summary of the work so far, including the "
+                        "original question, key verified findings with docids, and "
+                        "the next tactical step."
+                    ),
+                },
+            },
+            "required": ["summary"],
+        },
+    },
+}
+
 QWEN_SYSTEM_PROMPT = (
     "You are an expert research agent focused on comprehensive research strategy, "
     "execution, and final report writing. Your core goal is to be maximally helpful "

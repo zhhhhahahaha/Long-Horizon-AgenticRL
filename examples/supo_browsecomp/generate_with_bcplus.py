@@ -24,6 +24,22 @@ and appends the observation as a hand-shaped ``<tool_response>`` block plus
 the next-turn generation prompt. Loop stops on ``finish`` /
 ``--rollout-max-turns`` / length budget.
 
+**Context compression (SUPO paper's session-folding mechanism)**: when a
+sub-trajectory's total context length (prompt + accumulated response) exceeds
+``BCPLUS_COMPRESS_THRESH`` fraction of ``--rollout-max-context-len`` and we
+have not hit ``BCPLUS_MAX_SUB_TRAJS``, the current sub-trajectory closes out
+with a ``<summary>...</summary>`` block produced by the policy itself (SUPO's
+``SUMMARY_PROMPT_SEARCH``), and a fresh sub-trajectory opens with only the
+original question + the summary as its starting context. Each sub-trajectory
+is a separate training ``Sample``; all siblings from the same rollout
+invocation share ``rollout_id`` (matches
+``slime/rollout/_fanout_test_helpers.py``) so slime's per-rollout loss
+aggregation and DP scheduling group them correctly. The final sibling's
+outcome reward is broadcast to all siblings in ``reward_post_process``, which
+also implements SUPO's FOLDGRPO grouping (per-prompt ``group_index`` mean/std
+with ``rollout_id`` dedup, so a rollout with N sub-trajs still contributes
+one reward to the group statistics).
+
 The reward is a single-model judge routed through the internal MetaGen gateway
 (default: gpt-5-4-genai-dss4). SUPO's original two-model fallback path
 (gpt-4o-mini primary + gpt-4.1 relaxed-EM fallback) was collapsed because
@@ -49,7 +65,7 @@ from .local_search_client import AsyncSearchClient
 from .tool_schemas import TOOLS
 
 BCPLUS_CONFIGS = {
-    "max_turns": int(os.environ.get("BCPLUS_MAX_TURNS", "20")),
+    "max_turns": int(os.environ.get("BCPLUS_MAX_TURNS", "64")),
     "search_topk_default": 10,
     "search_topk_cap": 20,
     "doc_words_snippet": 512,  # matches SUPO reference impl (search result snippet)
@@ -63,6 +79,12 @@ BCPLUS_CONFIGS = {
     "judge_model": os.environ.get("BCPLUS_JUDGE_MODEL", "gpt-5-4-genai-dss4"),
     "judge_base_url": os.environ.get("BCPLUS_JUDGE_BASE_URL", "https://api.llama.com/compat/v1/"),
     "judge_max_retries": 3,
+    # Context-compression triggers a new sub-trajectory when total context
+    # length (prompt + accumulated response) exceeds this fraction of
+    # --rollout-max-context-len. See module docstring above.
+    "compress_length_threshold": float(os.environ.get("BCPLUS_COMPRESS_THRESH", "0.85")),
+    # Hard cap on sub-trajectories per rollout. Matches SUPO's max_session=5.
+    "max_sub_trajs": int(os.environ.get("BCPLUS_MAX_SUB_TRAJS", "5")),
 }
 
 _SEARCH_SEM = asyncio.Semaphore(BCPLUS_CONFIGS["search_concurrency"])
@@ -170,6 +192,127 @@ def _wrap_observation_and_reopen_assistant(obs: str) -> str:
         "<|im_start|>assistant\n"
         "<think>\n"
     )
+
+
+# ---------------------------------------------------------------------------
+# Context compression (SUPO session-folding)
+# ---------------------------------------------------------------------------
+
+# Verbatim from FoldAgent/agents/prompts.py::SUMMARY_PROMPT_SEARCH. This is
+# what the policy is asked to emit when the current sub-trajectory's context
+# is about to overflow. The model writes a summary inside <summary>...
+# </summary> tags; the summary becomes the ONLY context of the next sub-
+# trajectory (plus the original question).
+_COMPRESS_PROMPT = """Your operational context is full. Generate a concise handover summary by populating the template below. This summary will be your **sole context** for continuing this task. Be brief but ensure all critical data is present.
+
+---
+
+### **`// RESEARCH STATE HANDOVER //`**
+
+**1. Mission Objective**
+* **Original Query:** [State the user's verbatim query.]
+* **Verification Checklist:**
+    * `[Status]` [Checklist Item 1]
+    * `[Status]` [Checklist Item 2]
+    * ... (List all items with status: `[VERIFIED]`, `[PENDING]`, etc.)
+
+**2. Key Findings**
+* [List the most critical, verified facts with sources.]
+    * **Fact:** ... **Sources:** [docid)
+    * **Fact:** ... **Sources:** [docid)
+* **Discrepancies:** [Note any conflicting information found between sources.]
+
+**3. Tactical Plan**
+* **Promising Leads:** [List the best remaining keywords, sources, or angles to investigate.]
+* **Known Dead Ends:** [List queries or sources that proved useless to avoid repetition.]
+* **Immediate Next Action:** [State the exact tool call or query you were about to execute next.]
+
+Now generate the summary, and put your summary inside tag
+<summary>
+</summary>"""
+
+
+def _wrap_summary_request_and_reopen_assistant(prompt: str) -> str:
+    """Same shape as _wrap_observation_and_reopen_assistant but for a user turn
+    carrying the summary request (not a tool response).
+
+    Byte layout when appended after an existing assistant turn that stopped at
+    </tool_call>:
+        <|im_end|>\\n        # close the previous assistant turn
+        <|im_start|>user\\n{prompt}<|im_end|>\\n
+        <|im_start|>assistant\\n<think>\\n
+    """
+    return (
+        "<|im_end|>\n"
+        f"<|im_start|>user\n{prompt}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+        "<think>\n"
+    )
+
+
+def _extract_summary(text: str) -> str | None:
+    """Return the (last) <summary>...</summary> body, stripped, or None.
+
+    Matches SUPO's extract_summary at FoldAgent/agents/fold_agent.py:38.
+    """
+    if not text:
+        return None
+    matches = re.findall(r"<summary>(.*?)</summary>", text, re.DOTALL)
+    return matches[-1].strip() if matches else None
+
+
+def _extract_original_question(user_content: str) -> str:
+    """Pull the "Question: ..." block out of the parquet user turn so we can
+    inline it into the continuation prompt for a compressed sub-trajectory.
+
+    The parquet user template is:
+        "You are a deep research agent... Please perform reasoning ...\\n\\n
+         Question: {THIS_SAMPLE_QUESTION}\\n\\n
+         Your response should contain:\\n..."
+
+    We slice everything between "Question:" and the next double newline that
+    starts the "Your response should contain:" preamble. If the pattern
+    doesn't match (defensive), fall back to the whole user content.
+    """
+    m = re.search(r"Question:\s*(.*?)\n\nYour response should contain:", user_content, re.DOTALL)
+    if not m:
+        return user_content
+    return m.group(1).strip()
+
+
+def _build_continuation_chat(original_prompt: list[dict], summary: str) -> list[dict]:
+    """Build the chat message list for a fresh sub-trajectory whose only
+    context is the original question + the summary of prior work.
+
+    Reuses the original system prompt (parquet's trimmed task-role blurb)
+    verbatim so tools=TOOLS injection is identical to the initial rollout.
+    The user turn is a rewritten prompt telling the model it's continuing
+    from a summary.
+    """
+    if not isinstance(original_prompt, list) or len(original_prompt) < 2:
+        raise ValueError(f"Expected original_prompt to be a [system, user] list; got {original_prompt!r}")
+    system_msg = original_prompt[0]
+    user_msg = original_prompt[1]
+    question = _extract_original_question(user_msg["content"])
+    continuation_user = (
+        "You are a deep research agent. You are continuing a task from a previous "
+        "session that had to hand off context due to length. The summary below "
+        "is your **sole context** for this session.\n\n"
+        f"Question: {question}\n\n"
+        "### Previous session summary\n\n"
+        f"{summary}\n\n"
+        "Your response should contain:\n"
+        "Explanation: {your explanation for your final answer. For this explanation section only, "
+        "you should cite your evidence documents inline by enclosing their docids in square "
+        "brackets [] at the end of sentences. For example, [20].}\n"
+        "Exact Answer: {your succinct, final answer}\n"
+        "Confidence: {your confidence score between 0% and 100% for your answer}\n\n"
+        "Use finish tool to submit your answer."
+    )
+    return [
+        {"role": "system", "content": system_msg["content"]},
+        {"role": "user", "content": continuation_user},
+    ]
 
 
 def _keep_first_n_words(text: str, n: int) -> str:
@@ -353,15 +496,19 @@ async def _judge(question: str, correct_answer: str, predicted_answer: str) -> f
 # ---------------------------------------------------------------------------
 
 
-async def _run_action(fn_calls: list[dict], visited: set[str]) -> tuple[str, str | None]:
-    """Return (observation_text, finish_answer_or_None).
+async def _run_action(fn_calls: list[dict], visited: set[str]) -> tuple[str, str | None, bool]:
+    """Return (observation_text, finish_answer_or_None, had_effective_call).
 
     finish_answer_or_None is a non-empty string only if the model called
     <function=finish>. observation_text is what we should append back as the
     user turn (empty string if the trajectory is now terminal).
+    had_effective_call is True iff at least one fn in fn_calls dispatched a
+    real action (successful search / open_page / non-empty finish). False
+    when every call was rejected for bad args, unknown name, or empty finish.
     """
     observation = ""
     finish_answer: str | None = None
+    had_effective_call = False
     client = _search_client()
     for fn in fn_calls:
         name = fn["function"]
@@ -381,6 +528,7 @@ async def _run_action(fn_calls: list[dict], visited: set[str]) -> tuple[str, str
             async with _SEARCH_SEM:
                 # request k=50 upstream then dedup-by-visited like SUPO does
                 serp = await client.search(query, 50)
+            had_effective_call = True
             shown = 0
             for i, page in enumerate(serp, 1):
                 if page["docid"] in visited:
@@ -413,6 +561,7 @@ async def _run_action(fn_calls: list[dict], visited: set[str]) -> tuple[str, str
                 continue
             async with _SEARCH_SEM:
                 opened = await client.open(url=url, docid=docid)
+            had_effective_call = True
             for page in opened:
                 text = _keep_first_n_words(page.get("text", ""), BCPLUS_CONFIGS["doc_words_full"])
                 observation += (
@@ -427,6 +576,7 @@ async def _run_action(fn_calls: list[dict], visited: set[str]) -> tuple[str, str
             answer = args.get("answer", "")
             if answer.strip():
                 finish_answer = answer
+                had_effective_call = True
             else:
                 observation += (
                     "Fail to parse answer. Please resubmit with the correct tool call format, eg\n"
@@ -448,7 +598,7 @@ async def _run_action(fn_calls: list[dict], visited: set[str]) -> tuple[str, str
             "additional information if we still can not answer the question. Do not give the "
             "answer if the information is still not enough."
         )
-    return observation.strip(), finish_answer
+    return observation.strip(), finish_answer, had_effective_call
 
 
 # ---------------------------------------------------------------------------
@@ -456,17 +606,132 @@ async def _run_action(fn_calls: list[dict], visited: set[str]) -> tuple[str, str
 # ---------------------------------------------------------------------------
 
 
-async def generate(args, sample: Sample, sampling_params) -> Sample:
-    assert not args.partial_rollout, "partial_rollout not supported for BC+ generate."
+def _stash_bcplus(sample: Sample, stats: dict) -> None:
+    """Populate ``sample.metadata['_bcplus']`` and ``round_number``.
 
+    Called from every exit path of ``_run_one_sub_trajectory`` (normal, length,
+    abort, compressed) so the sub-trajectory always carries its stats even on
+    early-return paths. ``stats`` fields: n_search, n_open, finished,
+    finish_answer, final_stop_reason, n_turns_used, outcome, summary.
+    """
+    if not isinstance(sample.metadata, dict):
+        sample.metadata = {}
+    sample.metadata["_bcplus"] = dict(stats)
+    # slime's log_multi_turn_data picks this up as multi_turn_metric/round_number_*
+    sample.metadata["round_number"] = stats.get("n_turns_used", 0)
+
+
+async def _do_compression(
+    args,
+    tokenizer,
+    url: str,
+    sample: Sample,
+    sampling_params: dict,
+    prompt_ids: list[int],
+    response_token_ids: list[int],
+) -> tuple[str | None, int]:
+    """Run the SUPO summary-generation turn on the current sub-trajectory.
+
+    Appends the summary request + policy summary output to the current
+    sub-trajectory's tokens/loss_mask (loss_mask=0 for the request, =1 for
+    the model's summary — the model IS learning to summarize).
+
+    Returns ``(summary_or_None, extra_tokens_added)``. ``summary`` is None if
+    extraction failed. ``extra_tokens_added`` is the count added to
+    ``response_token_ids`` this call so the caller can update its running
+    length tracker.
+    """
+    added_tokens_start = len(response_token_ids)
+
+    # Step 1: append the summary request as a user turn (loss_mask=0). Uses
+    # the same wrapper shape as tool-response injection except with a plain
+    # user message instead of a <tool_response> block.
+    request_wrapped = _wrap_summary_request_and_reopen_assistant(_COMPRESS_PROMPT)
+    request_tokens = tokenizer(request_wrapped, add_special_tokens=False)["input_ids"]
+    response_token_ids.extend(request_tokens)
+    sample.append_response_tokens(
+        args, tokens=request_tokens, trainable=False, text=request_wrapped,
+    )
+
+    # Step 2: sglang generation for the summary. Stop tags:
+    #   - </summary>: canonical case, model closed the summary block
+    #   - </tool_call>: model chose to emit a tool call instead of a summary
+    #     (heuristic-forced compression is against the model's will; we want
+    #     to catch it and fall back to using the raw text as summary rather
+    #     than letting it burn all remaining budget writing tool calls).
+    summary_sampling_params = {**sampling_params, "stop": ["</summary>", "</tool_call>"]}
+    current_ids = list(prompt_ids) + response_token_ids
+    payload = {
+        "input_ids": current_ids,
+        "sampling_params": summary_sampling_params,
+        "return_logprob": True,
+    }
+    output = await post(url, payload)
+
+    if output["meta_info"]["finish_reason"]["type"] == "abort":
+        # Treat abort during summarization as compression failure.
+        return None, len(response_token_ids) - added_tokens_start
+
+    # TEMP DEBUG (remove after smoke-test verify)
+    _summary_text_debug = output["text"]
+    print(
+        f"[BC+ COMPRESS DEBUG] _do_compression sglang finish_reason={output['meta_info']['finish_reason']['type']!r} "
+        f"raw cur_text[:400]={_summary_text_debug[:400]!r}",
+        flush=True,
+    )
+
+    cur_text = output["text"]
+    cur_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
+    cur_logps = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+    response_token_ids.extend(cur_tokens)
+    sample.append_response_tokens(
+        args,
+        tokens=cur_tokens,
+        log_probs=cur_logps,
+        trainable=True,
+        meta_info=output["meta_info"],
+        text=cur_text,
+    )
+
+    # Extract the summary. Matches SUPO fold_agent.py:139's
+    # `summary = extract_summary(response) or response` — if the model didn't
+    # emit <summary> tags, fall back to using the entire cur_text as the
+    # summary. This handles the common case where the policy under thinking
+    # spends its response inside <think>...</think> and never gets to open
+    # the <summary> block; we still pass forward *something* the next sub-
+    # trajectory can build on.
+    summary = _extract_summary(cur_text)
+    if summary is None and cur_text.strip():
+        # Strip the <think> block if present so the summary is just the visible
+        # output the model wrote after thinking.
+        without_think = re.sub(r"^.*?</think>\s*", "", cur_text, count=1, flags=re.DOTALL)
+        summary = (without_think if without_think.strip() else cur_text).strip()
+    return summary, len(response_token_ids) - added_tokens_start
+
+
+async def _run_one_sub_trajectory(
+    args,
+    sample: Sample,
+    sampling_params: dict,
+) -> str:
+    """Run the ReAct loop for a single sub-trajectory in-place on ``sample``.
+
+    Populates ``sample.tokens``, ``sample.loss_mask``, ``sample.response``,
+    ``sample.metadata['_bcplus']`` (via ``_stash_bcplus``), and ``sample.status``.
+
+    Returns an outcome tag: one of ``"finished"``, ``"truncated"``, ``"aborted"``,
+    ``"compressed"``, ``"compress_failed"``. The parent ``generate`` uses this
+    to decide whether to open a fresh sub-trajectory.
+
+    Loop terminates early with outcome ``"compressed"`` if the response length
+    exceeds ``compress_length_threshold * rollout_max_context_len``, in which
+    case a summary is generated inline and stashed at
+    ``sample.metadata['_bcplus']['summary']``.
+    """
     state = GenerateState(args)
     tokenizer = state.tokenizer
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
-    # Initial prompt: render via Qwen chat template with tools=TOOLS so the
-    # template auto-emits the <tools> schema block + <tool_call> format
-    # instructions in the system message. Parquet system prompt is trimmed
-    # to just the task role; the tool teaching comes from here.
     if not isinstance(sample.prompt, list):
         raise TypeError(
             f"BC+ generate expects sample.prompt to be list[dict]; got {type(sample.prompt)}"
@@ -479,14 +744,9 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.loss_mask = []
     sample.response = ""
 
-    # Track response tokens separately so we can build the input_ids payload
-    # each turn without touching sample.tokens directly. Invariant maintained:
-    # sample.tokens == prompt_ids + response_token_ids at all times.
     response_token_ids: list[int] = []
 
-    # Stop at </tool_call> (not </function>) so the outer wrapper is complete
-    # when the sampler cuts. no_stop_trim=True (default in GenerateState)
-    # keeps the tag in output["text"] so _extract_fn_call can match it.
+    # Stop at </tool_call> for tool-call turns (no_stop_trim=True keeps the tag).
     stop_tags = ["</tool_call>"]
     existing_stop = sampling_params.get("stop") or []
     if isinstance(existing_stop, str):
@@ -496,34 +756,62 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         "stop": list(dict.fromkeys([*existing_stop, *stop_tags])),
     }
 
+    # Compression trigger: full-context length (prompt + accumulated response)
+    # exceeds `compress_length_threshold * rollout_max_context_len`. We use
+    # rollout_max_context_len (not rollout_max_response_len) because:
+    #   * rollout_max_response_len is sglang's per-call max_new_tokens, NOT a
+    #     cumulative response cap across turns
+    #   * rollout_max_context_len is slime's convention for "total context
+    #     budget per sample" — retool/geo3k/coding_agent_rl all use it for
+    #     accumulated-length checks (see retool/generate_with_retool.py:244-247)
+    # We require it to be set explicitly (no fallback to cp*max_tokens_per_gpu
+    # like retool) because a silent fallback risks a wrong-sized budget.
+    assert args.rollout_max_context_len is not None, (
+        "BC+ compression trigger requires --rollout-max-context-len to be set "
+        "explicitly. It caps the total prompt+response budget per sample and "
+        "governs when compression fires."
+    )
+    compress_threshold_tokens = int(
+        BCPLUS_CONFIGS["compress_length_threshold"] * args.rollout_max_context_len
+    )
+
     visited_docs: set[str] = set()
     n_search = 0
     n_open = 0
+    # Count turns where the model failed to dispatch a valid tool call:
+    # parse fail (no <tool_call>), unknown function name, missing required
+    # args (search/query, open_page/url|docid), or empty-answer finish.
+    # A single turn counts at most once even if _run_action reports multiple
+    # errors — we care about "this turn produced zero effective tool calls".
+    n_bad_tool_calls = 0
+    # Count turns where the search server side failed us in any way — HTTP
+    # errors, timeouts, malformed 200 responses (missing keys / bad JSON),
+    # client bugs, anything except asyncio.CancelledError. This is the
+    # "search server health" signal, kept separate from n_bad_tool_calls so
+    # the model-side and server-side failure modes stay distinguishable.
+    n_search_server_error = 0
     finish_answer: str | None = None
     finish_reason_last: str | None = None
-    _turn = -1  # guard against BCPLUS_MAX_TURNS == 0 (_stash_bcplus reads _turn)
+    summary_from_compress: str | None = None
+    outcome: str = "unknown"
+    _turn = -1
 
-    def _stash_bcplus() -> None:
-        # Called before every return so metadata is populated even on the
-        # abort early-exit path (previously only the normal-completion path
-        # wrote it, and downstream diagnostics under-counted aborts).
-        if not isinstance(sample.metadata, dict):
-            sample.metadata = {}
-        sample.metadata["_bcplus"] = {
+    def _stash():
+        _stash_bcplus(sample, {
             "n_search": n_search,
             "n_open": n_open,
+            "n_bad_tool_calls": n_bad_tool_calls,
+            "n_search_server_error": n_search_server_error,
             "finished": finish_answer is not None,
             "finish_answer": finish_answer or "",
             "final_stop_reason": finish_reason_last or "",
             "n_turns_used": _turn + 1,
-        }
-        # slime's log_multi_turn_data picks this up as multi_turn_metric/round_number_*
-        sample.metadata["round_number"] = _turn + 1
+            "outcome": outcome,
+            "summary": summary_from_compress,
+            "response_len_tokens": len(response_token_ids),
+        })
 
     for _turn in range(BCPLUS_CONFIGS["max_turns"]):
-        # sglang gets input_ids (not text). The payload is exactly what
-        # sample.tokens equals right now — sglang input ≡ sample.tokens
-        # invariant, no re-tokenization anywhere in the loop.
         current_ids = list(prompt_ids) + response_token_ids
         payload = {
             "input_ids": current_ids,
@@ -536,12 +824,10 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         finish_reason_last = finish_reason
         if finish_reason == "abort":
             sample.status = Sample.Status.ABORTED
-            _stash_bcplus()
-            return sample
+            outcome = "aborted"
+            _stash()
+            return outcome
 
-        # Raw sglang token ids. Never re-tokenize the decoded text — BPE
-        # boundaries in decode+re-tokenize aren't guaranteed to match the
-        # autoregressive sampling boundaries.
         cur_text = output["text"]
         cur_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
         cur_logps = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
@@ -557,11 +843,15 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         )
 
         if finish_reason == "length":
-            break
+            sample.status = Sample.Status.TRUNCATED
+            outcome = "truncated"
+            _stash()
+            return outcome
 
         fn_calls = _extract_fn_call(cur_text)
         if not fn_calls:
             observation = "No function call was detected in the model response."
+            n_bad_tool_calls += 1
         else:
             for fn in fn_calls:
                 if fn["function"] == "search":
@@ -569,18 +859,71 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                 elif fn["function"] == "open_page":
                     n_open += 1
             try:
-                observation, finish_answer = await _run_action(fn_calls, visited_docs)
-            except httpx.HTTPError as e:
-                observation = f"[Search server error] {e}"
+                observation, finish_answer, had_effective_call = await _run_action(fn_calls, visited_docs)
+            except asyncio.CancelledError:
+                # Cooperative cancellation (rollout aborted upstream) — re-raise
+                # so the parent task tears down correctly. Not a server error.
+                raise
+            except Exception as e:
+                # Catch-all for anything the search server or client throws:
+                # httpx.HTTPError (timeout / conn refused / HTTP 5xx),
+                # KeyError / TypeError from malformed 200 responses, JSON
+                # decode errors, client bugs, etc. Print so the traceback
+                # is grep-able in train.log; increment the counter so wandb
+                # (bcplus/n_search_server_error_mean) shows the health.
+                print(
+                    f"[BCPLUS search-server error] turn={_turn} fn_calls={fn_calls!r} "
+                    f"err={type(e).__name__}: {e}",
+                    flush=True,
+                )
+                observation = f"[Search server error] {type(e).__name__}: {e}"
                 finish_answer = None
+                # Server-side failure is not a model-format error; do not
+                # taint n_bad_tool_calls with it. Keep the two signals clean.
+                had_effective_call = True
+                n_search_server_error += 1
+            if not had_effective_call:
+                n_bad_tool_calls += 1
 
         if finish_answer is not None:
-            break
+            sample.status = Sample.Status.COMPLETED
+            outcome = "finished"
+            _stash()
+            return outcome
 
-        # Append the observation as the exact byte sequence Qwen chat template
-        # would emit for {role: tool, content: obs} + add_generation_prompt=True.
-        # Tokenized once here and appended raw — this is the only tokenization
-        # step in the loop after the initial prompt render above.
+        # Compression check BEFORE injecting the tool-response observation.
+        # If total context is already over budget, don't blow it further by
+        # appending the obs — instead, close out with a compression turn.
+        # Total = prompt + accumulated response tokens (this is what sglang
+        # sees as input_ids on the next turn).
+        total_context_len = len(prompt_ids) + len(response_token_ids)
+        if total_context_len > compress_threshold_tokens:
+            # TEMP DEBUG (remove after smoke-test verify)
+            print(
+                f"[BC+ COMPRESS DEBUG] compression triggered on turn {_turn} "
+                f"(total_context={total_context_len} = prompt {len(prompt_ids)} + "
+                f"resp {len(response_token_ids)} > thresh={compress_threshold_tokens})",
+                flush=True,
+            )
+            summary_from_compress, _ = await _do_compression(
+                args, tokenizer, url, sample, sampling_params,
+                prompt_ids, response_token_ids,
+            )
+            # TEMP DEBUG
+            print(
+                f"[BC+ COMPRESS DEBUG] _do_compression returned "
+                f"summary={'None' if summary_from_compress is None else repr(summary_from_compress[:150]) + '...'}",
+                flush=True,
+            )
+            if summary_from_compress is None:
+                sample.status = Sample.Status.TRUNCATED
+                outcome = "compress_failed"
+            else:
+                sample.status = Sample.Status.COMPLETED
+                outcome = "compressed"
+            _stash()
+            return outcome
+
         obs_wrapped = _wrap_observation_and_reopen_assistant(observation)
         obs_tokens = tokenizer(obs_wrapped, add_special_tokens=False)["input_ids"]
         response_token_ids += obs_tokens
@@ -588,17 +931,100 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             args, tokens=obs_tokens, trainable=False, text=obs_wrapped,
         )
 
-    _stash_bcplus()
+    # max_turns exhausted without finish/compress/length/abort.
+    sample.status = Sample.Status.TRUNCATED
+    outcome = "truncated"
+    _stash()
+    return outcome
 
-    match finish_reason_last:
-        case "length":
-            sample.status = Sample.Status.TRUNCATED
-        case "abort":
-            sample.status = Sample.Status.ABORTED
-        case _:
-            sample.status = Sample.Status.COMPLETED
 
-    return sample
+async def generate(args, sample: Sample, sampling_params) -> list[Sample]:
+    """Rollout entry point. Returns a LIST of sibling sub-trajectory Samples.
+
+    All siblings share ``rollout_id`` (== the original ``sample.index``) so
+    slime's per-rollout loss reducer aggregates them into one rollout, and
+    ``build_dp_schedule`` keeps them in the same training step.
+
+    Compression is triggered by ``_run_one_sub_trajectory`` when the current
+    sub-trajectory's total context length (prompt + response) exceeds
+    ``compress_length_threshold * rollout_max_context_len``. Each triggered
+    compression closes the current sub-trajectory (with the summary appended
+    to its response tokens) and this loop opens a fresh sub-trajectory whose
+    prompt is the original question + the summary.
+
+    Reward is judged only on the FINAL sub-trajectory (the only one that
+    could have called ``finish``). Broadcasting the final reward to all
+    siblings + GRPO grouping with ``rollout_id`` dedup happens in
+    ``reward_post_process``.
+    """
+    assert not args.partial_rollout, "partial_rollout not supported for BC+ generate."
+
+    parent_rollout_id = sample.index
+    original_prompt = sample.prompt
+    sub_trajs: list[Sample] = []
+
+    current_sample = sample  # first sub-traj is the input sample itself
+    for sub_traj_index in range(BCPLUS_CONFIGS["max_sub_trajs"]):
+        current_sample.rollout_id = parent_rollout_id
+        # TEMP DEBUG (remove after smoke-test verify)
+        print(
+            f"[BC+ COMPRESS DEBUG] parent_idx={sample.index} "
+            f"sub_traj_index={sub_traj_index} starting sub-traj (rollout_id={parent_rollout_id})",
+            flush=True,
+        )
+        outcome = await _run_one_sub_trajectory(args, current_sample, sampling_params)
+        # TEMP DEBUG
+        print(
+            f"[BC+ COMPRESS DEBUG] parent_idx={sample.index} "
+            f"sub_traj_index={sub_traj_index} outcome={outcome!r} "
+            f"summary_len={len(current_sample.metadata.get('_bcplus', {}).get('summary') or '')}",
+            flush=True,
+        )
+        sub_trajs.append(current_sample)
+
+        if outcome != "compressed":
+            break
+
+        # Compression fired; open the next sub-trajectory with the summary.
+        summary = current_sample.metadata["_bcplus"]["summary"]
+        if summary is None:  # defensive; outcome == "compressed" implies summary exists
+            break
+
+        new_prompt = _build_continuation_chat(original_prompt, summary)
+        current_sample = Sample(
+            index=sample.index,
+            group_index=sample.group_index,
+            prompt=new_prompt,
+            label=sample.label,
+            metadata=copy.deepcopy(sample.metadata) if isinstance(sample.metadata, dict) else {},
+        )
+        # rollout_id will be set at the top of the next iteration
+    else:
+        # For-else: max_sub_trajs exhausted while the last outcome was still
+        # "compressed". Mark the last sub-traj as TRUNCATED (we bailed on the
+        # session because we hit the cap, not because we finished).
+        if sub_trajs and sub_trajs[-1].metadata.get("_bcplus", {}).get("outcome") == "compressed":
+            sub_trajs[-1].status = Sample.Status.TRUNCATED
+            sub_trajs[-1].metadata["_bcplus"]["outcome"] = "compressed_capped"
+
+    # Broadcast sibling metadata so log_bcplus and reward_post_process can find
+    # each sub-traj's siblings and identify the final one.
+    final = sub_trajs[-1]
+    final_bcplus = final.metadata.get("_bcplus", {})
+    total = len(sub_trajs)
+    for i, s in enumerate(sub_trajs):
+        if not isinstance(s.metadata, dict):
+            s.metadata = {}
+        s.metadata["_bcplus_sibling"] = {
+            "sub_traj_index": i,
+            "total_sub_trajs": total,
+            "is_final": (i == total - 1),
+            "final_finish_answer": final_bcplus.get("finish_answer", ""),
+            "final_finished": final_bcplus.get("finished", False),
+            "parent_rollout_id": parent_rollout_id,
+        }
+
+    return sub_trajs
 
 
 async def reward_func(args, sample: Sample, **kwargs) -> dict:
@@ -611,9 +1037,24 @@ async def reward_func(args, sample: Sample, **kwargs) -> dict:
 
     Launcher must pass `--reward-key score` so GRPO uses `score` for the
     advantage; the other keys are metrics only.
+
+    Batched calling convention: when the custom generate function returns a
+    ``list[Sample]`` (as ours does for compressed rollouts), slime's
+    ``batched_async_rm`` (rm_hub/__init__.py:107) hands us the WHOLE list, not
+    one sample at a time. We loop and return a parallel list. Single-sample
+    calls (from single-Sample generators) still work — we just iterate a
+    one-element list.
     """
+    if isinstance(sample, list):
+        return [await _reward_one(args, s) for s in sample]
+    return await _reward_one(args, sample)
+
+
+async def _reward_one(args, sample: Sample) -> dict:
+    """Judge one sample. Splitting the per-sample logic out so ``reward_func``
+    can dispatch on Sample vs list[Sample] input."""
     if not isinstance(sample, Sample):
-        raise TypeError("Sample must be an instance of Sample class.")
+        raise TypeError(f"Sample must be an instance of Sample class; got {type(sample)}")
 
     md = sample.metadata or {}
     bc = md.get("_bcplus", {}) if isinstance(md, dict) else {}
@@ -621,6 +1062,8 @@ async def reward_func(args, sample: Sample, **kwargs) -> dict:
     finish_answer = bc.get("finish_answer", "") or ""
     n_search = int(bc.get("n_search", 0))
     n_open = int(bc.get("n_open", 0))
+    n_bad_tool_calls = int(bc.get("n_bad_tool_calls", 0))
+    n_search_server_error = int(bc.get("n_search_server_error", 0))
     n_turns_used = int(bc.get("n_turns_used", 0))
     truncated = int(bc.get("final_stop_reason", "") == "length")
 
@@ -647,6 +1090,8 @@ async def reward_func(args, sample: Sample, **kwargs) -> dict:
         "n_search": float(n_search),
         "n_open": float(n_open),
         "n_tool_calls": float(n_search + n_open),
+        "n_bad_tool_calls": float(n_bad_tool_calls),
+        "n_search_server_error": float(n_search_server_error),
         "finished": float(int(finished)),
         "truncated": float(truncated),
         "no_finish_score": float(score if not finished else 0),  # marks when 0 came from no-finish
@@ -664,47 +1109,105 @@ def log_bcplus(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
     receives no rollout_id and its ``sample.rollout_id`` is a
     trajectory-level identifier, not the driver's step counter.
 
+    Handles compressed rollouts: ``samples`` may contain multiple sub-trajs
+    per rollout (all sharing ``sample.rollout_id``). Sub-traj-level metrics
+    aggregate across all sub-trajs; rollout-level metrics dedupe by
+    ``sample.rollout_id`` and use only the FINAL sibling's ``reward`` (that's
+    the one carrying the judge score post-broadcast).
+
     Returns False so slime's default rollout logging still runs afterwards.
     """
     import wandb
+    from collections import defaultdict
 
     if wandb.run is None:
         return False
 
-    flat_samples = []
+    flat_samples: list[Sample] = []
     for s in samples:
         if isinstance(s, list):
             flat_samples.extend(s)
         else:
             flat_samples.append(s)
 
-    diag_keys = ("n_turns", "n_search", "n_open", "n_tool_calls", "finished", "truncated", "judge_failed")
+    if not flat_samples:
+        return False
+
+    # Group by rollout_id (parent trajectory). Each group is one rollout with
+    # 1+ sub-trajs. If sub_traj_sibling metadata is missing (defensive), treat
+    # the sample as its own singleton rollout.
+    by_rollout: dict[int, list[Sample]] = defaultdict(list)
+    for s in flat_samples:
+        by_rollout[s.rollout_id if s.rollout_id is not None else id(s)].append(s)
+
+    # Sub-traj-level: aggregate reward diagnostics across ALL sub-trajs.
+    diag_keys = ("n_turns", "n_search", "n_open", "n_tool_calls", "n_bad_tool_calls", "n_search_server_error", "finished", "truncated", "judge_failed")
     diag_sums = {k: 0.0 for k in diag_keys}
     diag_count = 0
-    scores = []
     for s in flat_samples:
         r = s.reward
         if isinstance(r, dict):
-            scores.append(float(r.get("score", 0.0)))
             for k in diag_keys:
                 diag_sums[k] += float(r.get(k, 0.0))
             diag_count += 1
-        else:
-            scores.append(float(r) if r is not None else 0.0)
 
-    if diag_count == 0:
-        return False
+    # Rollout-level: dedupe by rollout_id, use final sibling's judged reward
+    # for the score metric.
+    scores_per_rollout: list[float] = []
+    sub_traj_counts: list[int] = []
+    compression_fired: list[bool] = []
+    compression_failed: list[bool] = []
+    capped: list[bool] = []
+    final_response_lens: list[int] = []
+    for _rid, group in by_rollout.items():
+        # Find the final sibling (the one with is_final=True, or the last if
+        # sibling metadata missing).
+        final = next(
+            (s for s in group if (s.metadata or {}).get("_bcplus_sibling", {}).get("is_final")),
+            group[-1],
+        )
+        r = final.reward
+        if isinstance(r, dict):
+            scores_per_rollout.append(float(r.get("score", 0.0)))
+        elif r is not None:
+            scores_per_rollout.append(float(r))
+        sub_traj_counts.append(len(group))
+        # Any non-final sibling with outcome="compressed" means at least one
+        # compression fired successfully in this rollout.
+        outcomes = [(s.metadata or {}).get("_bcplus", {}).get("outcome") for s in group]
+        compression_fired.append(any(o in ("compressed", "compressed_capped") for o in outcomes))
+        compression_failed.append(any(o == "compress_failed" for o in outcomes))
+        capped.append(any(o == "compressed_capped" for o in outcomes))
+        final_bcplus = (final.metadata or {}).get("_bcplus", {})
+        final_response_lens.append(int(final_bcplus.get("response_len_tokens", 0)))
+
+    n_rollouts = len(by_rollout)
 
     global _BCPLUS_METRIC_DEFINED
     if not _BCPLUS_METRIC_DEFINED:
         wandb.define_metric("bcplus/*", step_metric="rollout/step")
         _BCPLUS_METRIC_DEFINED = True
 
-    log = {f"bcplus/{k}_mean": diag_sums[k] / diag_count for k in diag_keys}
-    log["bcplus/score_mean"] = sum(scores) / len(scores) if scores else 0.0
-    log["bcplus/score_max"] = max(scores) if scores else 0.0
-    log["bcplus/score_hits"] = sum(1 for x in scores if x > 0)
-    log["bcplus/n_samples"] = diag_count
+    log = {}
+    # Sub-traj-averaged diagnostics (each sub-traj counts equally).
+    if diag_count > 0:
+        for k in diag_keys:
+            log[f"bcplus/{k}_mean"] = diag_sums[k] / diag_count
+    log["bcplus/n_sub_trajs_total"] = len(flat_samples)
+
+    # Rollout-level.
+    log["bcplus/score_mean"] = sum(scores_per_rollout) / n_rollouts if n_rollouts else 0.0
+    log["bcplus/score_max"] = max(scores_per_rollout) if scores_per_rollout else 0.0
+    log["bcplus/score_hits"] = sum(1 for x in scores_per_rollout if x > 0)
+    log["bcplus/n_rollouts"] = n_rollouts
+    log["bcplus/n_sub_trajs_mean"] = sum(sub_traj_counts) / n_rollouts if n_rollouts else 0.0
+    log["bcplus/n_sub_trajs_max"] = max(sub_traj_counts) if sub_traj_counts else 0
+    log["bcplus/compression_rate"] = sum(compression_fired) / n_rollouts if n_rollouts else 0.0
+    log["bcplus/compression_failed_rate"] = sum(compression_failed) / n_rollouts if n_rollouts else 0.0
+    log["bcplus/compression_capped_rate"] = sum(capped) / n_rollouts if n_rollouts else 0.0
+    log["bcplus/final_response_len_mean"] = (
+        sum(final_response_lens) / n_rollouts if n_rollouts else 0.0
+    )
     log["rollout/step"] = rollout_id
     wandb.log(log)
     return False
@@ -713,35 +1216,100 @@ def log_bcplus(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
 def reward_post_process(args, samples):
     """Custom post-process hook wired via ``--custom-reward-post-process-path``.
 
-    Only responsibility: run slime's default group-normalized GRPO advantage
-    math over the reward dicts returned by reward_func. Wandb logging of
-    bcplus diagnostics happens in log_bcplus (custom-rollout-log-function-path)
-    which is the only hook that gets the driver's rollout_id.
+    Two responsibilities:
+
+    1. **Broadcast final-sibling reward to all siblings**: only the final
+       sub-trajectory of each rollout has a ``finish_answer`` for the judge
+       to score. Every other sub-traj was closed by compression and has
+       ``reward["score"] = 0`` as a placeholder. We overwrite those
+       placeholders with the final sibling's judged reward, keyed by
+       ``rollout_id``.
+
+    2. **GRPO normalization matching SUPO's FOLDGRPO**: group by
+       ``group_index`` (the per-prompt id set by slime's data source);
+       within each group, dedupe by ``rollout_id`` when collecting rewards
+       for mean/std (so a rollout with N sub-trajs contributes exactly one
+       reward to the group statistics). Then broadcast the per-rollout
+       advantage back to every sub-trajectory of that rollout.
+
+    Denominator invariant: group size == number of distinct rollout_ids in
+    the group == ``n_samples_per_prompt``, NEVER sub-trajectory count.
+
+    Backward-compat: when no compression fired, every rollout has one
+    sub-traj, so the "dedup by rollout_id" step is a no-op and this reduces
+    to standard per-prompt GRPO normalization — matches the previous
+    reshape-by-shape logic.
     """
     import torch
+    from collections import defaultdict
 
-    flat_samples = []
+    flat_samples: list[Sample] = []
     for s in samples:
         if isinstance(s, list):
             flat_samples.extend(s)
         else:
             flat_samples.append(s)
 
+    # Step 1: broadcast final-sibling reward to all siblings of the same
+    # rollout_id. We rely on _bcplus_sibling.is_final set by generate().
+    rollout_to_final_reward: dict[int, dict | float | None] = {}
+    for s in flat_samples:
+        sib = (s.metadata or {}).get("_bcplus_sibling", {})
+        if sib.get("is_final"):
+            rollout_to_final_reward[s.rollout_id] = s.reward
+    for s in flat_samples:
+        if s.rollout_id in rollout_to_final_reward and rollout_to_final_reward[s.rollout_id] is not None:
+            s.reward = copy.deepcopy(rollout_to_final_reward[s.rollout_id])
+
+    # Step 2: raw scalar rewards (in flat_samples order).
     raw_rewards = [s.get_reward_value(args) for s in flat_samples]
-    if (
+
+    if not (
         args.advantage_estimator in ("grpo", "gspo", "cispo", "reinforce_plus_plus_baseline")
         and args.rewards_normalization
     ):
-        rewards = torch.tensor(raw_rewards, dtype=torch.float)
-        if rewards.shape[-1] == args.n_samples_per_prompt * args.rollout_batch_size:
-            rewards = rewards.reshape(-1, args.n_samples_per_prompt)
-        else:
-            rewards = rewards.view(-1, rewards.shape[-1])
-        mean = rewards.mean(dim=-1, keepdim=True)
-        rewards = rewards - mean
-        if args.advantage_estimator in ("grpo", "gspo", "cispo") and args.grpo_std_normalization:
-            std = rewards.std(dim=-1, keepdim=True)
-            rewards = rewards / (std + 1e-6)
-        return raw_rewards, rewards.flatten().tolist()
+        return raw_rewards, raw_rewards
 
-    return raw_rewards, raw_rewards
+    # Step 3: group by group_index, dedupe by rollout_id. Each rollout
+    # contributes ONE reward to its group's mean/std stats even if it
+    # produced multiple sub-trajectories.
+    group_rollout_reward: dict[int, dict[int, float]] = defaultdict(dict)
+    for i, s in enumerate(flat_samples):
+        if s.group_index is None:
+            # Defensive: samples without group_index become their own singleton
+            # group (mean=self, std=1) — advantage collapses to 0.
+            key = f"_singleton_{i}"
+            group_rollout_reward[key][i] = raw_rewards[i]
+        else:
+            group_rollout_reward[s.group_index][s.rollout_id] = raw_rewards[i]
+
+    # TEMP DEBUG (remove after smoke-test verify)
+    print(
+        f"[BC+ REWARD DEBUG] n_samples={len(flat_samples)} "
+        f"n_groups={len(group_rollout_reward)} "
+        f"group_rollout_reward={dict((k, dict(v)) for k, v in group_rollout_reward.items())}",
+        flush=True,
+    )
+
+    # Step 4: per-group mean/std; broadcast advantage back to each sub-traj.
+    normalized = [0.0] * len(flat_samples)
+    use_std = (
+        args.advantage_estimator in ("grpo", "gspo", "cispo")
+        and args.grpo_std_normalization
+    )
+    group_stats: dict = {}
+    for group_key, rollout_rewards in group_rollout_reward.items():
+        vals = torch.tensor(list(rollout_rewards.values()), dtype=torch.float)
+        mean = vals.mean().item()
+        std = vals.std().item() if len(vals) > 1 else 1.0
+        group_stats[group_key] = (mean, std)
+
+    for i, s in enumerate(flat_samples):
+        group_key = s.group_index if s.group_index is not None else f"_singleton_{i}"
+        mean, std = group_stats[group_key]
+        adv = raw_rewards[i] - mean
+        if use_std:
+            adv = adv / (std + 1e-6)
+        normalized[i] = adv
+
+    return raw_rewards, normalized

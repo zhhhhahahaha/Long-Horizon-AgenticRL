@@ -1,5 +1,11 @@
 #!/bin/bash
-# BrowseComp-Plus RL — pipeline smoke test with Qwen3.5-4B on 8 GPUs.
+# BrowseComp-Plus RL — canonical training launcher for Qwen3.5-4B on 8 GPUs.
+#
+# This file is the make-sense config for real training runs. Every rollout /
+# training knob defaulted here is what we want in production. Debug scripts
+# live under debug_scripts/ and only override a small set of BC_* env vars
+# (rollout size, context budget, threshold) — the pipeline logic itself
+# (compression, tools schema, reward hooks) is shared with this file.
 #
 # Two-part launcher:
 #   * Outer part (login pod): allocates the Slurm node, exports RUN_NAME,
@@ -14,6 +20,17 @@
 #      MetaGen via the Llama API OpenAI-compat endpoint; see README).
 #   3. HF checkpoints for Qwen3.5-4B (both hf and torch_dist mcore forms)
 #      exist at HF_CKPT_HOST / REF_LOAD_HOST below.
+#
+# Debug-only overrides (env vars — leave unset for canonical config):
+#   BC_NUM_ROLLOUT              default 20
+#   BC_ROLLOUT_BATCH_SIZE       default 8
+#   BC_N_SAMPLES                default 4
+#   BC_GLOBAL_BATCH_SIZE        default 32
+#   BC_MAX_RESPONSE_LEN         default 32768 (sglang per-call max_new_tokens)
+#   BC_MAX_CONTEXT_LEN          default 131072 (per-sample total context budget)
+#   BCPLUS_MAX_TURNS            default 64 (SUPO react_agent max turn count)
+#   BCPLUS_COMPRESS_THRESH      default 0.85 (compression trigger fraction)
+#   BCPLUS_MAX_SUB_TRAJS        default 5 (SUPO max_session)
 
 set -euo pipefail
 
@@ -64,7 +81,7 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
         fi
     fi
 
-    export RUN_NAME="${RUN_NAME:-supo-bcplus-qwen3p5-4b-smoke-$(date +%Y%m%d-%H%M)}"
+    export RUN_NAME="${RUN_NAME:-supo-bcplus-qwen3p5-4b-$(date +%Y%m%d-%H%M)}"
     echo "RUN_NAME=${RUN_NAME}"
 
     SLIME_HOST_DIR=/home/hhzhang01/slime
@@ -99,6 +116,15 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
                 --env LOCAL_SEARCH_URL='${LOCAL_SEARCH_URL}' \
                 --env SGLANG_SERVER_URL='${SGLANG_SERVER_URL}' \
                 --env LLAMA_API_KEY='${LLAMA_API_KEY}' \
+                --env BCPLUS_COMPRESS_THRESH='${BCPLUS_COMPRESS_THRESH:-}' \
+                --env BCPLUS_MAX_SUB_TRAJS='${BCPLUS_MAX_SUB_TRAJS:-}' \
+                --env BCPLUS_MAX_TURNS='${BCPLUS_MAX_TURNS:-}' \
+                --env BC_NUM_ROLLOUT='${BC_NUM_ROLLOUT:-}' \
+                --env BC_ROLLOUT_BATCH_SIZE='${BC_ROLLOUT_BATCH_SIZE:-}' \
+                --env BC_N_SAMPLES='${BC_N_SAMPLES:-}' \
+                --env BC_GLOBAL_BATCH_SIZE='${BC_GLOBAL_BATCH_SIZE:-}' \
+                --env BC_MAX_RESPONSE_LEN='${BC_MAX_RESPONSE_LEN:-}' \
+                --env BC_MAX_CONTEXT_LEN='${BC_MAX_CONTEXT_LEN:-}' \
                 ${ENROOT_ROOTFS} \
                 bash /slime/examples/supo_browsecomp/run_qwen3p5_4B.sh
         "
@@ -148,12 +174,23 @@ ROLLOUT_ARGS=(
    # If slime pre-renders, the tools argument is dropped and the model won't
    # know the tool schemas.
    --rollout-shuffle
-   --num-rollout 20
-   --rollout-batch-size 8
-   --n-samples-per-prompt 4
-   --rollout-max-response-len 32768
+   # Rollout sizing. Defaults here are the make-sense config for a real
+   # training run. The debug wrapper (debug_scripts/launch_all_debug.sh)
+   # shrinks these via the BC_* env vars declared in the module header.
+   --num-rollout ${BC_NUM_ROLLOUT:-20}
+   --rollout-batch-size ${BC_ROLLOUT_BATCH_SIZE:-8}
+   --n-samples-per-prompt ${BC_N_SAMPLES:-4}
+   # Per-turn sglang max_new_tokens. See notes/CONTEXT_LENGTH_LAYERS.md.
+   --rollout-max-response-len ${BC_MAX_RESPONSE_LEN:-32768}
+   # Per-sample total context budget (prompt + accumulated response). Governs
+   # when SUPO compression fires: trigger = BCPLUS_COMPRESS_THRESH *
+   # rollout-max-context-len. 128k for real training so a sample can grow to
+   # ~5 sub-trajectories worth of tokens before capping. Debug scripts shrink
+   # this (via BC_MAX_CONTEXT_LEN) to force early compression triggers. Must
+   # stay <= SGLang server's --context-length (set in launch_sglang_server.sh).
+   --rollout-max-context-len ${BC_MAX_CONTEXT_LEN:-131072}
    --rollout-temperature 1.0
-   --global-batch-size 32
+   --global-batch-size ${BC_GLOBAL_BATCH_SIZE:-32}
    --balance-data
 )
 
@@ -162,7 +199,8 @@ PERF_ARGS=(
    # TP=4 × CP=2 × PP=1 × DP=1 = 8. CP splits each sample along the seq
    # dimension across 2 ranks (ring attention keeps context correct), which
    # halves activation memory per rank — necessary because rollouts can
-   # reach 32k tokens (--rollout-max-response-len 32768).
+   # reach the total context budget set by --rollout-max-context-len (32k
+   # during debug, targeting 128k for real runs).
    --tensor-model-parallel-size 4
    --sequence-parallel
    --pipeline-model-parallel-size 1
@@ -260,7 +298,9 @@ RUNTIME_ENV_JSON="{
     \"LOCAL_SEARCH_URL\": \"${LOCAL_SEARCH_URL}\",
     \"SGLANG_SERVER_URL\": \"${SGLANG_SERVER_URL}\",
     \"LLAMA_API_KEY\": \"${LLAMA_API_KEY}\",
-    \"BCPLUS_MAX_TURNS\": \"64\"
+    \"BCPLUS_MAX_TURNS\": \"${BCPLUS_MAX_TURNS:-64}\",
+    \"BCPLUS_COMPRESS_THRESH\": \"${BCPLUS_COMPRESS_THRESH:-0.85}\",
+    \"BCPLUS_MAX_SUB_TRAJS\": \"${BCPLUS_MAX_SUB_TRAJS:-5}\"
   }
 }"
 

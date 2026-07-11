@@ -46,6 +46,12 @@ SGLANG_WALLTIME="${SGLANG_WALLTIME:-25:00:00}"
 HF_CKPT="${HF_CKPT:-/genai_hh/models/Qwen3.5-4B}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
 SERVER_PORT="${SERVER_PORT:-30000}"
+# SGLang server context length cap. 128k is the practical upper bound we ever
+# want a rollout to reach; smaller than Qwen3.5's 256k `max_position_embeddings`
+# so KV cache pre-allocation is halved. Actual per-sample budget is enforced
+# separately by `--rollout-max-context-len` in run_qwen3p5_4B.sh (usually 32k
+# during debug, tune upward for real runs).
+SGLANG_CONTEXT_LENGTH="${SGLANG_CONTEXT_LENGTH:-131072}"
 SGLANG_JOB_NAME="${SGLANG_JOB_NAME:-supo-sglang-$(date +%H%M%S)}"
 
 LOG_DIR="${GENAI_ROOT}/logs"
@@ -118,6 +124,7 @@ submit_new_server() {
                 --model-path ${HF_CKPT} \
                 --tp ${SGLANG_NUM_GPUS} \
                 --host 0.0.0.0 --port ${SERVER_PORT} \
+                --context-length ${SGLANG_CONTEXT_LENGTH} \
                 --mem-fraction-static ${MEM_FRACTION_STATIC} \
                 --disable-custom-all-reduce \
                 --trust-remote-code'"
