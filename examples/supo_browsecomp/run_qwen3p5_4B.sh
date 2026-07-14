@@ -31,6 +31,9 @@
 #   BCPLUS_MAX_TURNS            default 64 (SUPO react_agent max turn count)
 #   BCPLUS_COMPRESS_THRESH      default 0.85 (compression trigger fraction)
 #   BCPLUS_MAX_SUB_TRAJS        default 5 (SUPO max_session)
+#   BCPLUS_COMPRESS_PENALTY     default 0.5 (per-sub-traj penalty when a
+#                                compression turn failed to emit a real
+#                                <summary> block; set to 0 to disable)
 
 set -euo pipefail
 
@@ -119,6 +122,7 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
                 --env BCPLUS_COMPRESS_THRESH='${BCPLUS_COMPRESS_THRESH:-}' \
                 --env BCPLUS_MAX_SUB_TRAJS='${BCPLUS_MAX_SUB_TRAJS:-}' \
                 --env BCPLUS_MAX_TURNS='${BCPLUS_MAX_TURNS:-}' \
+                --env BCPLUS_COMPRESS_PENALTY='${BCPLUS_COMPRESS_PENALTY:-}' \
                 --env BC_NUM_ROLLOUT='${BC_NUM_ROLLOUT:-}' \
                 --env BC_ROLLOUT_BATCH_SIZE='${BC_ROLLOUT_BATCH_SIZE:-}' \
                 --env BC_N_SAMPLES='${BC_N_SAMPLES:-}' \
@@ -279,12 +283,16 @@ CUSTOM_ARGS=(
 MISC_ARGS+=(
    # log_multi_turn_data reads sample.metadata["round_number"] we set in generate()
    # and produces multi_turn_metric/round_number_* plus raw/observed response
-   # length stats.
+   # length stats. Safe with SUPO compression (sub-traj list) because it does
+   # per-sample mean/max/min aggregation without any group-size assertion.
    --log-multi-turn
-   # log pass@k across the group of n_samples_per_prompt trajectories per prompt
-   # (with n=4 we get pass@1..pass@4 → useful to see if the model ever solves
-   # a hard question even if only 1 of 4 samples works).
-   --log-passrate
+   # NOTE: --log-passrate is intentionally OFF. Unlike --log-multi-turn,
+   # slime's compute_pass_rate asserts len(flat_rewards) ==
+   # rollout_batch_size * n_samples_per_prompt, but our generate() returns
+   # list[Sample] (one per SUPO sub-trajectory) so flat_rewards grows with
+   # compression. The pass@k intent is already covered by bcplus/score_max
+   # + bcplus/score_hits in log_bcplus (which dedupes by rollout_id, so
+   # they reflect per-parent-rollout hit counts).
 )
 
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
@@ -300,7 +308,8 @@ RUNTIME_ENV_JSON="{
     \"LLAMA_API_KEY\": \"${LLAMA_API_KEY}\",
     \"BCPLUS_MAX_TURNS\": \"${BCPLUS_MAX_TURNS:-64}\",
     \"BCPLUS_COMPRESS_THRESH\": \"${BCPLUS_COMPRESS_THRESH:-0.85}\",
-    \"BCPLUS_MAX_SUB_TRAJS\": \"${BCPLUS_MAX_SUB_TRAJS:-5}\"
+    \"BCPLUS_MAX_SUB_TRAJS\": \"${BCPLUS_MAX_SUB_TRAJS:-5}\",
+    \"BCPLUS_COMPRESS_PENALTY\": \"${BCPLUS_COMPRESS_PENALTY:-0.5}\"
   }
 }"
 
