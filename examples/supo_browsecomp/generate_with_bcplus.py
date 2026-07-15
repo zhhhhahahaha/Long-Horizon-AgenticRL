@@ -57,6 +57,15 @@ The reward is a single-model judge routed through the internal MetaGen gateway
 (default: gpt-5-4-genai-dss4). SUPO's original two-model fallback path
 (gpt-4o-mini primary + gpt-4.1 relaxed-EM fallback) was collapsed because
 our primary is already stronger than SUPO's fallback.
+
+**Offline rollout dump** (optional, opt-in): when ``BCPLUS_DUMP_DIR`` is set
+(non-empty), ``dump_rollout_data_postprocess`` — wired via slime's
+``--rollout-data-postprocess-path`` — writes one parquet file per training
+iter with one row per sub-trajectory. Each row includes full
+``prompt_ids``/``response_ids``/``loss_mask`` for exact replay, plus dense
+(``sum(loss_mask==1)``-length) ``rollout_logps`` + ``train_old_logps``
+arrays for TIS drift analysis. Default off — canonical training pays
+zero cost.
 """
 
 from __future__ import annotations
@@ -108,6 +117,10 @@ BCPLUS_CONFIGS = {
     # disable the penalty entirely. Shell default in run_qwen3p5_4B.sh
     # RUNTIME_ENV_JSON must match this default.
     "compress_penalty": float(os.environ.get("BCPLUS_COMPRESS_PENALTY", "0.5")),
+    # Directory to dump per-sub-traj rollout+train state for offline analysis.
+    # Empty string disables (canonical training pays zero cost). See
+    # `dump_rollout_data_postprocess` docstring for the parquet schema.
+    "dump_dir": os.environ.get("BCPLUS_DUMP_DIR", ""),
 }
 
 _SEARCH_SEM = asyncio.Semaphore(BCPLUS_CONFIGS["search_concurrency"])
@@ -753,14 +766,6 @@ async def _do_compression(
         # Treat abort during summarization as compression failure.
         return None, "empty", len(response_token_ids) - added_tokens_start
 
-    # TEMP DEBUG (remove after smoke-test verify)
-    _summary_text_debug = output["text"]
-    print(
-        f"[BC+ COMPRESS DEBUG] _do_compression sglang finish_reason={output['meta_info']['finish_reason']['type']!r} "
-        f"raw cur_text[:2000]={_summary_text_debug[:2000]!r}",
-        flush=True,
-    )
-
     cur_text = output["text"]
     cur_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
     cur_logps = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
@@ -995,7 +1000,6 @@ async def _run_one_sub_trajectory(
         # sees as input_ids on the next turn).
         total_context_len = len(prompt_ids) + len(response_token_ids)
         if total_context_len > compress_threshold_tokens:
-            # TEMP DEBUG (remove after smoke-test verify)
             print(
                 f"[BC+ COMPRESS DEBUG] compression triggered on turn {_turn} "
                 f"(total_context={total_context_len} = prompt {len(prompt_ids)} + "
@@ -1005,13 +1009,6 @@ async def _run_one_sub_trajectory(
             summary_from_compress, summary_source, _ = await _do_compression(
                 args, tokenizer, url, sample, sampling_params,
                 prompt_ids, response_token_ids,
-            )
-            # TEMP DEBUG
-            print(
-                f"[BC+ COMPRESS DEBUG] _do_compression returned "
-                f"summary_source={summary_source!r} "
-                f"summary={'None' if summary_from_compress is None else repr(summary_from_compress[:150]) + '...'}",
-                flush=True,
             )
             if summary_from_compress is None:
                 sample.status = Sample.Status.TRUNCATED
@@ -1062,22 +1059,9 @@ async def generate(args, sample: Sample, sampling_params) -> list[Sample]:
     sub_trajs: list[Sample] = []
 
     current_sample = sample  # first sub-traj is the input sample itself
-    for sub_traj_index in range(BCPLUS_CONFIGS["max_sub_trajs"]):
+    for _ in range(BCPLUS_CONFIGS["max_sub_trajs"]):
         current_sample.rollout_id = parent_rollout_id
-        # TEMP DEBUG (remove after smoke-test verify)
-        print(
-            f"[BC+ COMPRESS DEBUG] parent_idx={sample.index} "
-            f"sub_traj_index={sub_traj_index} starting sub-traj (rollout_id={parent_rollout_id})",
-            flush=True,
-        )
         outcome = await _run_one_sub_trajectory(args, current_sample, sampling_params)
-        # TEMP DEBUG
-        print(
-            f"[BC+ COMPRESS DEBUG] parent_idx={sample.index} "
-            f"sub_traj_index={sub_traj_index} outcome={outcome!r} "
-            f"summary_len={len(current_sample.metadata.get('_bcplus', {}).get('summary') or '')}",
-            flush=True,
-        )
         sub_trajs.append(current_sample)
 
         if outcome != "compressed":
@@ -1120,6 +1104,19 @@ async def generate(args, sample: Sample, sampling_params) -> list[Sample]:
             "final_finish_answer": final_bcplus.get("finish_answer", ""),
             "final_finished": final_bcplus.get("finished", False),
             "parent_rollout_id": parent_rollout_id,
+        }
+        # Propagate the minimal set of _bcplus fields into `train_metadata` so
+        # they survive the ray/rollout.py handoff into rollout_data (only
+        # `train_metadata`, not `metadata`, is threaded through — see
+        # slime/ray/rollout.py:793-794). Used by dump_rollout_data_postprocess.
+        bc = s.metadata.get("_bcplus", {}) if isinstance(s.metadata, dict) else {}
+        s.train_metadata = {
+            "sub_traj_index": i,
+            "total_sub_trajs": total,
+            "is_final": (i == total - 1),
+            "outcome": bc.get("outcome", ""),
+            "summary_source": bc.get("summary_source", ""),
+            "group_index": int(s.group_index) if s.group_index is not None else -1,
         }
 
     return sub_trajs
@@ -1461,10 +1458,14 @@ def reward_post_process(args, samples):
     # with compression quality; pass@k should reflect answer accuracy only).
     # Written to every sub-traj — all siblings share the same broadcast
     # reward here, so `raw_final_score` is identical across a rollout.
+    # Also mirrored into train_metadata so the dump hook (which only sees
+    # train_metadata, not metadata) can pick it up.
     for i, s in enumerate(flat_samples):
         if not isinstance(s.metadata, dict):
             s.metadata = {}
         s.metadata.setdefault("_bcplus", {})["raw_final_score"] = float(raw_rewards[i])
+        if isinstance(s.train_metadata, dict):
+            s.train_metadata["score_raw"] = float(raw_rewards[i])
 
     if not (
         args.advantage_estimator in ("grpo", "gspo", "cispo", "reinforce_plus_plus_baseline")
@@ -1504,7 +1505,6 @@ def reward_post_process(args, samples):
                 elif not isinstance(s.reward, dict) and s.reward is not None:
                     s.reward = float(s.reward) - compress_penalty
                 penalties_applied += 1
-                # TEMP DEBUG (remove after smoke-test verify)
                 print(
                     f"[BC+ REWARD DEBUG] penalty applied rollout_id={s.rollout_id} "
                     f"summary_source={bc.get('summary_source')!r} "
@@ -1512,7 +1512,11 @@ def reward_post_process(args, samples):
                     flush=True,
                 )
 
-    # TEMP DEBUG (remove after smoke-test verify)
+    # Mirror the post-penalty score into train_metadata for the dump hook.
+    for i, s in enumerate(flat_samples):
+        if isinstance(s.train_metadata, dict):
+            s.train_metadata["score_final"] = float(raw_rewards[i])
+
     print(
         f"[BC+ REWARD DEBUG] n_samples={len(flat_samples)} "
         f"n_groups={len(group_rollout_reward)} "
@@ -1546,3 +1550,226 @@ def reward_post_process(args, samples):
         normalized[i] = adv
 
     return raw_rewards, normalized
+
+
+def dump_rollout_data_postprocess(args, rollout_id, rollout_data) -> None:
+    """Custom hook wired via ``--rollout-data-postprocess-path``.
+
+    Fires from ``slime/backends/megatron_utils/actor.py:483`` AFTER slime has
+    computed ``ref_log_probs`` + ``log_probs`` (train-old) + ``advantages`` and
+    BEFORE the actual training step. Reads from ``rollout_data``:
+      * ``rollout_data["rollout_log_probs"]`` — sglang sampling-time log_probs
+        (CP-sharded: each CP rank has only its portion under zigzag layout)
+      * ``rollout_data["log_probs"]`` — training-policy log_probs at start of
+        this iter (also CP-sharded). Populated only when
+        ``--dump-train-old-log-prob`` is set (which flips can_reuse=False).
+      * ``rollout_data["advantages"]`` — post-penalty GRPO advantages (CP-
+        sharded but every position is the same scalar broadcast, so we take
+        the local shard's first value).
+
+    Uses slime's ``all_gather_with_cp`` to reconstruct full-length per-sample
+    log_probs from the CP shards. ALL CP ranks must call the hook (NCCL
+    all_reduce hangs if any CP rank skips); only CP rank 0 writes the file.
+
+    ``train_new_logps`` (per-mini-batch log_probs from inside the loss
+    computation, i.e. the PPO clipping ratio's numerator) is intentionally
+    NOT captured — it would require slime-side patches. The signal we can
+    reconstruct offline from Phase 1 columns is the TIS correction weight
+    ``exp(train_old_logps - rollout_logps)`` (see loss.py:842), which is
+    typically the more actionable drift signal.
+
+    Writes one parquet file per iter per DP rank with one row per sub-
+    trajectory. See the module docstring / plan file for the full schema.
+
+    Disabled when ``BCPLUS_CONFIGS["dump_dir"]`` is empty (default) —
+    canonical training pays zero cost.
+    """
+    dump_dir = BCPLUS_CONFIGS["dump_dir"]
+    if not dump_dir:
+        return
+
+    # Guards:
+    #   - TP rank 0 only: TP-shard duplication doesn't add info here
+    #   - PP last stage only: log_probs live there
+    #   - All CP ranks MUST participate (all_gather_with_cp uses NCCL
+    #     all_reduce; if only one CP rank enters, the others hang)
+    #   - Each DP rank writes its own file (DP partitions are disjoint)
+    #   - Only CP rank 0 actually writes (all CP ranks see the same
+    #     gathered tensor after all-reduce; avoid duplicate writes)
+    import torch
+    try:
+        from megatron.core import parallel_state as mpu
+        dp_rank = mpu.get_data_parallel_rank(with_context_parallel=False)
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        cp_rank = mpu.get_context_parallel_rank()
+        cp_size = mpu.get_context_parallel_world_size()
+        pp_last = mpu.is_pipeline_last_stage()
+    except Exception:
+        dp_rank, tp_rank, cp_rank, cp_size, pp_last = 0, 0, 0, 1, True
+
+    if tp_rank != 0 or not pp_last:
+        return
+
+    from slime.backends.megatron_utils.cp_utils import all_gather_with_cp
+
+    tokens_list = rollout_data.get("tokens", [])
+    response_lengths = rollout_data.get("response_lengths", [])
+    total_lengths = rollout_data.get("total_lengths", [])
+    loss_masks_list = rollout_data.get("loss_masks", [])
+    rollout_lp_list = rollout_data.get("rollout_log_probs", [])
+    train_old_lp_list = rollout_data.get("log_probs", [])
+    advantages_list = rollout_data.get("advantages", [])
+    rollout_ids = rollout_data.get("rollout_ids", [])
+    metadata_list = rollout_data.get("metadata", [])
+
+    n = len(tokens_list)
+    if n == 0:
+        return
+
+    def _tolist(t):
+        if hasattr(t, "tolist"):
+            return t.tolist()
+        return list(t)
+
+    # Length invariants — silent fallbacks here would silently produce garbage
+    # parquet. If any of these fail, the upstream slime plumbing has diverged
+    # from what this dump function assumes.
+    assert len(response_lengths) == n and len(total_lengths) == n, (
+        f"length lists mismatch: n={n} response_lengths={len(response_lengths)} "
+        f"total_lengths={len(total_lengths)}"
+    )
+    assert len(loss_masks_list) == n, f"loss_masks length {len(loss_masks_list)} != {n}"
+    assert len(rollout_lp_list) == n, f"rollout_log_probs length {len(rollout_lp_list)} != {n}"
+    assert len(train_old_lp_list) == n, (
+        f"train_old log_probs length {len(train_old_lp_list)} != {n}. "
+        f"Did --dump-train-old-log-prob get set? BCPLUS_DUMP_DIR is set but "
+        f"can_reuse_log_probs_in_loss must be False for train_old to be computed."
+    )
+
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    # Gather full-length per-sample log_probs across the CP group. Every CP
+    # rank must call this — the internal all_reduce hangs if any CP rank
+    # skips. After the call, every CP rank holds the same full tensor.
+    full_rollout_lp_list = []
+    full_train_old_lp_list = []
+    for i in range(n):
+        total_length = int(total_lengths[i])
+        response_length = int(response_lengths[i])
+        shard_rollout = rollout_lp_list[i].to(device=device, dtype=torch.float32)
+        shard_train_old = train_old_lp_list[i].to(device=device, dtype=torch.float32)
+        full_rollout = all_gather_with_cp(shard_rollout, total_length, response_length)
+        full_train_old = all_gather_with_cp(shard_train_old, total_length, response_length)
+        full_rollout_lp_list.append(full_rollout.detach().cpu().tolist())
+        full_train_old_lp_list.append(full_train_old.detach().cpu().tolist())
+
+    # After the CP-wide all_reduce, all CP ranks have identical results. Only
+    # CP rank 0 writes the file to avoid duplicate output.
+    if cp_rank != 0:
+        return
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    os.makedirs(dump_dir, exist_ok=True)
+    out_path = os.path.join(dump_dir, f"rollouts_iter_{rollout_id:05d}_dp{dp_rank}.parquet")
+
+    rows: dict[str, list] = {
+        "iter_id": [int(rollout_id)] * n,
+        "group_index": [-1] * n,
+        "rollout_id": [int(r) for r in rollout_ids],
+        "sub_traj_index": [-1] * n,
+        "total_sub_trajs": [-1] * n,
+        "is_final": [False] * n,
+        "outcome": [""] * n,
+        "summary_source": [""] * n,
+        "score_raw": [float("nan")] * n,
+        "score_final": [float("nan")] * n,
+        "advantage": [float("nan")] * n,
+        "prompt_ids": [None] * n,
+        "response_ids": [None] * n,
+        "loss_mask": [None] * n,
+        "rollout_logps": [None] * n,
+        "train_old_logps": [None] * n,
+    }
+
+    for i in range(n):
+        tokens = _tolist(tokens_list[i])
+        rlen = int(response_lengths[i])
+        prompt_ids = tokens[: len(tokens) - rlen]
+        response_ids = tokens[len(tokens) - rlen :]
+        loss_mask = _tolist(loss_masks_list[i])
+        full_rollout_lp = full_rollout_lp_list[i]
+        full_train_old_lp = full_train_old_lp_list[i]
+
+        # Post-gather invariants: full log_probs must match response length.
+        assert len(loss_mask) == len(response_ids), (
+            f"sub-traj {i}: loss_mask len {len(loss_mask)} != response_ids len {len(response_ids)}"
+        )
+        assert len(full_rollout_lp) == len(response_ids), (
+            f"sub-traj {i}: gathered rollout_logps len {len(full_rollout_lp)} "
+            f"!= response_ids len {len(response_ids)}"
+        )
+        assert len(full_train_old_lp) == len(response_ids), (
+            f"sub-traj {i}: gathered train_old_logps len {len(full_train_old_lp)} "
+            f"!= response_ids len {len(response_ids)}"
+        )
+
+        # advantages[i] is a per-token tensor with all identical values (GRPO
+        # broadcasts scalar reward to per-token) — collapse to scalar. Under
+        # CP the local shard already has the (broadcast) scalar value, no
+        # gather needed.
+        adv_scalar = float("nan")
+        if i < len(advantages_list):
+            adv_vals = _tolist(advantages_list[i])
+            if len(adv_vals) > 0:
+                adv_scalar = float(adv_vals[0])
+
+        md = metadata_list[i] if i < len(metadata_list) and isinstance(metadata_list[i], dict) else {}
+        rows["group_index"][i] = int(md.get("group_index", -1))
+        rows["sub_traj_index"][i] = int(md.get("sub_traj_index", -1))
+        rows["total_sub_trajs"][i] = int(md.get("total_sub_trajs", -1))
+        rows["is_final"][i] = bool(md.get("is_final", False))
+        rows["outcome"][i] = str(md.get("outcome", ""))
+        rows["summary_source"][i] = str(md.get("summary_source", ""))
+        rows["score_raw"][i] = float(md.get("score_raw", float("nan")))
+        rows["score_final"][i] = float(md.get("score_final", float("nan")))
+        rows["advantage"][i] = adv_scalar
+        rows["prompt_ids"][i] = prompt_ids
+        rows["response_ids"][i] = response_ids
+        rows["loss_mask"][i] = loss_mask
+        rows["rollout_logps"][i] = full_rollout_lp
+        rows["train_old_logps"][i] = full_train_old_lp
+
+    # Sort rows by (group_index, rollout_id, sub_traj_index) so per-rollout
+    # groups (and per-prompt groups) are contiguous downstream.
+    order = sorted(
+        range(n),
+        key=lambda i: (rows["group_index"][i], rows["rollout_id"][i], rows["sub_traj_index"][i]),
+    )
+    sorted_rows = {k: [v[i] for i in order] for k, v in rows.items()}
+
+    schema = pa.schema([
+        pa.field("iter_id", pa.int32()),
+        pa.field("group_index", pa.int32()),
+        pa.field("rollout_id", pa.int32()),
+        pa.field("sub_traj_index", pa.int32()),
+        pa.field("total_sub_trajs", pa.int32()),
+        pa.field("is_final", pa.bool_()),
+        pa.field("outcome", pa.string()),
+        pa.field("summary_source", pa.string()),
+        pa.field("score_raw", pa.float32()),
+        pa.field("score_final", pa.float32()),
+        pa.field("advantage", pa.float32()),
+        pa.field("prompt_ids", pa.list_(pa.int32())),
+        pa.field("response_ids", pa.list_(pa.int32())),
+        pa.field("loss_mask", pa.list_(pa.int8())),
+        pa.field("rollout_logps", pa.list_(pa.float32())),
+        pa.field("train_old_logps", pa.list_(pa.float32())),
+    ])
+    table = pa.table(sorted_rows, schema=schema)
+    pq.write_table(table, out_path, compression="zstd")
+    print(
+        f"[BC+ DUMP] wrote {out_path} n_sub_trajs={n} iter={rollout_id} dp_rank={dp_rank}",
+        flush=True,
+    )

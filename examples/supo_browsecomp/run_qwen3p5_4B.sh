@@ -34,6 +34,12 @@
 #   BCPLUS_COMPRESS_PENALTY     default 0.5 (per-sub-traj penalty when a
 #                                compression turn failed to emit a real
 #                                <summary> block; set to 0 to disable)
+#   BCPLUS_DUMP_DIR             default "" (empty = disabled). When set,
+#                                per-iter parquet dumps of prompt_ids,
+#                                response_ids, loss_mask, rollout_logps,
+#                                train_old_logps, advantage go to
+#                                $BCPLUS_DUMP_DIR/rollouts_iter_NNNNN_dp*.parquet
+#                                for offline TIS drift analysis.
 
 set -euo pipefail
 
@@ -123,6 +129,7 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
                 --env BCPLUS_MAX_SUB_TRAJS='${BCPLUS_MAX_SUB_TRAJS:-}' \
                 --env BCPLUS_MAX_TURNS='${BCPLUS_MAX_TURNS:-}' \
                 --env BCPLUS_COMPRESS_PENALTY='${BCPLUS_COMPRESS_PENALTY:-}' \
+                --env BCPLUS_DUMP_DIR='${BCPLUS_DUMP_DIR:-}' \
                 --env BC_NUM_ROLLOUT='${BC_NUM_ROLLOUT:-}' \
                 --env BC_ROLLOUT_BATCH_SIZE='${BC_ROLLOUT_BATCH_SIZE:-}' \
                 --env BC_N_SAMPLES='${BC_N_SAMPLES:-}' \
@@ -278,7 +285,34 @@ CUSTOM_ARGS=(
    # wandb metrics, using the driver's rollout_id as rollout/step. Called
    # uniformly for sync and async training paths.
    --custom-rollout-log-function-path examples.supo_browsecomp.generate_with_bcplus.log_bcplus
+   # dump_rollout_data_postprocess runs in the trainer after
+   # rollout_log_probs + train_old log_probs + advantages are computed but
+   # before training starts. Writes per-iter parquet of rollout + train-old
+   # state for offline TIS drift / advantage attribution analysis. Only fires
+   # when BCPLUS_DUMP_DIR is non-empty (default disabled).
+   --rollout-data-postprocess-path examples.supo_browsecomp.generate_with_bcplus.dump_rollout_data_postprocess
 )
+
+# When dumping is enabled, force slime to run the pre-training forward pass
+# that populates rollout_data["log_probs"] (train_old). Without this, our
+# canonical config trips can_reuse_log_probs_in_loss=True (num_rollouts ==
+# global_batch_size → 1 training step per iter) and slime skips the forward,
+# leaving train_old_logps empty in the parquet. See dp_schedule.py comments
+# and actor.py:439-451 for the reuse logic.
+if [[ -n "${BCPLUS_DUMP_DIR:-}" ]]; then
+    CUSTOM_ARGS+=(--dump-train-old-log-prob)
+    # Users typically pass the login-pod-visible path (/genai/fsx-project/
+    # hhzhang01/...) since that's what they see with ls / tail. But inside
+    # the container that mount is remapped to /genai_hh (see enroot start
+    # --mount above). Auto-translate so dumps land on the actually-mounted
+    # FSx volume instead of the ephemeral container rootfs (where they
+    # vanish when the srun ends).
+    if [[ "${BCPLUS_DUMP_DIR}" == /genai/fsx-project/hhzhang01/* ]]; then
+        BCPLUS_DUMP_DIR_CONTAINER="${BCPLUS_DUMP_DIR/#\/genai\/fsx-project\/hhzhang01/\/genai_hh}"
+        echo "[BCPLUS] auto-translated BCPLUS_DUMP_DIR host=${BCPLUS_DUMP_DIR} -> container=${BCPLUS_DUMP_DIR_CONTAINER}"
+        export BCPLUS_DUMP_DIR="${BCPLUS_DUMP_DIR_CONTAINER}"
+    fi
+fi
 
 MISC_ARGS+=(
    # log_multi_turn_data reads sample.metadata["round_number"] we set in generate()
@@ -309,7 +343,8 @@ RUNTIME_ENV_JSON="{
     \"BCPLUS_MAX_TURNS\": \"${BCPLUS_MAX_TURNS:-64}\",
     \"BCPLUS_COMPRESS_THRESH\": \"${BCPLUS_COMPRESS_THRESH:-0.85}\",
     \"BCPLUS_MAX_SUB_TRAJS\": \"${BCPLUS_MAX_SUB_TRAJS:-5}\",
-    \"BCPLUS_COMPRESS_PENALTY\": \"${BCPLUS_COMPRESS_PENALTY:-0.5}\"
+    \"BCPLUS_COMPRESS_PENALTY\": \"${BCPLUS_COMPRESS_PENALTY:-0.5}\",
+    \"BCPLUS_DUMP_DIR\": \"${BCPLUS_DUMP_DIR:-}\"
   }
 }"
 
