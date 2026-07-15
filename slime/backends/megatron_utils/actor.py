@@ -459,6 +459,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     and not self.args.use_opd
                     and (not self.args.use_routing_replay or self.args.use_rollout_routing_replay)
                     and self.args.advantage_estimator != "gspo"
+                    and not getattr(self.args, "dump_train_old_log_prob", False)
                 )
                 if (
                     not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics

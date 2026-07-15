@@ -544,6 +544,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--dump-train-old-log-prob",
+                action="store_true",
+                default=False,
+                help=(
+                    "Force slime to run a pre-training forward pass and populate "
+                    "rollout_data['log_probs'] (train_old log-probs) even when "
+                    "can_reuse_log_probs_in_loss would otherwise skip it. Useful "
+                    "for --rollout-data-postprocess-path hooks that dump train_old "
+                    "for offline analysis. Adds one extra forward pass per iter; "
+                    "no memory overhead (unlike --keep-old-actor)."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-data-transport",
                 type=str,
                 choices=["object-store", "nixl"],
