@@ -263,6 +263,25 @@ CKPT_ARGS=(
    --save-interval 5
 )
 
+# Conditional --load for resume. First run: no latest_checkpointed_iteration.txt
+# exists, so we cold-init from --hf-checkpoint. Resume: file exists, add --load
+# so megatron picks up from the last saved iter AND slime's data_source.load()
+# restores sample_offset + epoch_id (data order stays identical because
+# rollout_shuffle is deterministic on `seed + epoch_id`, seed=42 default).
+#
+# To resume a specific run:
+#   export RUN_NAME=<the-original-run-name>   # same name as first submission
+#   bash run_qwen3p5_4B_colocate.sh
+# Without the RUN_NAME export the outer part generates a fresh timestamp,
+# CKPT_SAVE_DIR points to a new empty dir, and the branch below no-ops.
+if [[ -f "${CKPT_SAVE_DIR}/latest_checkpointed_iteration.txt" ]]; then
+    LOADED_ITER=$(cat "${CKPT_SAVE_DIR}/latest_checkpointed_iteration.txt" 2>/dev/null || echo "?")
+    echo "[head] resuming from ${CKPT_SAVE_DIR} (last iter: ${LOADED_ITER})"
+    CKPT_ARGS+=(--load "${CKPT_SAVE_DIR}")
+else
+    echo "[head] first run — cold init from ${HF_CKPT_HOST}"
+fi
+
 ROLLOUT_ARGS=(
    --prompt-data "${TRAIN_DATA}"
    --input-key prompt
