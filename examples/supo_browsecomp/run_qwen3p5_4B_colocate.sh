@@ -444,10 +444,20 @@ ray job submit --address="http://127.0.0.1:8265" \
 TRAIN_STATUS=$?
 echo "[head] ray job submit returned status=${TRAIN_STATUS}"
 
+# Disable errexit for the tail cleanup. Long-running training on FSx-mounted
+# /slime can leave the NFS session stale; when bash tries to read the next
+# script line after ray job submit returns, it can fail with:
+#   /slime/examples/.../run_qwen3p5_4B_colocate.sh: error reading input file:
+#     Stale file handle
+# Under `set -e` that immediately trips exit 2 even though training itself
+# succeeded (ray job returned status=0). Downgrading errexit here lets the
+# cleanup lines and final exit fall through so srun reflects TRAIN_STATUS.
+set +e
+
 # Signal workers to exit so srun can complete.
-touch "${DONE_FILE}"
+touch "${DONE_FILE}" 2>/dev/null || true
 echo "[head] wrote DONE, waiting for workers to exit"
-sleep 30
-ray stop --force || true
+sleep 30 || true
+ray stop --force 2>/dev/null || true
 
 exit ${TRAIN_STATUS}
