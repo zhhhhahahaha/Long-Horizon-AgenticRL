@@ -16,7 +16,7 @@ from slime.ray.train_actor import TrainRayActor
 from slime.utils import train_dump_utils
 from slime.utils.data import process_rollout_data
 from slime.utils.distributed_utils import get_gloo_group
-from slime.utils.logging_utils import init_tracking
+from slime.utils.logging_utils import finish_tracking, init_tracking
 from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.misc import Box
 from slime.utils.reloadable_process_group import (
@@ -199,6 +199,21 @@ class MegatronTrainRayActor(TrainRayActor):
         self.prof.on_init_end()
 
         return start_rollout_id
+
+    def finish_tracking(self) -> None:
+        """Flush wandb from the megatron main rank so the final iter's train
+        metrics land on disk before the ray actor is torn down.
+
+        Without this, actor's last-iter wandb.log() sits in the async buffer
+        when ray shuts down the actor process, and the last iter's train
+        metrics (loss, kl_loss, tis, grad_norm, ...) are lost. Only
+        `is_megatron_main_rank()` calls wandb.init in `init()` above, so only
+        that rank should finish.
+
+        Called from train.py after the training loop, before ray shuts down.
+        """
+        if is_megatron_main_rank():
+            finish_tracking(self.args)
 
     @timer
     def sleep(self) -> None:

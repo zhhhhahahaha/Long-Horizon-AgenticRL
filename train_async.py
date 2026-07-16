@@ -72,6 +72,12 @@ def train(args):
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             ray.get(rollout_manager.eval.remote(rollout_id))
 
+    # Flush wandb on all training actors BEFORE ray shuts down. See train.py
+    # for the full rationale — same fix.
+    actor_model.finish_tracking()
+    if args.use_critic and critic_model is not None:
+        critic_model.finish_tracking()
+
     ray.get(rollout_manager.dispose.remote())
     finish_tracking(args)
 

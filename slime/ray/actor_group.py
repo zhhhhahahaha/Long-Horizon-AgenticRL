@@ -177,6 +177,23 @@ class RayTrainGroup:
     def offload(self):
         return ray.get([actor.sleep.remote() for actor in self._actor_handlers])
 
+    def finish_tracking(self):
+        """Flush wandb on every ray actor before shutdown.
+
+        Only megatron main rank actually holds a wandb.run (see actor.py
+        init(), init_tracking is called under `if is_megatron_main_rank()`).
+        Calling on all handlers is safe because each actor's finish_tracking
+        internally checks that condition and no-ops on non-main ranks.
+
+        Must be called by train.py after the training loop and BEFORE ray
+        shuts down (`ray.get(rollout_manager.dispose)` + train.py exit),
+        otherwise the last iter's async wandb.log() batch is dropped when
+        the actor process is torn down. Was: last iter's train/loss,
+        train/kl_loss, train/tis stats, train/grad_norm silently missing
+        from wandb.
+        """
+        return ray.get([actor.finish_tracking.remote() for actor in self._actor_handlers])
+
     def release(self):
         actors, self._actor_handlers = self._actor_handlers, []
         for actor in actors:
