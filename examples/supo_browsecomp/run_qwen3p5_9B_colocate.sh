@@ -299,6 +299,12 @@ SGLANG_ARGS=(
    # training. Engine TP=4 → 64/4 = 16 sglang engines running concurrently.
    --rollout-num-gpus-per-engine 4
    --sglang-mem-fraction-static 0.7
+   # Disable custom all-reduce. sglang's custom_all_reduce.cuh path fails
+   # CUDA graph capture with "CUDA error: invalid argument" at TP=4 on our
+   # A100 nodes (retool 4B RL uses TP=2 and does not hit it). Falling back
+   # to NCCL for intra-TP reduce is slightly slower on small sizes but
+   # avoids the crash entirely; the 4B canonical script also sets this.
+   --sglang-disable-custom-all-reduce
 )
 
 MISC_ARGS=(
