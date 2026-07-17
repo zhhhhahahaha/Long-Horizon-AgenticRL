@@ -520,6 +520,23 @@ class MegatronTrainRayActor(TrainRayActor):
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
+            # Defrag PyTorch's caching allocator before actor forward+backward.
+            # ref_forward + optional old_actor forward preceding this line each
+            # allocate/free a 15+ GB fp32 softmax buffer per microbatch across
+            # 40+ microbatches. Mixed with GB-scale attention/FFN intermediates,
+            # the caching allocator fragments to tens of GB of reserved-unallocated
+            # space (empirically observed 30 GB unusable at OOM on 4B 8-node run).
+            # Actor forward's first microbatch then can't get a contiguous 15 GB
+            # for its own log_prob softmax and OOMs.
+            #
+            # Colocate mode uses torch_memory_saver which is mutually exclusive
+            # with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (the fix
+            # PyTorch itself recommends), so we can't rely on the allocator's
+            # anti-fragmentation feature. Manual empty_cache is the workaround.
+            #
+            # Cost: milliseconds per iter. Rev vs re-doing 40+ mb of ref forward
+            # after OOM is a no-brainer.
+            clear_memory()
             with timer("actor_train"):
                 train(
                     rollout_id,
