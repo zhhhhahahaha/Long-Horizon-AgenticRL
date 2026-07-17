@@ -162,7 +162,7 @@ def _next_actor():
     return actor
 
 
-async def _post(client, url, payload, max_retries=60, headers=None):
+async def _post(client, url, payload, max_retries=3, headers=None):
     retry_count = 0
     while retry_count < max_retries:
         response = None
@@ -221,7 +221,14 @@ def init_http_client(args):
     if _http_client is None:
         _http_client = httpx.AsyncClient(
             limits=httpx.Limits(max_connections=_client_concurrency),
-            timeout=httpx.Timeout(None),
+            # Bounded read timeout. Prior config was timeout=None which caused
+            # per-POST to wait forever if sglang dropped or lost a response —
+            # observed on an 8-node BC+ run where 8 rollouts hung 15h with no
+            # error log until slurm walltime. read=1200s covers worst-case
+            # legit generation (max_new_tokens=32k / ~30 tok/s per request
+            # when engine is fully loaded at ~16 concurrent = ~18min) with
+            # margin. connect/write bounded to catch TCP hangs early.
+            timeout=httpx.Timeout(connect=30.0, read=1200.0, write=30.0, pool=None),
             trust_env=False,  # internal SGLang comm only — never route through system proxy
         )
 
@@ -255,14 +262,15 @@ def _init_ray_distributed_post(args):
     @ray.remote
     class _HttpPosterActor:
         def __init__(self, concurrency: int):
-            # Lazy creation to this actor's event loop
+            # Lazy creation to this actor's event loop. See init_http_client
+            # for why timeout is bounded (never leave read=None).
             self._client = httpx.AsyncClient(
                 limits=httpx.Limits(max_connections=max(1, concurrency)),
-                timeout=httpx.Timeout(None),
+                timeout=httpx.Timeout(connect=30.0, read=1200.0, write=30.0, pool=None),
                 trust_env=False,  # internal SGLang comm only — never route through system proxy
             )
 
-        async def do_post(self, url, payload, max_retries=60, headers=None):
+        async def do_post(self, url, payload, max_retries=3, headers=None):
             return await _post(self._client, url, payload, max_retries, headers=headers)
 
     # Create actors per node
@@ -288,7 +296,7 @@ def _init_ray_distributed_post(args):
     _post_actors = created
 
 
-async def post(url, payload, max_retries=60, headers=None):
+async def post(url, payload, max_retries=3, headers=None):
     # If distributed mode is enabled and actors exist, dispatch via Ray.
     if _distributed_post_enabled and _post_actors:
         try:
