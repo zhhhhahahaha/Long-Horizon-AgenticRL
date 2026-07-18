@@ -1,10 +1,26 @@
 #!/bin/bash
-# BrowseComp-Plus RL — Qwen3.5-9B baseline on 8 A100 nodes (colocate mode).
+# BrowseComp-Plus RL — Qwen3.5-9B on 8 A100 nodes (colocate mode).
 #
-# All-in-one launcher: same 64 GPUs (8 nodes × 8 GPU) run rollout, then swap
-# to training via slime's --colocate offload dance. No external sglang server
-# job like the 4B canonical setup — sglang engines start on the training
-# GPUs and get replaced with actor weights each iter.
+# Fork of run_qwen3p5_4B_colocate.sh with model swapped to 9B + CP=2 +
+# smaller max_tokens_per_gpu. Same colocate machinery (per-node /dev/shm
+# rootfs staging, COORD_DIR host->container path split, EXIT trap,
+# --sglang-disable-custom-all-reduce, wandb-sync poll, conditional --load).
+#
+# Why CP=2 for 9B: Qwen3.5-9B has hidden=4096 (vs 4B's 2560), so its
+# activations are ~40% larger than 4B. On the 4B 8-node canonical we
+# already had to add clear_memory() before actor.train() to survive the
+# 30 GB PyTorch-cache fragmentation caused by ref forward's 15 GB fp32
+# softmax alloc-free cycles. 9B pushes that alloc to ~24 GB per rank at
+# TP=4 CP=1 — too tight even with the defrag fix. CP=2 splits seq dim in
+# half so vocab head activation drops to ~12 GB per rank, leaving room.
+#
+# Also using max_tokens_per_gpu=32768 (vs 4B's 65536): further caps
+# per-microbatch peak. Oversized single samples (>32k) still get their
+# own microbatch via first_fit_pack. TP=4 == num_query_groups=4 avoids
+# the megatron _apply_output_gate shape bug that broke earlier TP=8 tries.
+#
+# Physical layout at 8 nodes: TP=4 × CP=2 × PP=1 = 8 GPU per model group,
+# 64 GPU / 8 = DP=8. Global batch 256 / DP=8 = 32 samples per DP per iter.
 #
 # Two-part launcher:
 #   * Outer part (login pod): auto-discovers search server, exports RUN_NAME,
@@ -81,9 +97,18 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
     echo "coord dir host: ${COORD_DIR_HOST}"
     echo "coord dir container: ${COORD_DIR}"
 
-    # One srun spanning all 8 nodes. `--ntasks-per-node=1` → one enroot per node.
+    # One srun spanning all N nodes. `--ntasks-per-node=1` → one enroot per node.
     # `--exclusive` reserves the full node so nothing else lands on our GPUs.
-    exec srun \
+    #
+    # We background srun and drive a wandb-sync poll loop from this login-pod
+    # shell while training runs — mirrors the launch_all.sh orchestration
+    # pattern used by the 4B external-sglang canonical. This lets you watch
+    # loss curves on wandb.ai mid-run without waiting for the whole job to
+    # finish. Sync interval defaults to 5 min (override via WANDB_SYNC_INTERVAL_SEC).
+    WANDB_SYNC_INTERVAL_SEC="${WANDB_SYNC_INTERVAL_SEC:-300}"
+    SYNC_SCRIPT=/home/hhzhang01/slime/aws-cluster/wandb-sync.sh
+
+    srun \
         --nodes=${NUM_NODES} --gpus-per-node=8 --ntasks-per-node=1 --exclusive \
         --cpus-per-task=64 --mem=0 \
         --account="${SLURM_ACCOUNT}" --qos="${QOS}" \
@@ -138,7 +163,31 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
                 --env BC_MAX_CONTEXT_LEN='${BC_MAX_CONTEXT_LEN:-}' \
                 ${ENROOT_ROOTFS} \
                 bash /slime/examples/supo_browsecomp/run_qwen3p5_9B_colocate.sh
-        "
+        " &
+    TRAIN_PID=$!
+    echo "[outer] srun backgrounded, pid=${TRAIN_PID}; wandb-sync every ${WANDB_SYNC_INTERVAL_SEC}s"
+
+    # Ctrl-C in this shell -> scancel the slurm job so we don't leak.
+    trap 'echo "[outer] SIGINT: scancel ${RUN_NAME}"; scancel --jobname="${RUN_NAME}" 2>/dev/null; exit 130' INT TERM
+
+    # Poll wandb-sync while training alive. sync failures are non-fatal
+    # (wandb service on login pod occasionally has hiccups; keep going).
+    while kill -0 "${TRAIN_PID}" 2>/dev/null; do
+        sleep "${WANDB_SYNC_INTERVAL_SEC}"
+        if ! bash "${SYNC_SCRIPT}" "${RUN_NAME}" 2>&1 | sed 's/^/[wandb-sync] /'; then
+            echo "[outer] mid-run wandb-sync returned non-zero; continuing"
+        fi
+    done
+
+    wait "${TRAIN_PID}"
+    TRAIN_STATUS=$?
+    echo "[outer] training finished with status ${TRAIN_STATUS}"
+
+    # Final sync — catch anything the last periodic sync missed.
+    echo "[outer] final wandb-sync for ${RUN_NAME}"
+    bash "${SYNC_SCRIPT}" "${RUN_NAME}" 2>&1 | sed 's/^/[wandb-sync] /' || true
+
+    exit "${TRAIN_STATUS}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -221,6 +270,25 @@ CKPT_ARGS=(
    --save-interval 5
 )
 
+# Conditional --load for resume. First run: no latest_checkpointed_iteration.txt
+# exists, so we cold-init from --hf-checkpoint. Resume: file exists, add --load
+# so megatron picks up from the last saved iter AND slime's data_source.load()
+# restores sample_offset + epoch_id (data order stays identical because
+# rollout_shuffle is deterministic on `seed + epoch_id`, seed=42 default).
+#
+# To resume a specific run:
+#   export RUN_NAME=<the-original-run-name>   # same name as first submission
+#   bash run_qwen3p5_4B_colocate.sh
+# Without the RUN_NAME export the outer part generates a fresh timestamp,
+# CKPT_SAVE_DIR points to a new empty dir, and the branch below no-ops.
+if [[ -f "${CKPT_SAVE_DIR}/latest_checkpointed_iteration.txt" ]]; then
+    LOADED_ITER=$(cat "${CKPT_SAVE_DIR}/latest_checkpointed_iteration.txt" 2>/dev/null || echo "?")
+    echo "[head] resuming from ${CKPT_SAVE_DIR} (last iter: ${LOADED_ITER})"
+    CKPT_ARGS+=(--load "${CKPT_SAVE_DIR}")
+else
+    echo "[head] first run — cold init from ${HF_CKPT_HOST}"
+fi
+
 ROLLOUT_ARGS=(
    --prompt-data "${TRAIN_DATA}"
    --input-key prompt
@@ -249,25 +317,28 @@ ROLLOUT_ARGS=(
 )
 
 PERF_ARGS=(
-   # 8 nodes × 8 GPU = 64 GPUs. TP=4 × CP=1 × PP=1 × DP=16 = 64.
-   # TP=4 matches num_query_groups=4 in qwen3.5-9B.sh (one KV head per rank);
-   # this is the same TP that slime's qwen3-30B / qwen3-235B (both GQA=4) use.
-   # Setting TP=8 with GQA=4 requires megatron to replicate KV heads across
-   # 2 ranks; not all megatron versions support it, so we play safe with TP=4.
-   # DP=16 means each DP-rank gets global_batch/16 = 16 samples per iter.
+   # 8 nodes × 8 GPU = 64 GPUs. TP=4 × CP=2 × PP=1 × DP=8 = 64.
+   # TP=4 == num_query_groups=4: each rank gets exactly 1 KV head, no
+   # replication → avoids the megatron _apply_output_gate shape bug that
+   # trips at TP > num_query_groups.
+   # CP=2: split seq dim across 2 ranks (ring attention). Halves per-rank
+   # activation memory. Needed for 9B (hidden=4096) — with CP=1, the
+   # 15+ GB fp32 softmax alloc during ref forward would leave too little
+   # headroom even after our clear_memory() defrag. CP=2 drops the peak
+   # transient to ~7 GB per rank.
    --tensor-model-parallel-size 4
    --sequence-parallel
    --pipeline-model-parallel-size 1
-   --context-parallel-size 1
+   --context-parallel-size 2
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 2
    --use-dynamic-batch-size
-   # max-tokens-per-gpu sets microbatch packing target per DP-rank (TP-invariant).
-   # 65536 = single-sample microbatch when a sub-traj hits the compression
-   # trigger (~55.7k tokens). With TP=4 + SP + recompute-num-layers=2, per-rank
-   # activation for one 65k sample fits comfortably in 80 GB A100.
-   --max-tokens-per-gpu 65536
+   # max-tokens-per-gpu: 32k tokens per microbatch (per DP-rank). Oversized
+   # single samples (>32k) still get their own microbatch via first_fit_pack;
+   # this cap just makes shorter samples pack tighter to further trim vocab
+   # head peak per microbatch on the 9B.
+   --max-tokens-per-gpu 32768
 )
 
 GRPO_ARGS=(
@@ -406,10 +477,20 @@ ray job submit --address="http://127.0.0.1:8265" \
 TRAIN_STATUS=$?
 echo "[head] ray job submit returned status=${TRAIN_STATUS}"
 
+# Disable errexit for the tail cleanup. Long-running training on FSx-mounted
+# /slime can leave the NFS session stale; when bash tries to read the next
+# script line after ray job submit returns, it can fail with:
+#   /slime/examples/.../run_qwen3p5_4B_colocate.sh: error reading input file:
+#     Stale file handle
+# Under `set -e` that immediately trips exit 2 even though training itself
+# succeeded (ray job returned status=0). Downgrading errexit here lets the
+# cleanup lines and final exit fall through so srun reflects TRAIN_STATUS.
+set +e
+
 # Signal workers to exit so srun can complete.
-touch "${DONE_FILE}"
+touch "${DONE_FILE}" 2>/dev/null || true
 echo "[head] wrote DONE, waiting for workers to exit"
-sleep 30
-ray stop --force || true
+sleep 30 || true
+ray stop --force 2>/dev/null || true
 
 exit ${TRAIN_STATUS}
