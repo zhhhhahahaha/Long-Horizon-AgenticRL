@@ -925,26 +925,29 @@ async def _run_one_sub_trajectory(
         finish_reason = output["meta_info"]["finish_reason"]["type"]
         finish_reason_last = finish_reason
         if finish_reason == "abort":
+            # Abort path: never commit cur_tokens (matches prior behavior —
+            # the aborted turn's partial output does not enter sample).
             sample.status = Sample.Status.ABORTED
             outcome = "aborted"
             _stash()
             return outcome
 
+        # Sglang output kept LOCAL until we decide the turn is safe to commit.
+        # This lets us drop it atomically (with obs) under the projected-size
+        # compression check below — matches SUPO's rollback(k=2) semantics
+        # (undo assistant + tool_response, then summarize on clean boundary).
         cur_text = output["text"]
         cur_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
         cur_logps = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
 
-        response_token_ids += cur_tokens
-        sample.append_response_tokens(
-            args,
-            tokens=cur_tokens,
-            log_probs=cur_logps,
-            trainable=True,
-            meta_info=output["meta_info"],
-            text=cur_text,
-        )
-
         if finish_reason == "length":
+            # Length-truncated turn: still commit the model's output; the
+            # sample records what actually generated. No obs to worry about.
+            sample.append_response_tokens(
+                args, tokens=cur_tokens, log_probs=cur_logps, trainable=True,
+                meta_info=output["meta_info"], text=cur_text,
+            )
+            response_token_ids += cur_tokens
             sample.status = Sample.Status.TRUNCATED
             outcome = "truncated"
             _stash()
@@ -988,22 +991,58 @@ async def _run_one_sub_trajectory(
                 n_bad_tool_calls += 1
 
         if finish_answer is not None:
+            # Finish path: commit cur_tokens (they contain the finish tool_call)
+            # but no obs — the finish tool has no observation to inject.
+            sample.append_response_tokens(
+                args, tokens=cur_tokens, log_probs=cur_logps, trainable=True,
+                meta_info=output["meta_info"], text=cur_text,
+            )
+            response_token_ids += cur_tokens
             sample.status = Sample.Status.COMPLETED
             outcome = "finished"
             _stash()
             return outcome
 
-        # Compression check BEFORE injecting the tool-response observation.
-        # If total context is already over budget, don't blow it further by
-        # appending the obs — instead, close out with a compression turn.
-        # Total = prompt + accumulated response tokens (this is what sglang
-        # sees as input_ids on the next turn).
-        total_context_len = len(prompt_ids) + len(response_token_ids)
-        if total_context_len > compress_threshold_tokens:
+        # Compute the obs we'd append IF we commit this turn — needed to
+        # know the projected total context if the append goes through.
+        obs_wrapped = _wrap_observation_and_reopen_assistant(observation)
+        obs_tokens = tokenizer(obs_wrapped, add_special_tokens=False)["input_ids"]
+
+        # Projected total context (what sglang would see on the NEXT turn if
+        # we commit both cur_tokens and obs_tokens now).
+        projected = len(prompt_ids) + len(response_token_ids) + len(cur_tokens) + len(obs_tokens)
+
+        # Diagnostic: flag turns where obs ALONE is huge (pathological tool
+        # response, e.g. a single search/open_page that returned >30k tokens).
+        # This is the interesting outlier signal — normal compression firings
+        # are covered by the [BC+ COMPRESS DEBUG] line below and don't need
+        # to double-log here.
+        if len(obs_tokens) > 30_000:
+            fn_name = fn_calls[0].get("function") if fn_calls else "none"
+            print(
+                f"[BC+ OBS OUTLIER] turn={_turn} fn={fn_name} "
+                f"obs_tokens={len(obs_tokens)} cur_tokens={len(cur_tokens)} "
+                f"resp_before={len(response_token_ids)} projected={projected} "
+                f"thresh={compress_threshold_tokens}",
+                flush=True,
+            )
+
+        # Compression check on projected size (post-commit hypothetical).
+        # If the commit would push us over threshold, DROP cur_tokens + obs
+        # (never committed to sample) and run compression on the pre-turn
+        # state — same tokens the model saw before this turn's sglang call.
+        # This is SUPO's rollback(k=2) semantics: undo assistant + tool_response,
+        # then summarize on a clean assistant-turn boundary. Prior code
+        # checked the PRE-obs response length here, which missed the case
+        # where a single obs blows past the sglang server context (262 144)
+        # and 400s the next-turn call.
+        if projected > compress_threshold_tokens:
             print(
                 f"[BC+ COMPRESS DEBUG] compression triggered on turn {_turn} "
-                f"(total_context={total_context_len} = prompt {len(prompt_ids)} + "
-                f"resp {len(response_token_ids)} > thresh={compress_threshold_tokens})",
+                f"(projected={projected} = prompt {len(prompt_ids)} + "
+                f"resp {len(response_token_ids)} + cur {len(cur_tokens)} + "
+                f"obs {len(obs_tokens)} > thresh={compress_threshold_tokens}); "
+                f"dropping cur+obs (rollback), compressing on pre-turn state",
                 flush=True,
             )
             summary_from_compress, summary_source, _ = await _do_compression(
@@ -1019,12 +1058,16 @@ async def _run_one_sub_trajectory(
             _stash()
             return outcome
 
-        obs_wrapped = _wrap_observation_and_reopen_assistant(observation)
-        obs_tokens = tokenizer(obs_wrapped, add_special_tokens=False)["input_ids"]
-        response_token_ids += obs_tokens
+        # Safe to commit both cur_tokens and obs_tokens.
+        sample.append_response_tokens(
+            args, tokens=cur_tokens, log_probs=cur_logps, trainable=True,
+            meta_info=output["meta_info"], text=cur_text,
+        )
+        response_token_ids += cur_tokens
         sample.append_response_tokens(
             args, tokens=obs_tokens, trainable=False, text=obs_wrapped,
         )
+        response_token_ids += obs_tokens
 
     # max_turns exhausted without finish/compress/length/abort.
     sample.status = Sample.Status.TRUNCATED
