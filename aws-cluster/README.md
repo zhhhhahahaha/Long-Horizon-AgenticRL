@@ -15,7 +15,12 @@ slime code — it's here so this directory is a single grep-able answer to
 - **`wandb-sync.sh`** — after a training job finishes (or every 5 min mid-run
   via `launch_all.sh`), run this on the **login pod** to upload the offline
   wandb runs to wandb.ai. Reads the API key from `/home/hhzhang01/.wandb-key`
-  (chmod 600, kept outside the repo). Uses stock `python3 -m wandb sync`.
+  (chmod 600, kept outside the repo). Uses `python3 -m wandb sync --append`.
+  `--append` is required because the script re-syncs the same *still-growing*
+  offline runs every 5 min: plain `wandb sync` closes the cloud run after the
+  first upload, freezing a live/resumed run at its first-synced step; `--append`
+  resumes each run and pushes only the new steps. Also the on-demand command for
+  "sync now so I can see the curves": `bash wandb-sync.sh <RUN_NAME>`.
 - **`wandb-sync-merged.py`** — **DEPRECATED**, kept for reference only.
   Was an earlier attempt to fix the multi-process wandb offline sync bug
   (see below); introduced its own file_stream offset collision bug. Will be

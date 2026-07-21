@@ -12,11 +12,20 @@
 # The API key is read from /home/hhzhang01/.wandb-key (chmod 600). Never
 # passed on the command line or exported into shell history.
 #
-# Uses stock `python3 -m wandb sync`. Slime now creates ONE offline dir per
+# Uses `python3 -m wandb sync --append`. Slime now creates ONE offline dir per
 # Ray actor (RolloutManager + Megatron), each a distinct wandb run joined by
 # group=RUN_NAME. Cloud UI auto-groups them, no shared run_id / no _step
 # collision. See slime/utils/wandb_utils.py + aws-cluster/README.md for
 # the multi-run-per-group design.
+#
+# Why --append: this script is called repeatedly (every 5 min) on the same
+# still-growing offline runs. Plain `wandb sync` is a one-shot uploader — it
+# captures a run at its current EOF and then CLOSES the cloud run, so a live
+# run freezes at whatever step the first sync caught (dead runs look fine only
+# because their file no longer grows). --append (resume="allow") resumes each
+# cloud run and uploads just the new steps, so incremental/live sync works and
+# resumed runs keep advancing. Idempotent: re-syncing a complete run pushes
+# nothing new.
 
 set -eu
 
@@ -46,4 +55,4 @@ if [[ ${#matches[@]} -eq 0 ]]; then
 fi
 
 echo "wandb-sync.sh: syncing ${#matches[@]} offline dir(s) as independent runs..."
-python3 -m wandb sync "${matches[@]}"
+python3 -m wandb sync --append "${matches[@]}"
