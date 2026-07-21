@@ -310,21 +310,31 @@ ROLLOUT_ARGS=(
 )
 
 PERF_ARGS=(
-   # 8 nodes × 8 GPU = 64 GPUs. TP=4 × CP=1 × PP=1 × DP=16 = 64.
+   # 8 nodes × 8 GPU = 64 GPUs. TP=4 × CP=2 × PP=1 × DP=8 = 64.
    # TP=4 == num_query_groups=4: each rank gets exactly 1 KV head, no
    # replication. Avoids the megatron _apply_output_gate shape bug that
    # trips at TP > num_query_groups (which is what killed our TP=8 9B run).
-   # 4B fits comfortably at TP=4 CP=1 (hidden=2560 → activations are ~40%
-   # smaller than 9B's, no OOM even at 65k context).
+   # CP=2 (was 1): the previous CP=1 config OOM'd on run 292745 at iter 10
+   # (actor train's vocab_parallel_softmax needed 15 GB for a 55834-token
+   # sample × vocab_size/TP=4 × fp32 logits; PyTorch had 25 GB reserved-
+   # but-unallocated i.e. fragmented, couldn't find a contiguous 15 GB
+   # block). --recompute-granularity full doesn't help this because it
+   # only recomputes transformer layers, not the loss-side vocab head.
+   # CP=2 shards along seq dim, halving per-rank loss compute to
+   # 27917 tokens × vocab_size/TP=4 × 4 bytes ≈ 4.2 GB (fits comfortably).
    --tensor-model-parallel-size 4
    --sequence-parallel
    --pipeline-model-parallel-size 1
-   --context-parallel-size 1
+   --context-parallel-size 2
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 2
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 65536
+   # max-tokens-per-gpu: 32k tokens per microbatch per DP rank (was 65k).
+   # Combined with CP=2 halving per-rank seq, one microbatch's peak
+   # vocab-head alloc is ~4 GB, well within 80 GB HBM after model shard,
+   # activation, optimizer state, and torch_memory_saver overhead.
+   --max-tokens-per-gpu 32768
 )
 
 GRPO_ARGS=(
