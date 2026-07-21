@@ -63,6 +63,15 @@ CORPUS_DATASET = "Tevatron/browsecomp-plus-corpus"
 CORPUS_EMBEDDING_DATASET = "miaolu3/browsecomp-plus"
 CORPUS_EMBEDDING_FILE = "corpus_embeddings.pkl"
 
+# The embedding workers are launched with mp start_method="spawn", so each child
+# RE-IMPORTS this module — and the `MODEL_NAME = args.model` reassignment in the
+# __main__ block does NOT run in a child (its __name__ != "__main__"). Without
+# this, workers fall back to the HF repo id default above and try to reach
+# huggingface.co (fatal on an offline cluster like MAST). Reading the path from
+# an env var here (set by __main__ from --model) makes spawned children inherit
+# the real local checkpoint path.
+MODEL_NAME = os.environ.get("SEARCH_SERVER_MODEL", MODEL_NAME)
+
 @dataclass
 class SearchRequest:
     query: str
@@ -244,10 +253,15 @@ def optimized_worker(gpu_id: int, batch_queue: mp.Queue, result_queue: mp.Queue,
         os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
         device = torch.device("cuda:0")
 
-        # Load model
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, padding_side='left')
+        # Load model. Force local-only on air-gapped clusters (HF_HUB_OFFLINE=1,
+        # e.g. MAST) so a missing file errors instead of silently hitting the
+        # hub; keep the hub-download fallback available everywhere else.
+        offline = os.getenv("HF_HUB_OFFLINE") == "1"
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, padding_side='left',
+                                                  local_files_only=offline)
         model = AutoModel.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16,
-                                          attn_implementation="flash_attention_2").to(device)
+                                          attn_implementation="flash_attention_2",
+                                          local_files_only=offline).to(device)
         model.eval()
 
         # Load corpus embeddings
@@ -564,6 +578,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     MODEL_NAME = args.model
+    # Propagate to env so spawn-launched workers (which re-import this module)
+    # pick up the local checkpoint path instead of the HF repo-id default.
+    os.environ["SEARCH_SERVER_MODEL"] = args.model
     CORPUS_DATASET = args.corpus
     CORPUS_EMBEDDING_DATASET = args.corpus_embedding_dataset
     CORPUS_EMBEDDING_FILE = args.corpus_embedding_file
