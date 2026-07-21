@@ -212,8 +212,18 @@ class MegatronTrainRayActor(TrainRayActor):
 
         Called from train.py after the training loop, before ray shuts down.
         """
-        if is_megatron_main_rank():
-            finish_tracking(self.args)
+        # NOTE: do NOT gate on is_megatron_main_rank() here. In colocate mode the
+        # ReloadableProcessGroup that backs the DP/TP/PP groups is offloaded
+        # (self.group set to None) by the end of the run, so querying
+        # mpu.get_data_parallel_rank() at teardown raises
+        # `'NoneType' object has no attribute 'rank'` (reloadable_process_group
+        # .rank() -> self.group.rank()) and crashes the whole job with exit 1
+        # AFTER training already completed. finish_tracking() is self-guarding:
+        # it no-ops unless args.use_wandb AND wandb.run is not None, and only the
+        # rank that called wandb.init() in init() has a live wandb.run — so
+        # calling it unconditionally on every actor still finishes exactly the
+        # one main-rank run, without touching the (possibly torn-down) PGs.
+        finish_tracking(self.args)
 
     @timer
     def sleep(self) -> None:
