@@ -338,11 +338,12 @@ PERF_ARGS=(
    --recompute-method uniform
    --recompute-num-layers 2
    --use-dynamic-batch-size
-   # max-tokens-per-gpu: 32k tokens per microbatch per DP rank (was 65k).
-   # Combined with CP=2 halving per-rank seq, one microbatch's peak
-   # vocab-head alloc is ~4 GB, well within 80 GB HBM after model shard,
-   # activation, optimizer state, and torch_memory_saver overhead.
-   --max-tokens-per-gpu 32768
+   # max-tokens-per-gpu: 48k tokens per microbatch per DP rank (was 32k after
+   # the CP=1→CP=2 fix). Empirical peak used_GB on 293928 was 22.58 GB out of
+   # 79.25 GB (28.5% util) with 32k; ~56 GB free. 48k = 1.5x should push
+   # peak to ~30-35 GB, still well within budget. Larger microbatch = fewer
+   # microbatch iterations per training step = less framework overhead.
+   --max-tokens-per-gpu 49152
 )
 
 GRPO_ARGS=(
