@@ -353,14 +353,25 @@ OPTIMIZER_ARGS=(
 SGLANG_ARGS=(
    # Colocate: sglang engines run on the same 64 GPUs as the training actor.
    # Slime offloads actor weights to CPU during rollout and re-onloads before
-   # training. Engine TP=4 → 64/4 = 16 sglang engines running concurrently.
-   --rollout-num-gpus-per-engine 4
+   # training. Engine TP=2 → 64/2 = 32 sglang engines running concurrently.
+   # 4B model at 64k context: KV cache per max-length request ~4.7 GB, so per
+   # engine (2 GPU, ~126 GB free HBM) can hold ~50 concurrent max-len requests
+   # — vast headroom vs BC+ per-engine load of ~8 concurrent. Prior TP=4 was
+   # over-sharded: same aggregate bandwidth but half the engine count, so
+   # per-engine concurrency capacity was under-utilized and rollout was the
+   # main bottleneck (wait_time_ratio ~48%). Actor keeps TP=4 (Megatron topo
+   # unchanged); slime's colocate weight update all-gathers actor's TP=4
+   # shards to full HF tensor, then IPC-distributes to sglang's TP=2 engines
+   # — no manual reshape needed. Precedent: examples/retool/retool_qwen3_4b_rl.sh
+   # (same model size, uses TP=2), examples/on_policy_distillation/run-qwen3-8B-opd.sh
+   # (actor_tp=2 vs sglang_tp=1).
+   --rollout-num-gpus-per-engine 2
    --sglang-mem-fraction-static 0.7
-   # Disable custom all-reduce. sglang's custom_all_reduce.cuh path fails
-   # CUDA graph capture with "CUDA error: invalid argument" at TP=4 on our
-   # A100 nodes (retool 4B RL uses TP=2 and does not hit it). Falling back
-   # to NCCL for intra-TP reduce is slightly slower on small sizes but
-   # avoids the crash entirely; the 4B canonical script also sets this.
+   # Disable custom all-reduce. In colocate mode, torch_memory_saver's CUDA
+   # VMM allocations are incompatible with sglang's custom_all_reduce.cuh
+   # (which relies on cudaIpcGetMemHandle for cross-rank shared memory). NCCL
+   # fallback is slightly slower on small reductions but works. This applies
+   # at any TP > 1.
    --sglang-disable-custom-all-reduce
 )
 
