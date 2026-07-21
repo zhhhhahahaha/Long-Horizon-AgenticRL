@@ -87,6 +87,13 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
     COORD_DIR_HOST=/genai/fsx-project/hhzhang01/logs/ray-coord/${RUN_NAME}
     COORD_DIR=/genai_hh/logs/ray-coord/${RUN_NAME}
     mkdir -p "${COORD_DIR_HOST}"
+    # Clean stale coord files from a prior run of the same RUN_NAME. Without
+    # this, resume submits will hang forever: the prior run's EXIT trap
+    # (`touch DONE`) leaves `done` around, and workers on this new job's poll
+    # loop see DONE at startup and immediately exit — only the head node
+    # joins Ray, placement group waits forever for the missing 7 nodes.
+    # Observed on 293413 (6 h wasted before we noticed).
+    rm -f "${COORD_DIR_HOST}/done" "${COORD_DIR_HOST}/head.ip"
     echo "coord dir host: ${COORD_DIR_HOST}"
     echo "coord dir container: ${COORD_DIR}"
 
