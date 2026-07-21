@@ -154,6 +154,7 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
                 --env BC_GLOBAL_BATCH_SIZE='${BC_GLOBAL_BATCH_SIZE:-}' \
                 --env BC_MAX_RESPONSE_LEN='${BC_MAX_RESPONSE_LEN:-}' \
                 --env BC_MAX_CONTEXT_LEN='${BC_MAX_CONTEXT_LEN:-}' \
+                --env WANDB_X_FLUSH_INTERVAL_SECONDS='${WANDB_X_FLUSH_INTERVAL_SECONDS:-30}' \
                 ${ENROOT_ROOTFS} \
                 bash /slime/examples/supo_browsecomp/run_qwen3p5_4B_colocate.sh
         " &
@@ -451,7 +452,8 @@ RUNTIME_ENV_JSON="{
     \"BCPLUS_COMPRESS_THRESH\": \"${BCPLUS_COMPRESS_THRESH:-0.85}\",
     \"BCPLUS_MAX_SUB_TRAJS\": \"${BCPLUS_MAX_SUB_TRAJS:-5}\",
     \"BCPLUS_COMPRESS_PENALTY\": \"${BCPLUS_COMPRESS_PENALTY:-0.5}\",
-    \"BCPLUS_DUMP_DIR\": \"${BCPLUS_DUMP_DIR:-}\"
+    \"BCPLUS_DUMP_DIR\": \"${BCPLUS_DUMP_DIR:-}\",
+    \"WANDB_X_FLUSH_INTERVAL_SECONDS\": \"${WANDB_X_FLUSH_INTERVAL_SECONDS:-30}\"
   }
 }"
 # NOTE: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is DELIBERATELY NOT
