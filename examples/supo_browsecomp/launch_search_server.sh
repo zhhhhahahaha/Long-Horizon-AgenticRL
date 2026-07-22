@@ -22,8 +22,11 @@
 #                         Default /genai/fsx-project/hhzhang01.
 #   SLURM_ACCOUNT         Slurm account. Default genai_interns (needed to
 #                         access a100_* QOS on this cluster).
-#   QOS                   Slurm QOS. Default a100_genai_shared (partition is
-#                         inferred from QOS prefix on this cluster).
+#   QOS                   Slurm QOS. Default a100_dev (partition is inferred
+#                         from QOS prefix on this cluster). a100_dev has high
+#                         priority and doesn't consume the a100_*_high quota,
+#                         and it allows the full 7-day walltime — a good home
+#                         for this long-lived retrieval service.
 #   SERVER_PORT           Port the retrieval server binds to. Default 8000.
 #   SEARCH_JOB_NAME       Slurm job name (used for squeue matching too).
 #                         Default supo-search-server.
@@ -40,7 +43,7 @@ SLIME_HOST_DIR="${SLIME_HOST_DIR:-/home/hhzhang01/slime}"
 ENROOT_ROOTFS="${ENROOT_ROOTFS:-slime-test}"
 GENAI_ROOT="${GENAI_ROOT:-/genai/fsx-project/hhzhang01}"
 SLURM_ACCOUNT="${SLURM_ACCOUNT:-genai_interns}"
-QOS="${QOS:-a100_genai_shared}"
+QOS="${QOS:-a100_dev}"
 SERVER_PORT="${SERVER_PORT:-8000}"
 SEARCH_JOB_NAME="${SEARCH_JOB_NAME:-supo-search-server}"
 
