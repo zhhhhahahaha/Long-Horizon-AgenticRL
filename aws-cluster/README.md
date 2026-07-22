@@ -13,7 +13,7 @@ slime code — it's here so this directory is a single grep-able answer to
   offline` and `--wandb-dir /data/wandb`. Requires `RUN_NAME` env var to be
   set by the caller.
 - **`wandb-sync.sh`** — after a training job finishes (or every 5 min mid-run
-  via `launch_all.sh`), run this on the **login pod** to upload the offline
+  by the colocate launcher), run this on the **login pod** to upload the offline
   wandb runs to wandb.ai. Reads the API key from `/home/hhzhang01/.wandb-key`
   (chmod 600, kept outside the repo). Uses `python3 -m wandb sync --append`.
   `--append` is required because the script re-syncs the same *still-growing*

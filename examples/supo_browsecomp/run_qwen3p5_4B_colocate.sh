@@ -88,8 +88,8 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
     # Idempotent (launch_search_server.sh): reuses a RUNNING server that has
     # >= MIN_HOURS_REMAINING left, else scancel + resubmit a fresh 7-day job
     # (with a 10s Ctrl-C grace — abort if another experiment relies on it).
-    # This folds in what launch_all.sh Step 1 did for the retired external-sglang
-    # path. Set LOCAL_SEARCH_URL yourself to skip this and use a specific server.
+    # This is the search-server ensure the retired external-sglang orchestrator
+    # used to do. Set LOCAL_SEARCH_URL yourself to skip this and use a specific server.
     if [[ -z "${LOCAL_SEARCH_URL:-}" ]]; then
         # Default runway = this run's walltime (hours) + buffer, so the server
         # outlives training. Falls back to launch_search_server.sh's own default
@@ -137,8 +137,7 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
     # `--exclusive` reserves the full node so nothing else lands on our GPUs.
     #
     # We background srun and drive a wandb-sync poll loop from this login-pod
-    # shell while training runs — mirrors the launch_all.sh orchestration
-    # pattern used by the 4B external-sglang canonical. This lets you watch
+    # shell while training runs. This lets you watch
     # loss curves on wandb.ai mid-run without waiting for the whole job to
     # finish. Sync interval defaults to 5 min (override via WANDB_SYNC_INTERVAL_SEC).
     WANDB_SYNC_INTERVAL_SEC="${WANDB_SYNC_INTERVAL_SEC:-300}"

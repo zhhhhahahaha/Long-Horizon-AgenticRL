@@ -34,21 +34,20 @@ This is a **pipeline-first** port:
   - `reward_func()` — extracts the `<finish answer=...>` payload from the
     trajectory metadata and calls the MetaGen judge (with `em_score` /
     `relaxed_em` fast paths).
-- `run_qwen3p5_4B.sh` — two-part launcher (login pod → in-container). Trains
-  Qwen3.5-4B for 20 rollouts as a smoke test. Bump `HF_CKPT_HOST` /
-  `scripts/models/qwen3.5-9B.sh` for the first-real-run 9B move. Auto-reads
-  the search-server hostname from
-  `/genai/fsx-project/hhzhang01/logs/search-server.hostname` if
-  `LOCAL_SEARCH_URL` isn't already set.
+- `run_qwen3p5_4B_colocate.sh` — the live launcher for the full 8-node run
+  (64 GPU, colocate: sglang shares the training GPUs in a single srun).
+  Two-part (login pod → in-container). Auto-ensures the search server (see
+  below), then submits training. Training QOS defaults to
+  `a100_genai_interns_high`; the search server runs on `SEARCH_QOS` (default
+  `a100_dev`). `run_qwen3p5_9B_colocate.sh` is the 9B sibling. For a quick
+  1-node dump smoke, see `debug_scripts/run_qwen3p5_4B_1node_dumpsmoke.sh`.
 - `launch_search_server.sh` — idempotent orchestrator that sbatch's a
-  long-lived (7-day, 1 GPU) retrieval server, waits for `/health`, and writes
-  the resolved `host:port` to the hostname file. Reuses an existing job if
-  its remaining walltime is `>= MIN_HOURS_REMAINING` (default 48h); otherwise
-  scancels + resubmits so a training job doesn't outlive its search server.
-- `launch_all.sh` — one-button entry point: calls
-  `launch_search_server.sh` with a `MIN_HOURS_REMAINING` that covers the
-  requested training walltime + a buffer, then invokes `run_qwen3p5_4B.sh`,
-  then runs `aws-cluster/wandb-sync.sh` after srun exits.
+  long-lived (7-day, 1 GPU) retrieval server on `a100_dev`, waits for
+  `/health`, and writes the resolved `host:port` to the hostname file. Reuses
+  an existing job if its remaining walltime is `>= MIN_HOURS_REMAINING`
+  (default 48h); otherwise scancels + resubmits so a training job doesn't
+  outlive its search server. `run_qwen3p5_4B_colocate.sh` calls this
+  automatically (you can also run it standalone).
 
 ## Prerequisites
 
@@ -148,24 +147,31 @@ in a different MetaGen model or point at a local vLLM judge instead.
 Already staged: `/genai/fsx-project/hhzhang01/datasets/BC+/{bc_train,bc_test}.parquet`
 (680 train + 150 test rows).
 
-## Run the smoke test
+## Run training (8-node colocate)
 
-**One-button** — after Steps 1–4 in Prerequisites are done:
+**One command** — after the Prerequisites are done:
 ```bash
 export LLAMA_API_KEY="LLM|..."
-bash /home/hhzhang01/slime/examples/supo_browsecomp/launch_all.sh
+bash /home/hhzhang01/slime/examples/supo_browsecomp/run_qwen3p5_4B_colocate.sh
 ```
-This ensures the search server is up (with enough runway), submits the
-training srun, and syncs wandb offline runs after srun exits. Tune
-`TRAIN_WALLTIME_HOURS` (default 24) and `SEARCH_BUFFER_HOURS` (default 4).
+This auto-ensures the search server is up (with enough runway, on `a100_dev`),
+submits the 8-node training srun (QOS `a100_genai_interns_high`), and syncs
+wandb offline runs while/after srun runs. Tune `TRAIN_WALLTIME` and
+`SEARCH_BUFFER_HOURS` (default 4); `SEARCH_QOS` (default `a100_dev`) sets the
+search server's queue.
 
-**Manual** — if you're already sure the search server is healthy:
+**Point at an existing search server** — set `LOCAL_SEARCH_URL` to skip the
+ensure step entirely:
 ```bash
 export LOCAL_SEARCH_URL="http://<search-node>:8000"
 export LLAMA_API_KEY="LLM|..."
-bash /home/hhzhang01/slime/examples/supo_browsecomp/run_qwen3p5_4B.sh
-# After srun exits:
-bash /home/hhzhang01/slime/aws-cluster/wandb-sync.sh "${RUN_NAME}"
+bash /home/hhzhang01/slime/examples/supo_browsecomp/run_qwen3p5_4B_colocate.sh
+```
+
+**1-node dump smoke** — quick end-to-end check (dump on, train_old off):
+```bash
+export LLAMA_API_KEY="LLM|..."
+bash /home/hhzhang01/slime/examples/supo_browsecomp/debug_scripts/run_qwen3p5_4B_1node_dumpsmoke.sh
 ```
 
 ## What to expect from a healthy smoke run

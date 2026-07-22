@@ -111,8 +111,7 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
     # `--exclusive` reserves the full node so nothing else lands on our GPUs.
     #
     # We background srun and drive a wandb-sync poll loop from this login-pod
-    # shell while training runs — mirrors the launch_all.sh orchestration
-    # pattern used by the 4B external-sglang canonical. This lets you watch
+    # shell while training runs. This lets you watch
     # loss curves on wandb.ai mid-run without waiting for the whole job to
     # finish. Sync interval defaults to 5 min (override via WANDB_SYNC_INTERVAL_SEC).
     WANDB_SYNC_INTERVAL_SEC="${WANDB_SYNC_INTERVAL_SEC:-300}"
@@ -364,7 +363,7 @@ GRPO_ARGS=(
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
-   # Truncated Importance Sampling. See run_qwen3p5_4B.sh for rationale.
+   # Truncated Importance Sampling. See run_qwen3p5_4B_colocate.sh for rationale.
    --use-tis
    --tis-clip 2.0
    --tis-clip-low 0.0
@@ -415,7 +414,7 @@ CUSTOM_ARGS=(
 # When dumping is enabled, dump trajectories. train_old log_probs are opt-in
 # via BCPLUS_DUMP_TRAIN_OLD (empty/0/false = off): only then do we add
 # --dump-train-old-log-prob, which forces the pre-training forward pass that
-# populates rollout_data["log_probs"]. See run_qwen3p5_4B.sh comments for why
+# populates rollout_data["log_probs"]. See run_qwen3p5_4B_colocate.sh comments for why
 # can_reuse_log_probs_in_loss otherwise skips it.
 if [[ -n "${BCPLUS_DUMP_DIR:-}" ]]; then
     case "$(printf '%s' "${BCPLUS_DUMP_TRAIN_OLD:-}" | tr '[:upper:]' '[:lower:]')" in

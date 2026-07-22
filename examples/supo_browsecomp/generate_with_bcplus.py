@@ -114,7 +114,7 @@ BCPLUS_CONFIGS = {
     # reward_post_process AFTER final-reward broadcast but BEFORE GRPO
     # normalization, so it changes only the failing sub-traj's advantage —
     # sibling advantages and group mean/std are unaffected. Set to 0 to
-    # disable the penalty entirely. Shell default in run_qwen3p5_4B.sh
+    # disable the penalty entirely. Shell default in run_qwen3p5_4B_colocate.sh
     # RUNTIME_ENV_JSON must match this default.
     "compress_penalty": float(os.environ.get("BCPLUS_COMPRESS_PENALTY", "0.5")),
     # Directory to dump per-sub-traj rollout+train state for offline analysis.
