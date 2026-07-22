@@ -40,6 +40,16 @@
 #                                train_old_logps, advantage go to
 #                                $BCPLUS_DUMP_DIR/rollouts_iter_NNNNN_dp*.parquet
 #                                for offline TIS drift analysis.
+#   BCPLUS_DUMP_TRAIN_OLD       default "" (empty/0/false = off). Only meaningful
+#                                when BCPLUS_DUMP_DIR is set. When truthy, adds
+#                                --dump-train-old-log-prob (extra pre-training
+#                                forward pass every iter) and fills the
+#                                train_old_logps column. Leave off to dump
+#                                trajectories cheaply for inspection.
+#   BCPLUS_JUDGE_MODEL          default "gpt-5-4-genai-dss4" (MetaGen judge id)
+#   BCPLUS_JUDGE_BASE_URL       default "https://api.llama.com/compat/v1/"
+#   BCPLUS_JUDGE_CONCURRENCY    default 64  (judge call semaphore)
+#   BCPLUS_SEARCH_CONCURRENCY   default 128 (search call semaphore)
 
 set -euo pipefail
 
@@ -130,6 +140,11 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
                 --env BCPLUS_MAX_TURNS='${BCPLUS_MAX_TURNS:-}' \
                 --env BCPLUS_COMPRESS_PENALTY='${BCPLUS_COMPRESS_PENALTY:-}' \
                 --env BCPLUS_DUMP_DIR='${BCPLUS_DUMP_DIR:-}' \
+                --env BCPLUS_DUMP_TRAIN_OLD='${BCPLUS_DUMP_TRAIN_OLD:-}' \
+                --env BCPLUS_JUDGE_MODEL='${BCPLUS_JUDGE_MODEL:-}' \
+                --env BCPLUS_JUDGE_BASE_URL='${BCPLUS_JUDGE_BASE_URL:-}' \
+                --env BCPLUS_JUDGE_CONCURRENCY='${BCPLUS_JUDGE_CONCURRENCY:-}' \
+                --env BCPLUS_SEARCH_CONCURRENCY='${BCPLUS_SEARCH_CONCURRENCY:-}' \
                 --env BC_NUM_ROLLOUT='${BC_NUM_ROLLOUT:-}' \
                 --env BC_ROLLOUT_BATCH_SIZE='${BC_ROLLOUT_BATCH_SIZE:-}' \
                 --env BC_N_SAMPLES='${BC_N_SAMPLES:-}' \
@@ -300,7 +315,13 @@ CUSTOM_ARGS=(
 # leaving train_old_logps empty in the parquet. See dp_schedule.py comments
 # and actor.py:439-451 for the reuse logic.
 if [[ -n "${BCPLUS_DUMP_DIR:-}" ]]; then
-    CUSTOM_ARGS+=(--dump-train-old-log-prob)
+    # train_old log_probs are opt-in via BCPLUS_DUMP_TRAIN_OLD (empty/0/false =
+    # off): only then add --dump-train-old-log-prob to force the pre-training
+    # forward pass. Otherwise trajectories dump without train_old (null column).
+    case "$(printf '%s' "${BCPLUS_DUMP_TRAIN_OLD:-}" | tr '[:upper:]' '[:lower:]')" in
+        ""|0|false) : ;;
+        *) CUSTOM_ARGS+=(--dump-train-old-log-prob) ;;
+    esac
     # Users typically pass the login-pod-visible path (/genai/fsx-project/
     # hhzhang01/...) since that's what they see with ls / tail. But inside
     # the container that mount is remapped to /genai_hh (see enroot start
@@ -344,7 +365,12 @@ RUNTIME_ENV_JSON="{
     \"BCPLUS_COMPRESS_THRESH\": \"${BCPLUS_COMPRESS_THRESH:-0.85}\",
     \"BCPLUS_MAX_SUB_TRAJS\": \"${BCPLUS_MAX_SUB_TRAJS:-5}\",
     \"BCPLUS_COMPRESS_PENALTY\": \"${BCPLUS_COMPRESS_PENALTY:-0.5}\",
-    \"BCPLUS_DUMP_DIR\": \"${BCPLUS_DUMP_DIR:-}\"
+    \"BCPLUS_DUMP_DIR\": \"${BCPLUS_DUMP_DIR:-}\",
+    \"BCPLUS_DUMP_TRAIN_OLD\": \"${BCPLUS_DUMP_TRAIN_OLD:-}\",
+    \"BCPLUS_JUDGE_MODEL\": \"${BCPLUS_JUDGE_MODEL:-gpt-5-4-genai-dss4}\",
+    \"BCPLUS_JUDGE_BASE_URL\": \"${BCPLUS_JUDGE_BASE_URL:-https://api.llama.com/compat/v1/}\",
+    \"BCPLUS_JUDGE_CONCURRENCY\": \"${BCPLUS_JUDGE_CONCURRENCY:-64}\",
+    \"BCPLUS_SEARCH_CONCURRENCY\": \"${BCPLUS_SEARCH_CONCURRENCY:-128}\"
   }
 }"
 

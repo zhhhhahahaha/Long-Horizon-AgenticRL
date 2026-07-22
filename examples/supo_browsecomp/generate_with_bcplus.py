@@ -121,6 +121,13 @@ BCPLUS_CONFIGS = {
     # Empty string disables (canonical training pays zero cost). See
     # `dump_rollout_data_postprocess` docstring for the parquet schema.
     "dump_dir": os.environ.get("BCPLUS_DUMP_DIR", ""),
+    # Whether to also dump train_old log_probs. Off by default: including them
+    # requires --dump-train-old-log-prob, which forces an extra pre-training
+    # forward pass every iter. Leave off to inspect trajectories cheaply; turn
+    # on only for offline TIS drift analysis. Shell (run_*.sh) gating on
+    # BCPLUS_DUMP_TRAIN_OLD must match this default (empty/0/false = off).
+    "dump_train_old": os.environ.get("BCPLUS_DUMP_TRAIN_OLD", "").strip().lower()
+    not in ("", "0", "false"),
 }
 
 _SEARCH_SEM = asyncio.Semaphore(BCPLUS_CONFIGS["search_concurrency"])
@@ -1665,6 +1672,11 @@ def dump_rollout_data_postprocess(args, rollout_id, rollout_data) -> None:
     rollout_ids = rollout_data.get("rollout_ids", [])
     metadata_list = rollout_data.get("metadata", [])
 
+    # train_old log_probs only exist when --dump-train-old-log-prob forced the
+    # pre-training forward pass. Off by default so trajectories dump cheaply;
+    # when off the train_old_logps column is written as null.
+    dump_train_old = BCPLUS_CONFIGS["dump_train_old"]
+
     n = len(tokens_list)
     if n == 0:
         return
@@ -1683,28 +1695,34 @@ def dump_rollout_data_postprocess(args, rollout_id, rollout_data) -> None:
     )
     assert len(loss_masks_list) == n, f"loss_masks length {len(loss_masks_list)} != {n}"
     assert len(rollout_lp_list) == n, f"rollout_log_probs length {len(rollout_lp_list)} != {n}"
-    assert len(train_old_lp_list) == n, (
-        f"train_old log_probs length {len(train_old_lp_list)} != {n}. "
-        f"Did --dump-train-old-log-prob get set? BCPLUS_DUMP_DIR is set but "
-        f"can_reuse_log_probs_in_loss must be False for train_old to be computed."
-    )
+    if dump_train_old:
+        assert len(train_old_lp_list) == n, (
+            f"train_old log_probs length {len(train_old_lp_list)} != {n}. "
+            f"BCPLUS_DUMP_TRAIN_OLD is set but train_old is missing: "
+            f"--dump-train-old-log-prob must be passed (and "
+            f"can_reuse_log_probs_in_loss False) for train_old to be computed."
+        )
 
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
     # Gather full-length per-sample log_probs across the CP group. Every CP
     # rank must call this — the internal all_reduce hangs if any CP rank
-    # skips. After the call, every CP rank holds the same full tensor.
+    # skips. dump_train_old is a global env flag (identical on every rank), so
+    # the train_old branch is entered/skipped consistently across ranks.
     full_rollout_lp_list = []
     full_train_old_lp_list = []
     for i in range(n):
         total_length = int(total_lengths[i])
         response_length = int(response_lengths[i])
         shard_rollout = rollout_lp_list[i].to(device=device, dtype=torch.float32)
-        shard_train_old = train_old_lp_list[i].to(device=device, dtype=torch.float32)
         full_rollout = all_gather_with_cp(shard_rollout, total_length, response_length)
-        full_train_old = all_gather_with_cp(shard_train_old, total_length, response_length)
         full_rollout_lp_list.append(full_rollout.detach().cpu().tolist())
-        full_train_old_lp_list.append(full_train_old.detach().cpu().tolist())
+        if dump_train_old:
+            shard_train_old = train_old_lp_list[i].to(device=device, dtype=torch.float32)
+            full_train_old = all_gather_with_cp(shard_train_old, total_length, response_length)
+            full_train_old_lp_list.append(full_train_old.detach().cpu().tolist())
+        else:
+            full_train_old_lp_list.append(None)
 
     # After the CP-wide all_reduce, all CP ranks have identical results. Only
     # CP rank 0 writes the file to avoid duplicate output.
@@ -1753,10 +1771,11 @@ def dump_rollout_data_postprocess(args, rollout_id, rollout_data) -> None:
             f"sub-traj {i}: gathered rollout_logps len {len(full_rollout_lp)} "
             f"!= response_ids len {len(response_ids)}"
         )
-        assert len(full_train_old_lp) == len(response_ids), (
-            f"sub-traj {i}: gathered train_old_logps len {len(full_train_old_lp)} "
-            f"!= response_ids len {len(response_ids)}"
-        )
+        if full_train_old_lp is not None:
+            assert len(full_train_old_lp) == len(response_ids), (
+                f"sub-traj {i}: gathered train_old_logps len {len(full_train_old_lp)} "
+                f"!= response_ids len {len(response_ids)}"
+            )
 
         # advantages[i] is a per-token tensor with all identical values (GRPO
         # broadcasts scalar reward to per-token) — collapse to scalar. Under
