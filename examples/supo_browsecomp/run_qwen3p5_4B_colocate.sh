@@ -38,6 +38,28 @@
 #   BCPLUS_MAX_SUB_TRAJS        default 5
 #   BCPLUS_COMPRESS_PENALTY     default 0.5
 #   BCPLUS_DUMP_DIR             default "" (empty = disabled)
+#   BCPLUS_DUMP_TRAIN_OLD       default "" (empty/0/false = off). Only meaningful
+#                               when BCPLUS_DUMP_DIR is set. When truthy, adds
+#                               --dump-train-old-log-prob (extra pre-training
+#                               forward pass every iter) and fills the
+#                               train_old_logps column. Leave off to dump
+#                               trajectories cheaply for inspection.
+#   BCPLUS_JUDGE_MODEL          default "gpt-5-4-genai-dss4" (MetaGen judge id)
+#   BCPLUS_JUDGE_BASE_URL       default "https://api.llama.com/compat/v1/"
+#   BCPLUS_JUDGE_CONCURRENCY    default 64  (judge call semaphore)
+#   BCPLUS_SEARCH_CONCURRENCY   default 128 (search call semaphore)
+#   SEARCH_BUFFER_HOURS         default 4. Extra runway beyond TRAIN_WALLTIME the
+#                               search server must have to be reused; else it is
+#                               scancel'd + relaunched (10s Ctrl-C grace).
+#   SEARCH_QOS                  default a100_dev. QOS for the search server job
+#                               (decoupled from training QOS; keeps it off the
+#                               a100_*_high quota).
+#   QOS                         default a100_genai_interns_high (fast/high-prio
+#                               for the 8-node training srun). Override for a
+#                               different training queue.
+#   MIN_HOURS_REMAINING         overrides the reuse threshold directly (default
+#                               = TRAIN_WALLTIME hours + SEARCH_BUFFER_HOURS).
+#   LOCAL_SEARCH_URL            set to skip the ensure step and use this server.
 
 set -euo pipefail
 
@@ -47,25 +69,8 @@ set -euo pipefail
 if [[ "${SLIME_INNER:-0}" != "1" ]]; then
     : "${LLAMA_API_KEY:?LLAMA_API_KEY must be set on the login pod (LLM|... key with entitlement)}"
 
-    # Auto-discover the search server if LOCAL_SEARCH_URL wasn't passed in.
-    if [[ -z "${LOCAL_SEARCH_URL:-}" ]]; then
-        HOST_FILE=/genai/fsx-project/hhzhang01/logs/search-server.hostname
-        if [[ -f "${HOST_FILE}" ]]; then
-            SEARCH_TARGET=$(cat "${HOST_FILE}")
-            if curl -sf --max-time 5 "http://${SEARCH_TARGET}/health" > /dev/null; then
-                export LOCAL_SEARCH_URL="http://${SEARCH_TARGET}"
-                echo "auto-discovered LOCAL_SEARCH_URL=${LOCAL_SEARCH_URL}"
-            else
-                echo "ERROR: search server at ${SEARCH_TARGET} not responding." >&2
-                echo "       Run examples/supo_browsecomp/launch_search_server.sh first." >&2
-                exit 1
-            fi
-        else
-            echo "ERROR: LOCAL_SEARCH_URL not set and ${HOST_FILE} missing." >&2
-            echo "       Run examples/supo_browsecomp/launch_search_server.sh first." >&2
-            exit 1
-        fi
-    fi
+    # Search server is ensured after the config block below (that logic needs
+    # TRAIN_WALLTIME / QOS / SLURM_ACCOUNT / SLIME_HOST_DIR).
 
     export RUN_NAME="${RUN_NAME:-supo-bcplus-qwen3p5-4b-$(date +%Y%m%d-%H%M)}"
     echo "RUN_NAME=${RUN_NAME}"
@@ -73,11 +78,42 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
     SLIME_HOST_DIR=/home/hhzhang01/slime
     ENROOT_ROOTFS="${ENROOT_ROOTFS:-slime-test}"
     SLURM_ACCOUNT="${SLURM_ACCOUNT:-genai_interns}"
-    QOS="${QOS:-a100_genai_shared}"
+    QOS="${QOS:-a100_genai_interns_high}"
     TRAIN_WALLTIME="${TRAIN_WALLTIME:-24:00:00}"
     NUM_NODES="${NUM_NODES:-8}"
     TRAIN_LOG_PATH="${TRAIN_LOG_PATH:-/genai/fsx-project/hhzhang01/logs/${RUN_NAME}.log}"
     mkdir -p "$(dirname "${TRAIN_LOG_PATH}")"
+
+    # Ensure a healthy retrieval search server with enough runway for this run.
+    # Idempotent (launch_search_server.sh): reuses a RUNNING server that has
+    # >= MIN_HOURS_REMAINING left, else scancel + resubmit a fresh 7-day job
+    # (with a 10s Ctrl-C grace — abort if another experiment relies on it).
+    # This folds in what launch_all.sh Step 1 did for the retired external-sglang
+    # path. Set LOCAL_SEARCH_URL yourself to skip this and use a specific server.
+    if [[ -z "${LOCAL_SEARCH_URL:-}" ]]; then
+        # Default runway = this run's walltime (hours) + buffer, so the server
+        # outlives training. Falls back to launch_search_server.sh's own default
+        # if TRAIN_WALLTIME isn't a plain HH:MM:SS.
+        _wt_hours="${TRAIN_WALLTIME%%:*}"
+        _min_hours="${MIN_HOURS_REMAINING:-}"
+        if [[ -z "${_min_hours}" && "${_wt_hours}" =~ ^[0-9]+$ ]]; then
+            _min_hours="$((_wt_hours + ${SEARCH_BUFFER_HOURS:-4}))"
+        fi
+        # The search server runs on its OWN qos (SEARCH_QOS, default a100_dev):
+        # decoupled from the training QOS so it never eats the a100_*_high quota,
+        # gets high priority, and can hold the full 7-day walltime. Passed inline
+        # so this run's ${QOS} (used for the training srun below) is untouched.
+        echo "[colocate] ensuring search server on qos=${SEARCH_QOS:-a100_dev} (>= ${_min_hours:-48}h runway)"
+        MIN_HOURS_REMAINING="${_min_hours}" QOS="${SEARCH_QOS:-a100_dev}" SLURM_ACCOUNT="${SLURM_ACCOUNT}" \
+            bash "${SLIME_HOST_DIR}/examples/supo_browsecomp/launch_search_server.sh"
+        SEARCH_HOST_FILE=/genai/fsx-project/hhzhang01/logs/search-server.hostname
+        [[ -f "${SEARCH_HOST_FILE}" ]] || {
+            echo "ERROR: ${SEARCH_HOST_FILE} missing after launch_search_server.sh" >&2
+            exit 1
+        }
+        export LOCAL_SEARCH_URL="http://$(cat "${SEARCH_HOST_FILE}")"
+    fi
+    echo "[colocate] LOCAL_SEARCH_URL=${LOCAL_SEARCH_URL}"
 
     # Coordination file on FSx: head node writes its IP here; workers poll for it.
     # DONE file (written when head's ray job returns) tells workers they can exit.
@@ -155,6 +191,11 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
                 --env BCPLUS_MAX_TURNS='${BCPLUS_MAX_TURNS:-}' \
                 --env BCPLUS_COMPRESS_PENALTY='${BCPLUS_COMPRESS_PENALTY:-}' \
                 --env BCPLUS_DUMP_DIR='${BCPLUS_DUMP_DIR:-}' \
+                --env BCPLUS_DUMP_TRAIN_OLD='${BCPLUS_DUMP_TRAIN_OLD:-}' \
+                --env BCPLUS_JUDGE_MODEL='${BCPLUS_JUDGE_MODEL:-}' \
+                --env BCPLUS_JUDGE_BASE_URL='${BCPLUS_JUDGE_BASE_URL:-}' \
+                --env BCPLUS_JUDGE_CONCURRENCY='${BCPLUS_JUDGE_CONCURRENCY:-}' \
+                --env BCPLUS_SEARCH_CONCURRENCY='${BCPLUS_SEARCH_CONCURRENCY:-}' \
                 --env BC_NUM_ROLLOUT='${BC_NUM_ROLLOUT:-}' \
                 --env BC_ROLLOUT_BATCH_SIZE='${BC_ROLLOUT_BATCH_SIZE:-}' \
                 --env BC_N_SAMPLES='${BC_N_SAMPLES:-}' \
@@ -417,7 +458,13 @@ CUSTOM_ARGS=(
 # that populates rollout_data["log_probs"] (train_old). See run_qwen3p5_4B.sh
 # comments for why can_reuse_log_probs_in_loss otherwise skips it.
 if [[ -n "${BCPLUS_DUMP_DIR:-}" ]]; then
-    CUSTOM_ARGS+=(--dump-train-old-log-prob)
+    # train_old log_probs are opt-in via BCPLUS_DUMP_TRAIN_OLD (empty/0/false =
+    # off): only then add --dump-train-old-log-prob to force the pre-training
+    # forward pass. Otherwise trajectories dump without train_old (null column).
+    case "$(printf '%s' "${BCPLUS_DUMP_TRAIN_OLD:-}" | tr '[:upper:]' '[:lower:]')" in
+        ""|0|false) : ;;
+        *) CUSTOM_ARGS+=(--dump-train-old-log-prob) ;;
+    esac
     if [[ "${BCPLUS_DUMP_DIR}" == /genai/fsx-project/hhzhang01/* ]]; then
         BCPLUS_DUMP_DIR_CONTAINER="${BCPLUS_DUMP_DIR/#\/genai\/fsx-project\/hhzhang01/\/genai_hh}"
         echo "[BCPLUS] auto-translated BCPLUS_DUMP_DIR host=${BCPLUS_DUMP_DIR} -> container=${BCPLUS_DUMP_DIR_CONTAINER}"
@@ -461,6 +508,11 @@ RUNTIME_ENV_JSON="{
     \"BCPLUS_MAX_SUB_TRAJS\": \"${BCPLUS_MAX_SUB_TRAJS:-5}\",
     \"BCPLUS_COMPRESS_PENALTY\": \"${BCPLUS_COMPRESS_PENALTY:-0.5}\",
     \"BCPLUS_DUMP_DIR\": \"${BCPLUS_DUMP_DIR:-}\",
+    \"BCPLUS_DUMP_TRAIN_OLD\": \"${BCPLUS_DUMP_TRAIN_OLD:-}\",
+    \"BCPLUS_JUDGE_MODEL\": \"${BCPLUS_JUDGE_MODEL:-gpt-5-4-genai-dss4}\",
+    \"BCPLUS_JUDGE_BASE_URL\": \"${BCPLUS_JUDGE_BASE_URL:-https://api.llama.com/compat/v1/}\",
+    \"BCPLUS_JUDGE_CONCURRENCY\": \"${BCPLUS_JUDGE_CONCURRENCY:-64}\",
+    \"BCPLUS_SEARCH_CONCURRENCY\": \"${BCPLUS_SEARCH_CONCURRENCY:-128}\",
     \"WANDB_X_FLUSH_INTERVAL_SECONDS\": \"${WANDB_X_FLUSH_INTERVAL_SECONDS:-30}\"
   }
 }"
