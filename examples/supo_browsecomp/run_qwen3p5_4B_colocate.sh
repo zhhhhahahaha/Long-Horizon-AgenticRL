@@ -37,7 +37,10 @@
 #   BCPLUS_COMPRESS_THRESH      default 0.85
 #   BCPLUS_MAX_SUB_TRAJS        default 5
 #   BCPLUS_COMPRESS_PENALTY     default 0.5
-#   BCPLUS_DUMP_DIR             default "" (empty = disabled)
+#   BCPLUS_DUMP_DIR             default /genai/fsx-project/hhzhang01/dumps/${RUN_NAME}
+#                               — per-iter rollout parquet dump is ON by default
+#                               so training rollouts can be inspected offline.
+#                               Set BCPLUS_DUMP_DIR="" to disable.
 #   BCPLUS_DUMP_TRAIN_OLD       default "" (empty/0/false = off). Only meaningful
 #                               when BCPLUS_DUMP_DIR is set. When truthy, adds
 #                               --dump-train-old-log-prob (extra pre-training
@@ -83,6 +86,14 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
     NUM_NODES="${NUM_NODES:-8}"
     TRAIN_LOG_PATH="${TRAIN_LOG_PATH:-/genai/fsx-project/hhzhang01/logs/${RUN_NAME}.log}"
     mkdir -p "$(dirname "${TRAIN_LOG_PATH}")"
+
+    # Dump per-iter rollout parquet BY DEFAULT so training rollouts can be
+    # inspected offline (token ids + loss_mask + rollout_logps + advantage +
+    # outcome/score, one file per DP rank per iter, written to fast Lustre).
+    # Uses `-` (not `:-`): unset -> default path (on); explicit BCPLUS_DUMP_DIR=""
+    # -> off. train_old stays off (no extra forward pass) unless
+    # BCPLUS_DUMP_TRAIN_OLD=1.
+    export BCPLUS_DUMP_DIR="${BCPLUS_DUMP_DIR-/genai/fsx-project/hhzhang01/dumps/${RUN_NAME}}"
 
     # Ensure a healthy retrieval search server with enough runway for this run.
     # Idempotent (launch_search_server.sh): reuses a RUNNING server that has
