@@ -309,7 +309,7 @@ source scripts/models/qwen3.5-4B.sh
 HF_CKPT_HOST=/genai_hh/models/Qwen3.5-4B
 REF_LOAD_HOST=/genai_hh/models/Qwen3.5-4B_torch_dist
 TRAIN_DATA=/genai_hh/datasets/BC+/bc_train.parquet
-TEST_DATA=/genai_hh/datasets/BC+/bc_test.parquet
+TEST_DATA="${BC_TEST_DATA:-/genai_hh/datasets/BC+/bc_test.parquet}"
 CKPT_SAVE_DIR=/genai_hh/checkpoints/${RUN_NAME}
 mkdir -p "${CKPT_SAVE_DIR}"
 
@@ -489,6 +489,111 @@ COLOCATE_ARGS=(
    --colocate
 )
 
+# ----------------------------------------------------------------------------
+# Eval-only mode (opt-in via BC_EVAL_MODE=1; no-op otherwise).
+#
+# Reuses the ENTIRE training config above (model / sglang / custom generate +
+# reward + judge / colocate), and only flips to slime's eval-only path:
+#   * --num-rollout 0 + --eval-interval 1 -> train.py runs ONE eval at rollout 0
+#     then exits (train.py:36-37). argparse "last wins" makes the appended
+#     --num-rollout 0 override ROLLOUT_ARGS' --num-rollout ${BC_NUM_ROLLOUT}.
+#   * --eval-prompt-data feeds the 150-question BC+ test set. eval inherits
+#     input/label/metadata keys + temperature + max_response_len + custom_rm
+#     from the training args via slime/utils/eval_config.py fallbacks, and the
+#     eval path dispatches to args.custom_generate_function_path (our multi-turn
+#     ReAct generate) via sglang_rollout.py:251 — same search + judge as train.
+#   * --dump-details writes <dir>/rollout_data/eval_0.pt with every eval Sample
+#     (token ids + decoded response + reward + _bcplus metadata) — no HF
+#     conversion needed: actor.update_weights() (train.py:27) syncs the loaded
+#     megatron checkpoint into sglang BEFORE the eval runs.
+#
+# Driven by eval/run_qwen3p5_4B_eval.sh, one job per checkpoint:
+#   BC_EVAL_LOAD  = <run>/iter_0000NN (host path) to eval that iter, or
+#                 = "base"/"" -> no --load (base weights from --hf-checkpoint)
+#   BC_EVAL_N     = --n-samples-per-eval-prompt (default 4)
+#   EVAL_DUMP_DIR = host dir for the eval dump (auto host->/genai_hh remapped)
+#
+# Checkpoint selection is ELEGANT: point --load at the RUN dir (it has the
+# latest_checkpointed_iteration.txt tracker) and pass --ckpt-step N — megatron
+# overrides the tracker's iteration with args.ckpt_step (checkpointing.py:215,
+# 1188). No per-iter tracker files / symlink dirs needed. Two consequences we
+# handle here:
+#   * --ckpt-step is applied to EVERY checkpoint load (actor AND ref), so eval
+#     runs WITHOUT a reference model — drop --use-kl-loss (=> with_ref=False,
+#     placement_group.py:178) and don't pass --ref-load. Ref/KL are unused in eval.
+#   * a trained checkpoint carries optimizer+scheduler state whose total-iters
+#     (e.g. 5120) would clash with our dummy --lr-decay-iters 1 and trip
+#     `OptimizerParamScheduler ... do not match`. --no-load-optim/--no-load-rng
+#     load ONLY model weights (eval needs no optimizer), sidestepping that.
+# ----------------------------------------------------------------------------
+EVAL_ARGS=()
+if [[ "${BC_EVAL_MODE:-}" == "1" ]]; then
+    : "${EVAL_DUMP_DIR:?BC_EVAL_MODE=1 requires EVAL_DUMP_DIR}"
+    # Host -> container path remap (same idiom as BCPLUS_DUMP_DIR above).
+    if [[ "${EVAL_DUMP_DIR}" == /genai/fsx-project/hhzhang01/* ]]; then
+        EVAL_DUMP_DIR="${EVAL_DUMP_DIR/#\/genai\/fsx-project\/hhzhang01/\/genai_hh}"
+    fi
+
+    EVAL_ARGS=(
+        --num-rollout 0
+        --eval-interval 1
+        --eval-prompt-data bcplus_test "${TEST_DATA}"
+        --n-samples-per-eval-prompt "${BC_EVAL_N:-4}"
+        --dump-details "${EVAL_DUMP_DIR}"
+        # num-rollout 0 makes train_iters=0 (model.py:204), which would zero the
+        # LR-decay schedule and trip `assert lr_decay_steps > 0` in megatron's
+        # OptimizerParamScheduler when the (unused) optimizer is still BUILT.
+        --lr-decay-iters 1
+    )
+
+    # Actor checkpoint: --load <run> + --ckpt-step N selects the iter (no ref, no
+    # symlink view dirs). base = --hf-checkpoint only (no --load / --ckpt-step).
+    NEW_CKPT_ARGS=(--hf-checkpoint "${HF_CKPT_HOST}")
+    if [[ -n "${BC_EVAL_LOAD:-}" && "${BC_EVAL_LOAD}" != "base" ]]; then
+        RUN_DIR="$(dirname "${BC_EVAL_LOAD%/}")"
+        ITER_NAME="$(basename "${BC_EVAL_LOAD%/}")"
+        if [[ ! "${ITER_NAME}" =~ ^iter_[0-9]{7}$ ]]; then
+            echo "[eval] ERROR: BC_EVAL_LOAD must end in iter_NNNNNNN or be 'base', got ${BC_EVAL_LOAD}" >&2
+            exit 1
+        fi
+        CKPT_STEP=$((10#${ITER_NAME#iter_}))
+        if [[ "${RUN_DIR}" == /genai/fsx-project/hhzhang01/* ]]; then
+            RUN_DIR="${RUN_DIR/#\/genai\/fsx-project\/hhzhang01/\/genai_hh}"
+        fi
+        # --no-load-optim/--no-load-rng: load ONLY model weights (a trained
+        # checkpoint's optimizer/scheduler total-iters would clash with the dummy
+        # --lr-decay-iters 1). Only in the iter branch: base has no --load, and
+        # --no-load-optim without --load trips `assert args.load is not None ...`.
+        NEW_CKPT_ARGS+=(--load "${RUN_DIR}" --ckpt-step "${CKPT_STEP}" --no-load-optim --no-load-rng)
+        echo "[eval] loading iter ${CKPT_STEP}: --load ${RUN_DIR} --ckpt-step ${CKPT_STEP}"
+    else
+        # base = untrained model. It still needs a --load: slime asserts
+        # args.load/pretrained_checkpoint in setup_model_and_optimizer (model.py:292),
+        # and with no ref model there is otherwise no checkpoint source. Load the
+        # base torch_dist (a release checkpoint = same base weights as --hf-checkpoint).
+        NEW_CKPT_ARGS+=(--load "${REF_LOAD_HOST}" --no-load-optim --no-load-rng)
+        echo "[eval] base model via --load ${REF_LOAD_HOST} (base torch_dist release)"
+    fi
+    CKPT_ARGS=("${NEW_CKPT_ARGS[@]}")
+
+    # No reference model in eval: args.ckpt_step is global (would also hit the ref
+    # load and break it). Dropping --use-kl-loss => with_ref=False, so no ref is
+    # created/loaded. KL/ref are unused in eval anyway.
+    GRPO_ARGS=(--advantage-estimator grpo)
+
+    # Drop the training-only rollout-data dump hook (fires during train() only)
+    # and --dump-train-old-log-prob (no training step in eval). Keep the custom
+    # generate + reward + reward-post + rollout-log hooks (eval uses all of them).
+    CUSTOM_ARGS=(
+        --custom-generate-function-path examples.supo_browsecomp.generate_with_bcplus.generate
+        --custom-rm-path                 examples.supo_browsecomp.generate_with_bcplus.reward_func
+        --reward-key score
+        --custom-reward-post-process-path examples.supo_browsecomp.generate_with_bcplus.reward_post_process
+        --custom-rollout-log-function-path examples.supo_browsecomp.generate_with_bcplus.log_bcplus
+    )
+    echo "[eval] BC_EVAL_MODE=1 -> eval-only (no ref), n=${BC_EVAL_N:-4}, dump -> ${EVAL_DUMP_DIR}"
+fi
+
 # ---- Start ray head, publish IP, wait for workers ----
 export MASTER_ADDR="${MY_IP}"
 
@@ -552,6 +657,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${SGLANG_ARGS[@]} \
    ${MISC_ARGS[@]} \
    ${CUSTOM_ARGS[@]} \
+   ${EVAL_ARGS[@]} \
    ${COLOCATE_ARGS[@]}
 
 TRAIN_STATUS=$?
