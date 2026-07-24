@@ -10,7 +10,7 @@
 #     host-side CONNECT relay auto-started by --docker_host_cmd on 127.0.0.1:9080)
 #   * search discovery: read the search server's [ipv6]:port from OILFS, wait /health
 #   * LLAMA_API_KEY from an OILFS file (see note on secret hygiene)
-#   * wandb OFFLINE → OILFS (sync later from the devgpu)
+#   * wandb OFFLINE → node-local disk → atomic OILFS snapshots for live sync
 #   * Ray head/worker election from MAST_HPC_TASK_GROUP_HOSTNAMES (multi-node)
 #
 # Defaults are a 1-node (8 GPU) SMOKE: TP=4, CP=2 → DP=1, tiny batch, 2 rollouts.
@@ -23,6 +23,7 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export RAY_AUTH_MODE=disabled                 # Ray 2.55 token auth off (before ray start)
 export SGLANG_NUMA_BIND_V2=0                  # broken bind-mounted numactl
 export PYTORCH_CUDA_ALLOC_CONF=""             # torch_memory_saver(colocate) vs expandable_segments
+export WANDB_X_FLUSH_INTERVAL_SECONDS="${WANDB_X_FLUSH_INTERVAL_SECONDS:-30}"
 unset TRITON_CACHE_MANAGER                    # msl_tools.* unimportable here
 export TRITON_CACHE_DIR=/tmp/triton_cache_slime
 
@@ -36,6 +37,7 @@ export no_proxy="127.0.0.1,localhost,::1" NO_PROXY="127.0.0.1,localhost,::1"
 SLIME=/slime-src
 D=/mnt/wsfuse/hhzhang01/supo-data
 STAGE=/mnt/wsfuse/hhzhang01/supo-slime
+RUN_NAME="${RUN_NAME:-${MAST_HPC_JOB_NAME:-supo-bcplus-mast-local}}"
 cd "${SLIME}"
 
 # --------------------------- LLAMA_API_KEY (judge) --------------------------
@@ -101,24 +103,79 @@ export MASTER_ADDR
 # would globalize the head's IP to every node). Harmless at 1 node (=127.0.0.1).
 export SLIME_HOST_IP="${MASTER_ADDR}"
 
-# Cross-node NCCL OOB bootstrap fix. MAST sets NCCL_SOCKET_IFNAME=beth0, whose
-# addresses (…bace:0:… on a different subnet) are NOT routable container-to-
-# container across nodes, so NCCL's OOB socket connect times out ("socketPoll
-# Connect ... Connection timed out"). The RoCE data plane (mlx5 HCAs) is fine;
-# only the TCP bootstrap fails. Point OOB at the interface carrying our routable
-# MASTER_ADDR (the very address Ray uses successfully cross-node). Match on the
-# /48 prefix to sidestep IPv6 :0:-vs-:: compression mismatches.
-NCCL_SOCKET_IFNAME_DETECTED=""
-if [[ "${NNODES}" != "1" ]]; then
-  ADDR_PREFIX="$(echo "${MASTER_ADDR}" | cut -d: -f1-3)"    # e.g. 2401:db00:146c
-  NCCL_SOCKET_IFNAME_DETECTED="$(ip -6 -o addr show 2>/dev/null | grep -F "${ADDR_PREFIX}:" | awk '{print $2}' | head -1)"
-  if [[ -n "${NCCL_SOCKET_IFNAME_DETECTED}" ]]; then
-    export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME_DETECTED}"
-    echo "[trainer] NCCL_SOCKET_IFNAME -> ${NCCL_SOCKET_IFNAME_DETECTED} (routable OOB iface for ${MASTER_ADDR})"
-  else
-    echo "[trainer] WARN: could not detect routable iface for ${MASTER_ADDR}; leaving NCCL_SOCKET_IFNAME as-is"
-  fi
+# Cross-node NCCL OOB bootstrap fix (Tupperware Netns / IP-per-task reservations).
+# MAST hardcodes NCCL_SOCKET_IFNAME=beth0 for every job (nccl_env.py) — that is
+# the BACKEND RoCE NIC, whose per-task `…bace…` address is NOT routable container-
+# to-container on a Netns-onboarded reservation, so NCCL's TCP OOB bootstrap times
+# out (socketPollConnect ... Connection timed out). The RoCE DATA plane (mlx5
+# verbs) is unaffected. Fix: move the OOB bootstrap onto the FRONTEND task NIC that
+# MAST assigns — its name is in $TW_TASK_ASSIGNED_IFNAMES (the same NIC Ray joins
+# on cross-node) — and drop the beth-oriented NCCL_SOCKET_IPADDR_PREFIX=2401 hint.
+NCCL_OOB_IFNAME="${TW_TASK_ASSIGNED_IFNAMES:-eth0}"
+export NCCL_SOCKET_IFNAME="${NCCL_OOB_IFNAME}"
+export NCCL_CLIENT_SOCKET_IFNAME="${NCCL_OOB_IFNAME}"   # keep == NCCL_SOCKET_IFNAME (mismatch → "CVAR incompatible")
+unset NCCL_SOCKET_IPADDR_PREFIX                          # beth-oriented 2803/2401 prefix hint would mis-match in NetNS
+# torch/c10d also needs the frontend NIC: gloo PGs (CPU coordination, e.g. the
+# checkpoint-save barrier) default to beth0 too and would hang cross-node in NetNS.
+# (TCPStore is fine — it binds MASTER_ADDR, which we already set to the eth0/face IP.)
+export GLOO_SOCKET_IFNAME="${NCCL_OOB_IFNAME}"
+echo "[trainer] NCCL/GLOO OOB iface -> ${NCCL_OOB_IFNAME} (frontend; TW_TASK_ASSIGNED_IFNAMES='${TW_TASK_ASSIGNED_IFNAMES:-<unset>}'); data plane stays on mlx5 RoCE"
+
+# W&B's transaction log cannot be written safely to OILFS (wandb-core can fail
+# close(2) with EOVERFLOW and leave an empty run). Every Ray actor writes to the
+# same path on its own host-local /tmp. Each task publishes immutable tar
+# snapshots into a task-specific OILFS directory; the devserver watcher extracts
+# those snapshots to local disk before running `wandb sync`.
+WANDB_ATTEMPT_ID="${MAST_HPC_JOB_ATTEMPT_INDEX:-0}-${MAST_HPC_TASK_GROUP_ATTEMPT_EPOCH:-0}"
+WANDB_DIR="${MAST_WANDB_LOCAL_DIR:-/tmp/slime-wandb/${RUN_NAME}/attempt-${WANDB_ATTEMPT_ID}}"
+WANDB_PUBLISHER_DIR="${STAGE}/wandb-snapshots/${RUN_NAME}/attempt-${WANDB_ATTEMPT_ID}-task-${TW_TASK_ID:-0}"
+WANDB_SNAPSHOT_SCRIPT="${SLIME}/examples/supo_browsecomp/mast/wandb_snapshot.sh"
+rm -rf "${WANDB_DIR}"
+mkdir -p "${WANDB_DIR}"
+bash "${WANDB_SNAPSHOT_SCRIPT}" watch "${WANDB_DIR}" "${WANDB_PUBLISHER_DIR}" \
+  "${MAST_WANDB_SNAPSHOT_INTERVAL_SEC:-60}" &
+WANDB_SNAPSHOT_PID=$!
+echo "[trainer] W&B local=${WANDB_DIR} snapshots=${WANDB_PUBLISHER_DIR}"
+
+RAY_LOG_COPY_TIMEOUT_SEC="${MAST_RAY_LOG_COPY_TIMEOUT_SEC:-120}"
+if ! [[ "${RAY_LOG_COPY_TIMEOUT_SEC}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[trainer] WARN: invalid MAST_RAY_LOG_COPY_TIMEOUT_SEC=${RAY_LOG_COPY_TIMEOUT_SEC}; using 120" >&2
+  RAY_LOG_COPY_TIMEOUT_SEC=120
 fi
+
+on_trainer_exit() {
+  local rc=$?
+  trap - EXIT INT TERM
+
+  if [[ "${IS_HEAD}" = "1" ]]; then
+    echo "[head] EXIT trap: touch DONE"
+    touch "${DONE_FILE}" 2>/dev/null || true
+  fi
+
+  kill "${WANDB_SNAPSHOT_PID}" 2>/dev/null || true
+  wait "${WANDB_SNAPSHOT_PID}" 2>/dev/null || true
+  if ! bash "${WANDB_SNAPSHOT_SCRIPT}" once "${WANDB_DIR}" "${WANDB_PUBLISHER_DIR}"; then
+    echo "[trainer] WARN: final W&B snapshot failed" >&2
+  fi
+
+  if [[ "${IS_HEAD}" = "1" && "${MAST_PERSIST_RAY_LOGS:-1}" != "0" ]]; then
+    echo "[head] persisting Ray logs (timeout=${RAY_LOG_COPY_TIMEOUT_SEC}s)"
+    if ! timeout --signal=TERM --kill-after=10s "${RAY_LOG_COPY_TIMEOUT_SEC}s" \
+      bash -c '
+        set -e
+        dest=$1
+        rm -rf "${dest}"
+        mkdir -p "${dest}"
+        cp -rL /var/tmp/ray/session_*/logs "${dest}/"
+      ' _ "${STAGE}/raylogs/${RUN_NAME}"; then
+      echo "[head] WARN: Ray log persistence timed out or failed; training result is unchanged" >&2
+    fi
+  fi
+  return "${rc}"
+}
+trap on_trainer_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ----- worker branch (multi-node only): join ray, wait for DONE -----
 # Robust against COORD_DIR staleness across retries (same MAST_HPC_JOB_NAME reuses
@@ -154,10 +211,7 @@ rm -rf "${COORD_DIR}" 2>/dev/null || true
 mkdir -p "${COORD_DIR}"
 source scripts/models/qwen3.5-4B.sh
 
-RUN_NAME="${RUN_NAME:-${MAST_HPC_JOB_NAME:-supo-bcplus-mast-local}}"
-WANDB_DIR="${STAGE}/wandb/${RUN_NAME}"
 CKPT_SAVE_DIR="${STAGE}/checkpoints/${RUN_NAME}"
-mkdir -p "${WANDB_DIR}" "${CKPT_SAVE_DIR}"
 
 CKPT_ARGS=(
    --hf-checkpoint "${D}/Qwen3.5-4B"
@@ -262,6 +316,7 @@ fi
 
 WANDB_ARGS=(
    --use-wandb --wandb-mode offline
+   --wandb-explicit-teardown
    --wandb-project "${BC_WANDB_PROJECT:-supo-bcplus-mast}"
    --wandb-group "${RUN_NAME}" --wandb-dir "${WANDB_DIR}"
 )
@@ -269,8 +324,6 @@ WANDB_ARGS=(
 COLOCATE_ARGS=( --colocate )
 
 # ----- start ray head, publish IP, wait for workers -----
-trap 'echo "[head] EXIT trap: touch DONE + persist ray logs"; touch "${DONE_FILE}" 2>/dev/null || true; rm -rf "${STAGE}/raylogs/${RUN_NAME}" 2>/dev/null || true; mkdir -p "${STAGE}/raylogs/${RUN_NAME}" 2>/dev/null || true; cp -rL /var/tmp/ray/session_*/logs "${STAGE}/raylogs/${RUN_NAME}/" 2>/dev/null || true' EXIT
-
 ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus 8 \
     --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
@@ -280,18 +333,16 @@ if [[ "${NNODES}" != "1" ]]; then
   sleep 40; ray status || true
 fi
 
-# Propagate the detected NCCL OOB interface to all ray actors (interface name is
-# identical across the homogeneous nodes, so a single value is correct cluster-
-# wide). Omitted entirely at 1 node / if detection failed, to avoid disturbing
-# the proven single-node NCCL path.
-NCCL_IFNAME_FRAGMENT=""
-if [[ -n "${NCCL_SOCKET_IFNAME_DETECTED:-}" ]]; then
-  NCCL_IFNAME_FRAGMENT="\"NCCL_SOCKET_IFNAME\": \"${NCCL_SOCKET_IFNAME_DETECTED}\","
-fi
-
+# Propagate the NCCL OOB interface override to all ray actors (the frontend NIC
+# name is identical across the homogeneous nodes, so one value is cluster-wide
+# correct). Also blank NCCL_SOCKET_IPADDR_PREFIX so a leftover beth-oriented
+# prefix hint can't steer OOB back onto the backend NIC.
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    ${NCCL_IFNAME_FRAGMENT}
+    \"NCCL_SOCKET_IFNAME\": \"${NCCL_OOB_IFNAME}\",
+    \"NCCL_CLIENT_SOCKET_IFNAME\": \"${NCCL_OOB_IFNAME}\",
+    \"NCCL_SOCKET_IPADDR_PREFIX\": \"\",
+    \"GLOO_SOCKET_IFNAME\": \"${NCCL_OOB_IFNAME}\",
     \"PYTHONPATH\": \"/root/Megatron-LM/:${SLIME}\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"MASTER_ADDR\": \"${MASTER_ADDR}\",
@@ -300,6 +351,7 @@ RUNTIME_ENV_JSON="{
     \"TRITON_CACHE_DIR\": \"/tmp/triton_cache_slime\",
     \"HF_HUB_OFFLINE\": \"1\",
     \"TRANSFORMERS_OFFLINE\": \"1\",
+    \"WANDB_X_FLUSH_INTERVAL_SECONDS\": \"${WANDB_X_FLUSH_INTERVAL_SECONDS}\",
     \"LOCAL_SEARCH_URL\": \"${LOCAL_SEARCH_URL}\",
     \"LLAMA_API_KEY\": \"${LLAMA_API_KEY}\",
     \"http_proxy\": \"\",

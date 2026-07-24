@@ -163,6 +163,51 @@ wandb offline runs while/after srun runs. Tune `TRAIN_WALLTIME` and
 `SEARCH_BUFFER_HOURS` (default 4); `SEARCH_QOS` (default `a100_dev`) sets the
 search server's queue.
 
+### MAST W&B live sync
+
+MAST writes W&B transaction logs to each node's local `/tmp` and publishes an
+immutable tar snapshot to `supo-slime/wandb-snapshots/<job>/` every 60 seconds.
+It does not write active `.wandb` files directly to OILFS. From the devserver,
+wrap the existing JSON-mode MAST command to submit the job and start its W&B
+watcher atomically from the user's point of view:
+
+```bash
+cd /home/hhzhang01/Long-Horizon-AgenticRL
+examples/supo_browsecomp/mast/submit_with_wandb.sh -- \
+  /home/hhzhang01/local/fbsource/genai/msl/rl/cli.sh mast --json \
+  ...the existing MAST arguments...
+```
+
+The wrapper passes the submission command through unchanged, parses
+`.job.job_name` from its structured response, and starts the watcher in tmux.
+It saves the response and watcher log under
+`~/.local/state/mast-wandb/<job>/`. If a devserver reboot removes the tmux
+session, restore only the watcher without submitting another training job:
+
+```bash
+examples/supo_browsecomp/mast/submit_with_wandb.sh \
+  watch-only avocado_rev1_rl_debug_80m-xxxxxxxx
+```
+
+The wrapper refuses commands without `--json`. If submission succeeds but the
+watcher fails to start, it reports the already-submitted job and exits with
+status 3; use `watch-only` to recover rather than rerunning the submission.
+
+The watcher extracts only completed snapshots to devserver-local cache, then
+uploads to `https://meta.wandb.io` every five minutes with `wandb sync
+--append`. It survives MAST preemption/rescheduling and performs a final sync
+after MAST reaches `COMPLETE`, `FAILED`, or `DEAD`. For an on-demand upload,
+replace `watch` with `once`. The Meta W&B key remains in `~/.wandb-key` on the
+devserver and is never copied into MAST or OILFS. Set
+`MAST_WANDB_SNAPSHOT_INTERVAL_SEC` on the trainer to change the 60-second
+snapshot interval.
+
+At shutdown, the head task also copies Ray text logs to OILFS. This cleanup is
+limited to 120 seconds so a large log directory cannot keep GPUs allocated after
+training has finished. Set `MAST_RAY_LOG_COPY_TIMEOUT_SEC` to change that limit,
+or `MAST_PERSIST_RAY_LOGS=0` to skip Ray log persistence. The final W&B snapshot
+is published before this cleanup starts.
+
 **Point at an existing search server** — set `LOCAL_SEARCH_URL` to skip the
 ensure step entirely:
 ```bash
