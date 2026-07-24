@@ -7,10 +7,11 @@ either ported or vendored here).
 
 This is a **pipeline-first** port:
 
-- Rollout: single-session ReAct (`workflow="search"` in the SUPO reference
-  impl), no branch / summary / process reward.
-- Algorithm: slime's stock GRPO. FoldGRPO advantage estimation, branch
-  scheduling, and `process_reward=[flat,scope]` are left for a follow-up.
+- Rollout: ReAct search with automatic SUPO session folding when a sub-
+  trajectory approaches its context budget. Branching and process reward are
+  not implemented.
+- Algorithm: rollout-id-deduped FoldGRPO normalization across compression
+  siblings, plus token-level advantage control for the generated summary turn.
 - Judge: OpenAI-family model via Meta's internal MetaGen gateway (Llama API
   OpenAI-compat endpoint). Defaults to `gpt-5-4-genai-dss4` for both the
   primary judge and the near-miss fallback.
@@ -25,8 +26,7 @@ This is a **pipeline-first** port:
   a long-lived Slurm job.
 - `local_search_client.py` — thin async HTTP client (`/search`, `/open`) for
   talking to the retrieval server from inside slime.
-- `generate_with_bcplus.py` — the two callables wired into slime's custom
-  generate + reward hooks:
+- `generate_with_bcplus.py` — rollout, reward, post-processing, and W&B hooks:
   - `generate()` — multi-turn ReAct loop. Stops the sampler at `</function>`,
     parses the last `<function=...>` block, dispatches to `search`/`open_page`/
     `finish`, and appends the observation as `loss_mask=0` text before the next
@@ -34,6 +34,9 @@ This is a **pipeline-first** port:
   - `reward_func()` — extracts the `<finish answer=...>` payload from the
     trajectory metadata and calls the MetaGen judge (with `em_score` /
     `relaxed_em` fast paths).
+- `summary_advantage.py` — expands each rollout's normalized GRPO signal over
+  response tokens and assigns a fixed negative advantage only to malformed
+  compression-generation turns (thinking plus summary output).
 - `run_qwen3p5_4B_colocate.sh` — the live launcher for the full 8-node run
   (64 GPU, colocate: sglang shares the training GPUs in a single srun).
   Two-part (login pod → in-container). Auto-ensures the search server (see
@@ -188,8 +191,7 @@ bash /home/hhzhang01/slime/examples/supo_browsecomp/debug_scripts/run_qwen3p5_4B
 
 ## Not (yet) ported from the SUPO paper
 
-- Branch / summary / multi-session tool (`workflow="search_branch"`).
-- FoldGRPO advantage estimator.
+- Search branching / model-selected compression (`workflow="search_branch"`).
 - `process_reward=[flat,scope]` shaping and `scope_judge` sub-agent.
 - Multi-question `<q1>...<q2>...` prompts appear in the eval set — the judge
   handles them but the rollout loop does not do the "you must answer all"

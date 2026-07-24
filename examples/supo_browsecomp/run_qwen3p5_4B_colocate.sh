@@ -460,6 +460,7 @@ CUSTOM_ARGS=(
    --custom-rm-path                 examples.supo_browsecomp.generate_with_bcplus.reward_func
    --reward-key score
    --custom-reward-post-process-path examples.supo_browsecomp.generate_with_bcplus.reward_post_process
+   --custom-advantage-function-path examples.supo_browsecomp.summary_advantage.compute_summary_aware_advantages
    --custom-rollout-log-function-path examples.supo_browsecomp.generate_with_bcplus.log_bcplus
    --rollout-data-postprocess-path   examples.supo_browsecomp.generate_with_bcplus.dump_rollout_data_postprocess
 )

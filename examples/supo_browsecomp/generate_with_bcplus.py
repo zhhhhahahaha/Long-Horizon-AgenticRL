@@ -1,10 +1,11 @@
 """Multi-turn ReAct rollout + reward for BrowseComp-Plus, following the SUPO
 paper's workflow="search" recipe (arXiv 2510.11967).
 
-Four callables are exported and wired into slime via:
+Five callables are exported and wired into slime via:
     --custom-generate-function-path      examples.supo_browsecomp.generate_with_bcplus.generate
     --custom-rm-path                     examples.supo_browsecomp.generate_with_bcplus.reward_func
     --custom-reward-post-process-path    examples.supo_browsecomp.generate_with_bcplus.reward_post_process
+    --custom-advantage-function-path     examples.supo_browsecomp.summary_advantage.compute_summary_aware_advantages
     --custom-rollout-log-function-path   examples.supo_browsecomp.generate_with_bcplus.log_bcplus
 
 log_bcplus is where per-rollout wandb metrics are emitted — it's the only
@@ -40,18 +41,15 @@ also implements SUPO's FOLDGRPO grouping (per-prompt ``group_index`` mean/std
 with ``rollout_id`` dedup, so a rollout with N sub-trajs still contributes
 one reward to the group statistics).
 
-**Compression-failure penalty**: when a compression turn fires but the model
-fails to emit a real ``<summary>...</summary>`` block (we salvage raw text
-via a fallback path), ``BCPLUS_COMPRESS_PENALTY`` is subtracted from that
-one sub-trajectory's score in ``reward_post_process``. Group mean/std are
-computed from unpenalized per-rollout final rewards, so the penalty shifts
-only the failing sub-traj's advantage — sibling scores are unaffected. This
-gives the model a gradient signal to learn to emit real summary blocks
-without punishing its siblings when one of them happens to be the failing
-one. Track ``bcplus/compress_success_rate`` on wandb to see this improve
+**Compression-failure advantage**: when a compression turn fires but the
+model fails to emit a real ``<summary>...</summary>`` block (we salvage raw
+text via a fallback path), every model-generated token in that compression
+turn receives advantage ``-BCPLUS_COMPRESS_PENALTY``. The summary request is
+not trainable, and earlier research tokens retain the rollout's answer-based
+advantage. Track ``bcplus/compress_success_rate`` on wandb to see this improve
 over training. Metric ``summary_source`` (per sub-traj) is one of
-``"extracted"`` (good), ``"fallback"`` (salvage from raw text, penalized),
-or ``"empty"`` (no output at all, penalized).
+``"extracted"`` (good), ``"fallback"`` (salvage from raw text, negative
+summary-turn advantage), or ``"empty"`` (no generated summary turn).
 
 The reward is a single-model judge routed through the internal MetaGen gateway
 (default: gpt-5-4-genai-dss4). SUPO's original two-model fallback path
@@ -77,6 +75,7 @@ import os
 import re
 import unicodedata
 from collections import Counter
+from collections.abc import Iterable, Mapping
 
 import httpx
 
@@ -108,14 +107,11 @@ BCPLUS_CONFIGS = {
     "compress_length_threshold": float(os.environ.get("BCPLUS_COMPRESS_THRESH", "0.85")),
     # Hard cap on sub-trajectories per rollout. Matches SUPO's max_session=5.
     "max_sub_trajs": int(os.environ.get("BCPLUS_MAX_SUB_TRAJS", "5")),
-    # Penalty subtracted from a sub-traj's `score` when it was closed by
-    # compression but the model failed to emit a real <summary>...</summary>
-    # block (summary_source != "extracted"). Applied per-sub-traj in
-    # reward_post_process AFTER final-reward broadcast but BEFORE GRPO
-    # normalization, so it changes only the failing sub-traj's advantage —
-    # sibling advantages and group mean/std are unaffected. Set to 0 to
-    # disable the penalty entirely. Shell default in run_qwen3p5_4B_colocate.sh
-    # RUNTIME_ENV_JSON must match this default.
+    # Magnitude of the fixed negative advantage assigned to all generated
+    # tokens in a fallback summary turn. Applied by the BC+ custom advantage
+    # function after rollout-level GRPO normalization; earlier research tokens
+    # and sibling sub-trajectories retain their answer-based advantage. Set to
+    # 0 to disable the override entirely. Shell launcher defaults must match.
     "compress_penalty": float(os.environ.get("BCPLUS_COMPRESS_PENALTY", "0.5")),
     # Directory to dump per-sub-traj rollout+train state for offline analysis.
     # Empty string disables (canonical training pays zero cost). See
@@ -483,6 +479,28 @@ def _extract_q_dict(s: str) -> dict:
     return {k: v.strip() for k, v in re.findall(r"<(q\d+)>(.*?)</\1>", s, flags=re.S)}
 
 
+def _evidence_docids(value) -> set[str]:
+    """Normalize parquet evidence_docs values into corpus docid strings."""
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        value = value.strip()
+        return {value} if value else set()
+    if isinstance(value, Mapping):
+        for key in ("docid", "docids", "doc_id", "doc_ids", "document_id", "document_ids"):
+            if key in value:
+                return _evidence_docids(value[key])
+        return set()
+    if isinstance(value, Iterable):
+        docids: set[str] = set()
+        for item in value:
+            docids.update(_evidence_docids(item))
+        return docids
+    if isinstance(value, int) and not isinstance(value, bool):
+        return {str(value)}
+    return set()
+
+
 async def _call_openai(messages, model, max_retries=3):
     """Chat completions against Meta's internal MetaGen gateway.
 
@@ -579,8 +597,10 @@ async def _judge(question: str, correct_answer: str, predicted_answer: str) -> f
 # ---------------------------------------------------------------------------
 
 
-async def _run_action(fn_calls: list[dict], visited: set[str]) -> tuple[str, str | None, bool]:
-    """Return (observation_text, finish_answer_or_None, had_effective_call).
+async def _run_action(
+    fn_calls: list[dict], visited: set[str]
+) -> tuple[str, str | None, bool, set[str], set[str]]:
+    """Return the observation, finish state, and docids exposed by the tools.
 
     finish_answer_or_None is a non-empty string only if the model called
     <function=finish>. observation_text is what we should append back as the
@@ -588,10 +608,14 @@ async def _run_action(fn_calls: list[dict], visited: set[str]) -> tuple[str, str
     had_effective_call is True iff at least one fn in fn_calls dispatched a
     real action (successful search / open_page / non-empty finish). False
     when every call was rejected for bad args, unknown name, or empty finish.
+    The two docid sets contain search results included in the observation and
+    documents successfully resolved by open_page, respectively.
     """
     observation = ""
     finish_answer: str | None = None
     had_effective_call = False
+    retrieved_docids: set[str] = set()
+    opened_docids: set[str] = set()
     client = _search_client()
     for fn in fn_calls:
         name = fn["function"]
@@ -631,6 +655,7 @@ async def _run_action(fn_calls: list[dict], visited: set[str]) -> tuple[str, str
                     f"url: {page['url']}\n"
                     f"content: {text}\n"
                 )
+                retrieved_docids.add(str(page["docid"]))
                 shown += shown_incr
                 if shown >= topk:
                     break
@@ -646,6 +671,8 @@ async def _run_action(fn_calls: list[dict], visited: set[str]) -> tuple[str, str
                 opened = await client.open(url=url, docid=docid)
             had_effective_call = True
             for page in opened:
+                if page.get("docid") is not None:
+                    opened_docids.add(str(page["docid"]))
                 text = _keep_first_n_words(page.get("text", ""), BCPLUS_CONFIGS["doc_words_full"])
                 observation += (
                     "[Opened Page Content]\n"
@@ -681,7 +708,13 @@ async def _run_action(fn_calls: list[dict], visited: set[str]) -> tuple[str, str
             "additional information if we still can not answer the question. Do not give the "
             "answer if the information is still not enough."
         )
-    return observation.strip(), finish_answer, had_effective_call
+    return (
+        observation.strip(),
+        finish_answer,
+        had_effective_call,
+        retrieved_docids,
+        opened_docids,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -695,7 +728,8 @@ def _stash_bcplus(sample: Sample, stats: dict) -> None:
     Called from every exit path of ``_run_one_sub_trajectory`` (normal, length,
     abort, compressed) so the sub-trajectory always carries its stats even on
     early-return paths. ``stats`` fields: n_search, n_open, finished,
-    finish_answer, final_stop_reason, n_turns_used, outcome, summary.
+    finish_answer, final_stop_reason, n_turns_used, outcome, summary,
+    retrieved_docids, opened_docids.
     """
     if not isinstance(sample.metadata, dict):
         sample.metadata = {}
@@ -712,25 +746,29 @@ async def _do_compression(
     sampling_params: dict,
     prompt_ids: list[int],
     response_token_ids: list[int],
-) -> tuple[str | None, str, int]:
+) -> tuple[str | None, str, int, tuple[int, int] | None]:
     """Run the SUPO summary-generation turn on the current sub-trajectory.
 
     Appends the summary request + policy summary output to the current
     sub-trajectory's tokens/loss_mask (loss_mask=0 for the request, =1 for
     the model's summary — the model IS learning to summarize).
 
-    Returns ``(summary_or_None, summary_source, extra_tokens_added)``.
+    Returns ``(summary_or_None, summary_source, extra_tokens_added,
+    summary_turn_span_or_None)``. The span is response-relative and half-open;
+    it covers every model-generated token in the compression turn (thinking,
+    tags, and visible summary), but excludes the non-trainable summary request.
     ``summary`` is None only when the model produced literally no output.
     ``summary_source`` is one of:
       * ``"extracted"`` — model emitted a real <summary>...</summary> block
         (the good path).
       * ``"fallback"`` — no <summary> block, but non-empty output; we strip
-        the <think> block and salvage the raw text as summary. Downstream
-        `reward_post_process` will penalize this sub-traj.
+        the <think> block and salvage the raw text as summary. The downstream
+        custom advantage hook will override this summary turn.
       * ``"empty"`` — model produced literally no output or an abort; no
         salvage possible. Sub-traj will be marked ``compress_failed``.
     ``extra_tokens_added`` is the count added to ``response_token_ids`` this
-    call so the caller can update its running length tracker.
+    call so the caller can update its running length tracker. Abort and empty
+    generation paths return no summary-turn span.
     """
     added_tokens_start = len(response_token_ids)
 
@@ -743,6 +781,7 @@ async def _do_compression(
     sample.append_response_tokens(
         args, tokens=request_tokens, trainable=False, text=request_wrapped,
     )
+    summary_turn_start = len(response_token_ids)
 
     # Step 2: sglang generation for the summary. Stop tags:
     #   - </summary>: canonical case, model closed the summary block
@@ -771,7 +810,7 @@ async def _do_compression(
 
     if output["meta_info"]["finish_reason"]["type"] == "abort":
         # Treat abort during summarization as compression failure.
-        return None, "empty", len(response_token_ids) - added_tokens_start
+        return None, "empty", len(response_token_ids) - added_tokens_start, None
 
     cur_text = output["text"]
     cur_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
@@ -785,6 +824,7 @@ async def _do_compression(
         meta_info=output["meta_info"],
         text=cur_text,
     )
+    summary_turn_end = len(response_token_ids)
 
     # Extract the summary. Matches SUPO fold_agent.py:139's
     # `summary = extract_summary(response) or response` — if the model didn't
@@ -793,7 +833,7 @@ async def _do_compression(
     # spends its response inside <think>...</think> and never gets to open
     # the <summary> block; we still pass forward *something* the next sub-
     # trajectory can build on. The `summary_source` return tag lets the
-    # reward hook penalize this fallback path so the model has a gradient
+    # advantage hook penalize this fallback path so the model has a gradient
     # signal to actually learn to emit real <summary> blocks.
     summary = _extract_summary(cur_text)
     if summary is not None:
@@ -806,7 +846,12 @@ async def _do_compression(
         summary_source = "fallback"
     else:
         summary_source = "empty"
-    return summary, summary_source, len(response_token_ids) - added_tokens_start
+    summary_turn_span = (
+        (summary_turn_start, summary_turn_end)
+        if summary_source != "empty" and summary_turn_end > summary_turn_start
+        else None
+    )
+    return summary, summary_source, len(response_token_ids) - added_tokens_start, summary_turn_span
 
 
 async def _run_one_sub_trajectory(
@@ -876,6 +921,8 @@ async def _run_one_sub_trajectory(
     )
 
     visited_docs: set[str] = set()
+    retrieved_docids: set[str] = set()
+    opened_docids: set[str] = set()
     n_search = 0
     n_open = 0
     # Count turns where the model failed to dispatch a valid tool call:
@@ -894,6 +941,7 @@ async def _run_one_sub_trajectory(
     finish_reason_last: str | None = None
     summary_from_compress: str | None = None
     summary_source: str = ""  # set by _do_compression on the compression turn
+    summary_turn_span: tuple[int, int] | None = None
     outcome: str = "unknown"
     _turn = -1
 
@@ -910,7 +958,11 @@ async def _run_one_sub_trajectory(
             "outcome": outcome,
             "summary": summary_from_compress,
             "summary_source": summary_source,
+            "summary_turn_start": summary_turn_span[0] if summary_turn_span is not None else None,
+            "summary_turn_end": summary_turn_span[1] if summary_turn_span is not None else None,
             "response_len_tokens": len(response_token_ids),
+            "retrieved_docids": sorted(retrieved_docids),
+            "opened_docids": sorted(opened_docids),
         })
 
     for _turn in range(BCPLUS_CONFIGS["max_turns"]):
@@ -961,6 +1013,8 @@ async def _run_one_sub_trajectory(
             return outcome
 
         fn_calls = _extract_fn_call(cur_text)
+        turn_retrieved_docids: set[str] = set()
+        turn_opened_docids: set[str] = set()
         if not fn_calls:
             observation = "No function call was detected in the model response."
             n_bad_tool_calls += 1
@@ -971,7 +1025,13 @@ async def _run_one_sub_trajectory(
                 elif fn["function"] == "open_page":
                     n_open += 1
             try:
-                observation, finish_answer, had_effective_call = await _run_action(fn_calls, visited_docs)
+                (
+                    observation,
+                    finish_answer,
+                    had_effective_call,
+                    turn_retrieved_docids,
+                    turn_opened_docids,
+                ) = await _run_action(fn_calls, visited_docs)
             except asyncio.CancelledError:
                 # Cooperative cancellation (rollout aborted upstream) — re-raise
                 # so the parent task tears down correctly. Not a server error.
@@ -982,7 +1042,7 @@ async def _run_one_sub_trajectory(
                 # KeyError / TypeError from malformed 200 responses, JSON
                 # decode errors, client bugs, etc. Print so the traceback
                 # is grep-able in train.log; increment the counter so wandb
-                # (bcplus/n_search_server_error_mean) shows the health.
+                # (bcplus/n_search_server_error_sub_traj_mean) shows the health.
                 print(
                     f"[BCPLUS search-server error] turn={_turn} fn_calls={fn_calls!r} "
                     f"err={type(e).__name__}: {e}",
@@ -1052,7 +1112,7 @@ async def _run_one_sub_trajectory(
                 f"dropping cur+obs (rollback), compressing on pre-turn state",
                 flush=True,
             )
-            summary_from_compress, summary_source, _ = await _do_compression(
+            summary_from_compress, summary_source, _, summary_turn_span = await _do_compression(
                 args, tokenizer, url, sample, sampling_params,
                 prompt_ids, response_token_ids,
             )
@@ -1075,6 +1135,11 @@ async def _run_one_sub_trajectory(
             args, tokens=obs_tokens, trainable=False, text=obs_wrapped,
         )
         response_token_ids += obs_tokens
+        # Count tool evidence only after its observation is committed and
+        # therefore actually visible to the model. A compression rollback
+        # drops the observation and must not create a retrieval/open hit.
+        retrieved_docids.update(turn_retrieved_docids)
+        opened_docids.update(turn_opened_docids)
 
     # max_turns exhausted without finish/compress/length/abort.
     sample.status = Sample.Status.TRUNCATED
@@ -1166,6 +1231,8 @@ async def generate(args, sample: Sample, sampling_params) -> list[Sample]:
             "is_final": (i == total - 1),
             "outcome": bc.get("outcome", ""),
             "summary_source": bc.get("summary_source", ""),
+            "summary_turn_start": bc.get("summary_turn_start"),
+            "summary_turn_end": bc.get("summary_turn_end"),
             "group_index": int(s.group_index) if s.group_index is not None else -1,
         }
 
@@ -1256,9 +1323,9 @@ def log_bcplus(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
 
     Handles compressed rollouts: ``samples`` may contain multiple sub-trajs
     per rollout (all sharing ``sample.rollout_id``). Sub-traj-level metrics
-    aggregate across all sub-trajs; rollout-level metrics dedupe by
-    ``sample.rollout_id`` and use only the FINAL sibling's ``reward`` (that's
-    the one carrying the judge score post-broadcast).
+    aggregate across all sub-trajs; trajectory-level metrics first aggregate
+    siblings by ``sample.rollout_id`` so every complete trajectory contributes
+    once.
 
     Returns False so slime's default rollout logging still runs afterwards.
     """
@@ -1286,14 +1353,29 @@ def log_bcplus(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
         by_rollout[s.rollout_id if s.rollout_id is not None else id(s)].append(s)
 
     # Sub-traj-level: aggregate reward diagnostics across ALL sub-trajs.
-    diag_keys = ("n_turns", "n_search", "n_open", "n_tool_calls", "n_bad_tool_calls", "n_search_server_error", "finished", "truncated", "judge_failed")
-    diag_sums = {k: 0.0 for k in diag_keys}
+    count_diag_keys = (
+        "n_turns",
+        "n_search",
+        "n_open",
+        "n_tool_calls",
+        "n_bad_tool_calls",
+        "n_search_server_error",
+    )
+    sub_traj_count_sums = {k: 0.0 for k in count_diag_keys}
+    finished_sub_traj_sum = 0.0
+    judge_failed_sub_traj_sum = 0.0
+    sglang_length_stop_sum = 0.0
     diag_count = 0
     for s in flat_samples:
         r = s.reward
         if isinstance(r, dict):
-            for k in diag_keys:
-                diag_sums[k] += float(r.get(k, 0.0))
+            for k in count_diag_keys:
+                sub_traj_count_sums[k] += float(r.get(k, 0.0))
+            finished_sub_traj_sum += float(r.get("finished", 0.0))
+            judge_failed_sub_traj_sum += float(r.get("judge_failed", 0.0))
+            # `truncated` specifically means SGLang returned finish_reason=length;
+            # it does not include max-turn or compression-related truncation.
+            sglang_length_stop_sum += float(r.get("truncated", 0.0))
             diag_count += 1
 
     # Rollout-level: dedupe by rollout_id, use final sibling's judged reward
@@ -1304,13 +1386,31 @@ def log_bcplus(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
     compression_failed: list[bool] = []
     capped: list[bool] = []
     final_response_lens: list[int] = []
+    trajectory_count_sums = {k: 0.0 for k in count_diag_keys}
+    finished_trajectory_count = 0
+    judge_failed_trajectory_count = 0
+    sglang_length_stop_trajectory_count = 0
+    evidence_trajectory_count = 0
+    retrieved_gold_hit_count = 0
+    opened_gold_hit_count = 0
+    opened_gold_given_retrieved_count = 0
+    retrieved_gold_recall_sum = 0.0
+    opened_gold_recall_sum = 0.0
+    opened_gold_answer_count = 0
+    opened_gold_correct_count = 0
+    not_opened_gold_answer_count = 0
+    not_opened_gold_correct_count = 0
     # For pass@k: group by group_index (per-prompt), collect per-rollout
-    # raw (pre-penalty) score. `raw_final_score` is snapshotted in
-    # reward_post_process before the compression-failure penalty is applied,
-    # so pass@k reflects pure answer accuracy (matches the traditional
+    # clean judge score. `raw_final_score` is snapshotted in
+    # reward_post_process before token-level summary overrides are applied, so
+    # pass@k reflects pure answer accuracy (matches the traditional
     # "did this rollout get the answer right" semantics), independent of
     # whether the model happened to fail at emitting <summary> blocks.
     group_raw_scores: dict[int, list[float]] = defaultdict(list)
+    # Clean zero-std diagnostics: one final judge score per parent trajectory,
+    # grouped by prompt. This is the rollout-id-deduped counterpart to slime's
+    # built-in metric, which sees every compression-created sub-traj.
+    group_final_scores: dict[int, list[float]] = defaultdict(list)
     for _rid, group in by_rollout.items():
         # Find the final sibling (the one with is_final=True, or the last if
         # sibling metadata missing).
@@ -1319,10 +1419,30 @@ def log_bcplus(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
             group[-1],
         )
         r = final.reward
+        final_score: float | None = None
         if isinstance(r, dict):
-            scores_per_rollout.append(float(r.get("score", 0.0)))
+            final_score = float(r.get("score", 0.0))
+            scores_per_rollout.append(final_score)
+            finished_trajectory_count += int(bool(r.get("finished", 0.0)))
+            judge_failed_trajectory_count += int(bool(r.get("judge_failed", 0.0)))
         elif r is not None:
-            scores_per_rollout.append(float(r))
+            final_score = float(r)
+            scores_per_rollout.append(final_score)
+        if final.group_index is not None and final_score is not None:
+            group_final_scores[final.group_index].append(final_score)
+        for k in count_diag_keys:
+            trajectory_count_sums[k] += sum(
+                float(s.reward.get(k, 0.0))
+                for s in group
+                if isinstance(s.reward, dict)
+            )
+        sglang_length_stop_trajectory_count += int(
+            any(
+                bool(s.reward.get("truncated", 0.0))
+                for s in group
+                if isinstance(s.reward, dict)
+            )
+        )
         sub_traj_counts.append(len(group))
         # Any non-final sibling with outcome="compressed" means at least one
         # compression fired successfully in this rollout.
@@ -1332,6 +1452,40 @@ def log_bcplus(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
         capped.append(any(o == "compressed_capped" for o in outcomes))
         final_bcplus = (final.metadata or {}).get("_bcplus", {})
         final_response_lens.append(int(final_bcplus.get("response_len_tokens", 0)))
+        gold_docids = _evidence_docids((final.metadata or {}).get("evidence_docs"))
+        if gold_docids:
+            # Compression siblings form one logical trajectory. Union their
+            # tool histories before computing one hit/recall contribution.
+            retrieved = set().union(
+                *(
+                    _evidence_docids((s.metadata or {}).get("_bcplus", {}).get("retrieved_docids"))
+                    for s in group
+                )
+            )
+            opened = set().union(
+                *(
+                    _evidence_docids((s.metadata or {}).get("_bcplus", {}).get("opened_docids"))
+                    for s in group
+                )
+            )
+            retrieved_gold = gold_docids & retrieved
+            opened_gold = gold_docids & opened
+            retrieved_hit = bool(retrieved_gold)
+            opened_hit = bool(opened_gold)
+            evidence_trajectory_count += 1
+            retrieved_gold_hit_count += int(retrieved_hit)
+            opened_gold_hit_count += int(opened_hit)
+            opened_gold_given_retrieved_count += int(retrieved_hit and opened_hit)
+            retrieved_gold_recall_sum += len(retrieved_gold) / len(gold_docids)
+            opened_gold_recall_sum += len(opened_gold) / len(gold_docids)
+            if final_score is not None:
+                answer_correct = float(final_bcplus.get("raw_final_score", final_score)) >= 1.0
+                if opened_hit:
+                    opened_gold_answer_count += 1
+                    opened_gold_correct_count += int(answer_correct)
+                else:
+                    not_opened_gold_answer_count += 1
+                    not_opened_gold_correct_count += int(answer_correct)
         # Collect per-group raw scores for pass@k. group_index may be None if
         # something upstream mis-set it — skip those samples (they'd form
         # singleton groups where pass@k is degenerate anyway).
@@ -1348,6 +1502,7 @@ def log_bcplus(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
     # Numerator = sub-trajs where the model emitted a real <summary> block.
     summary_extracted_count = 0
     summary_fallback_count = 0
+    summary_empty_count = 0
     attempted_compression_count = 0
     for s in flat_samples:
         bc = (s.metadata or {}).get("_bcplus", {}) if isinstance(s.metadata, dict) else {}
@@ -1356,19 +1511,22 @@ def log_bcplus(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
             src = bc.get("summary_source", "")
             if src == "extracted":
                 summary_extracted_count += 1
-            elif src in ("fallback", "empty"):
+            elif src == "fallback":
                 summary_fallback_count += 1
+            elif src == "empty":
+                summary_empty_count += 1
 
-    # Per-sub-traj penalty magnitude (0 when sub-traj wasn't penalized).
-    # Averaged over ALL sub-trajs to reflect batch-level penalty pressure.
+    # Fixed summary-turn advantage override, averaged over all sub-trajs with
+    # unaffected samples contributing zero. This reflects batch-level pressure
+    # without conflating the override with the raw judge reward.
     compress_penalty = BCPLUS_CONFIGS["compress_penalty"]
-    penalty_sum = 0.0
+    summary_fallback_advantage_sum = 0.0
     for s in flat_samples:
         bc = (s.metadata or {}).get("_bcplus", {}) if isinstance(s.metadata, dict) else {}
-        if bc.get("outcome") == "compressed" and bc.get("summary_source") != "extracted":
-            penalty_sum += compress_penalty
+        if compress_penalty > 0 and bc.get("summary_source") == "fallback":
+            summary_fallback_advantage_sum -= compress_penalty
 
-    # pass@k on RAW (pre-penalty) scores. Uses the unbiased combinatorial
+    # pass@k on clean judge scores. Uses the unbiased combinatorial
     # estimator: for a prompt with n rollouts and c correct, the probability
     # that a random size-k sample contains at least one correct is
     # 1 - C(n-c, k) / C(n, k). Averaged across prompts. "Correct" is
@@ -1400,13 +1558,26 @@ def log_bcplus(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
         _BCPLUS_METRIC_DEFINED = True
 
     log = {}
-    # Sub-traj-averaged diagnostics (each sub-traj counts equally).
+    # Sub-traj-level diagnostics (each sub-traj counts equally).
     if diag_count > 0:
-        for k in diag_keys:
-            log[f"bcplus/{k}_mean"] = diag_sums[k] / diag_count
+        for k in count_diag_keys:
+            log[f"bcplus/{k}_sub_traj_mean"] = sub_traj_count_sums[k] / diag_count
+        log["bcplus/finished_sub_traj_rate"] = finished_sub_traj_sum / diag_count
+        log["bcplus/judge_failed_sub_traj_rate"] = judge_failed_sub_traj_sum / diag_count
+        log["bcplus/sglang_length_stop_sub_traj_rate"] = sglang_length_stop_sum / diag_count
     log["bcplus/n_sub_trajs_total"] = len(flat_samples)
 
-    # Rollout-level.
+    # Complete-trajectory-level diagnostics (each parent rollout counts once).
+    if n_rollouts > 0:
+        for k in count_diag_keys:
+            log[f"bcplus/{k}_trajectory_mean"] = trajectory_count_sums[k] / n_rollouts
+        log["bcplus/finished_trajectory_rate"] = finished_trajectory_count / n_rollouts
+        log["bcplus/judge_failed_trajectory_rate"] = judge_failed_trajectory_count / n_rollouts
+        log["bcplus/sglang_length_stop_trajectory_rate"] = (
+            sglang_length_stop_trajectory_count / n_rollouts
+        )
+
+    # Other rollout-level diagnostics.
     log["bcplus/score_mean"] = sum(scores_per_rollout) / n_rollouts if n_rollouts else 0.0
     log["bcplus/score_max"] = max(scores_per_rollout) if scores_per_rollout else 0.0
     log["bcplus/score_hits"] = sum(1 for x in scores_per_rollout if x > 0)
@@ -1419,15 +1590,59 @@ def log_bcplus(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
     log["bcplus/final_response_len_mean"] = (
         sum(final_response_lens) / n_rollouts if n_rollouts else 0.0
     )
+    # Gold-evidence metrics use one contribution per complete trajectory.
+    # Trajectories without evidence_docs are excluded and reported separately
+    # rather than being silently counted as retrieval failures.
+    log["bcplus/evidence_trajectory_count"] = evidence_trajectory_count
+    if evidence_trajectory_count:
+        log["bcplus/retrieved_gold_trajectory_rate"] = (
+            retrieved_gold_hit_count / evidence_trajectory_count
+        )
+        log["bcplus/opened_gold_trajectory_rate"] = (
+            opened_gold_hit_count / evidence_trajectory_count
+        )
+        log["bcplus/retrieved_gold_doc_recall_mean"] = (
+            retrieved_gold_recall_sum / evidence_trajectory_count
+        )
+        log["bcplus/opened_gold_doc_recall_mean"] = (
+            opened_gold_recall_sum / evidence_trajectory_count
+        )
+    else:
+        log["bcplus/retrieved_gold_trajectory_rate"] = 0.0
+        log["bcplus/opened_gold_trajectory_rate"] = 0.0
+        log["bcplus/retrieved_gold_doc_recall_mean"] = 0.0
+        log["bcplus/opened_gold_doc_recall_mean"] = 0.0
+    log["bcplus/opened_gold_given_retrieved_rate"] = (
+        opened_gold_given_retrieved_count / retrieved_gold_hit_count
+        if retrieved_gold_hit_count else 0.0
+    )
+    log["bcplus/answer_correct_given_opened_gold_rate"] = (
+        opened_gold_correct_count / opened_gold_answer_count
+        if opened_gold_answer_count else 0.0
+    )
+    log["bcplus/answer_correct_given_not_opened_gold_rate"] = (
+        not_opened_gold_correct_count / not_opened_gold_answer_count
+        if not_opened_gold_answer_count else 0.0
+    )
+    # Prompt groups whose rollout-id-deduped final rewards have zero variance
+    # at the two terminal reward values. Always emit both keys so W&B records
+    # a real zero instead of leaving a gap when no group matches.
+    log["bcplus/zero_std_trajectory_count_1.0"] = sum(
+        1 for scores in group_final_scores.values() if scores and all(score == 1.0 for score in scores)
+    )
+    log["bcplus/zero_std_trajectory_count_0.0"] = sum(
+        1 for scores in group_final_scores.values() if scores and all(score == 0.0 for score in scores)
+    )
     # Compression-quality metrics.
     log["bcplus/summary_extracted_count"] = summary_extracted_count
     log["bcplus/summary_fallback_count"] = summary_fallback_count
+    log["bcplus/summary_empty_count"] = summary_empty_count
     log["bcplus/compress_success_rate"] = (
         summary_extracted_count / attempted_compression_count
         if attempted_compression_count else 0.0
     )
-    log["bcplus/compress_penalty_mean"] = (
-        penalty_sum / len(flat_samples) if flat_samples else 0.0
+    log["bcplus/summary_fallback_advantage_override_mean"] = (
+        summary_fallback_advantage_sum / len(flat_samples) if flat_samples else 0.0
     )
     # pass@k on raw scores (see computation above). Average across prompts.
     for k in sorted(pass_at_k.keys()):
@@ -1438,9 +1653,9 @@ def log_bcplus(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
 
 
 def reward_post_process(args, samples):
-    """Custom post-process hook wired via ``--custom-reward-post-process-path``.
+    """Broadcast final rewards and compute rollout-deduped GRPO advantages.
 
-    Three responsibilities:
+    Two responsibilities:
 
     1. **Broadcast final-sibling reward to all siblings**: only the final
        sub-trajectory of each rollout has a ``finish_answer`` for the judge
@@ -1449,24 +1664,16 @@ def reward_post_process(args, samples):
        placeholders with the final sibling's judged reward, keyed by
        ``rollout_id``.
 
-    2. **Per-sub-traj compression-failure penalty**: any sub-traj whose
-       ``outcome == "compressed"`` and ``summary_source != "extracted"``
-       (i.e. compression fired but the model didn't emit a real
-       ``<summary>...</summary>`` block, so we fell back to salvaging raw
-       text) gets ``BCPLUS_COMPRESS_PENALTY`` subtracted from its score.
-       Applied AFTER the group-stats snapshot below, so group mean/std are
-       computed from unpenalized per-rollout final rewards — the penalty
-       only shifts the failing sub-traj's own advantage, sibling
-       advantages are unaffected. ``compressed_capped`` (rollout ran out
-       of sub-traj budget) is NOT penalized; only actual compression
-       fail-to-emit-summary is.
-
-    3. **GRPO normalization matching SUPO's FOLDGRPO**: group by
+    2. **GRPO normalization matching SUPO's FOLDGRPO**: group by
        ``group_index`` (the per-prompt id set by slime's data source);
        within each group, dedupe by ``rollout_id`` when collecting rewards
        for mean/std (so a rollout with N sub-trajs contributes exactly one
        reward to the group statistics). Then broadcast the per-rollout
        advantage back to every sub-trajectory of that rollout.
+
+    The token-level fallback-summary override is applied later by
+    ``compute_summary_aware_advantages``. Keeping it out of raw rewards avoids
+    dividing a fixed penalty by a zero or very small GRPO group std.
 
     Denominator invariant: group size == number of distinct rollout_ids in
     the group == ``n_samples_per_prompt``, NEVER sub-trajectory count.
@@ -1497,15 +1704,12 @@ def reward_post_process(args, samples):
         if s.rollout_id in rollout_to_final_reward and rollout_to_final_reward[s.rollout_id] is not None:
             s.reward = copy.deepcopy(rollout_to_final_reward[s.rollout_id])
 
-    # Step 2: raw scalar rewards (in flat_samples order) — POST-broadcast,
-    # PRE-penalty. This snapshot is what group stats will be computed from,
-    # so penalties don't leak into group mean/std.
+    # Step 2: clean scalar judge rewards in flat-sample order, post-broadcast.
     raw_rewards = [s.get_reward_value(args) for s in flat_samples]
 
-    # Snapshot the pre-penalty score into every sibling's metadata so
-    # `log_bcplus` can compute pass@k on the un-mutated judge signal
-    # (post-penalty scores are the training signal but conflate correctness
-    # with compression quality; pass@k should reflect answer accuracy only).
+    # Snapshot the clean judge score into every sibling's metadata so
+    # `log_bcplus` and offline analysis can separate answer correctness from
+    # the later token-level summary-format advantage.
     # Written to every sub-traj — all siblings share the same broadcast
     # reward here, so `raw_final_score` is identical across a rollout.
     # Also mirrored into train_metadata so the dump hook (which only sees
@@ -1525,8 +1729,7 @@ def reward_post_process(args, samples):
 
     # Step 3: group by group_index, dedupe by rollout_id. Each rollout
     # contributes ONE reward to its group's mean/std stats even if it
-    # produced multiple sub-trajectories. Uses UNPENALIZED raw_rewards so
-    # compression-failure penalties don't shift group statistics.
+    # produced multiple sub-trajectories.
     group_rollout_reward: dict[int, dict[int, float]] = defaultdict(dict)
     for i, s in enumerate(flat_samples):
         if s.group_index is None:
@@ -1537,32 +1740,8 @@ def reward_post_process(args, samples):
         else:
             group_rollout_reward[s.group_index][s.rollout_id] = raw_rewards[i]
 
-    # Step 4: apply per-sub-traj compression-failure penalty. Mutates both
-    # raw_rewards[i] (used for advantage calc below) and s.reward["score"]
-    # (so downstream logging + wandb reflect the penalized value). Only
-    # `outcome == "compressed"` counts; `compressed_capped`, `compress_failed`,
-    # `finished`, `truncated`, `aborted` are exempt.
-    compress_penalty = BCPLUS_CONFIGS["compress_penalty"]
-    penalties_applied = 0
-    if compress_penalty > 0:
-        for i, s in enumerate(flat_samples):
-            bc = (s.metadata or {}).get("_bcplus", {}) if isinstance(s.metadata, dict) else {}
-            if bc.get("outcome") == "compressed" and bc.get("summary_source") != "extracted":
-                pre_score = raw_rewards[i]
-                raw_rewards[i] = raw_rewards[i] - compress_penalty
-                if isinstance(s.reward, dict) and "score" in s.reward:
-                    s.reward["score"] = float(s.reward["score"]) - compress_penalty
-                elif not isinstance(s.reward, dict) and s.reward is not None:
-                    s.reward = float(s.reward) - compress_penalty
-                penalties_applied += 1
-                print(
-                    f"[BC+ REWARD DEBUG] penalty applied rollout_id={s.rollout_id} "
-                    f"summary_source={bc.get('summary_source')!r} "
-                    f"pre_score={pre_score:.4f} -> post_score={raw_rewards[i]:.4f}",
-                    flush=True,
-                )
-
-    # Mirror the post-penalty score into train_metadata for the dump hook.
+    # The legacy dump field remains scalar and now carries the clean judge
+    # score. Token-level summary advantages are intentionally not dumped yet.
     for i, s in enumerate(flat_samples):
         if isinstance(s.train_metadata, dict):
             s.train_metadata["score_final"] = float(raw_rewards[i])
@@ -1570,15 +1749,13 @@ def reward_post_process(args, samples):
     print(
         f"[BC+ REWARD DEBUG] n_samples={len(flat_samples)} "
         f"n_groups={len(group_rollout_reward)} "
-        f"penalties_applied={penalties_applied} "
         f"group_rollout_reward={dict((k, dict(v)) for k, v in group_rollout_reward.items())}",
         flush=True,
     )
 
-    # Step 5: per-group mean/std; broadcast advantage back to each sub-traj.
-    # Uses UNPENALIZED group stats (from step 3 snapshot) but PENALIZED
-    # per-sub-traj raw_rewards (from step 4), so the penalty shifts only the
-    # failing sub-traj's advantage — sibling advantages unaffected.
+    # Step 4: compute one clean base advantage per parent rollout and broadcast
+    # it to sibling sub-trajectories. The custom advantage hook expands this
+    # scalar over tokens and replaces fallback-summary spans only.
     normalized = [0.0] * len(flat_samples)
     use_std = (
         args.advantage_estimator in ("grpo", "gspo", "cispo")
@@ -1613,9 +1790,9 @@ def dump_rollout_data_postprocess(args, rollout_id, rollout_data) -> None:
       * ``rollout_data["log_probs"]`` — training-policy log_probs at start of
         this iter (also CP-sharded). Populated only when
         ``--dump-train-old-log-prob`` is set (which flips can_reuse=False).
-      * ``rollout_data["advantages"]`` — post-penalty GRPO advantages (CP-
-        sharded but every position is the same scalar broadcast, so we take
-        the local shard's first value).
+      * ``rollout_data["advantages"]`` — token-level GRPO advantages. The
+        legacy dump still records only the local shard's first value, so it is
+        not a complete summary-turn advantage record.
 
     Uses slime's ``all_gather_with_cp`` to reconstruct full-length per-sample
     log_probs from the CP shards. ALL CP ranks must call the hook (NCCL
