@@ -13,8 +13,8 @@
 #   * wandb OFFLINE → OILFS (sync later from the devgpu)
 #   * Ray head/worker election from MAST_HPC_TASK_GROUP_HOSTNAMES (multi-node)
 #
-# Defaults are a 1-node (8 GPU) SMOKE: TP=4 → DP=2, tiny batch, 2 rollouts. Scale
-# via the BC_* / NUM env overrides once the pipeline is green.
+# Defaults are a 1-node (8 GPU) SMOKE: TP=4, CP=2 → DP=1, tiny batch, 2 rollouts.
+# Scale via the BC_* / NUM env overrides once the pipeline is green.
 set -uo pipefail
 
 # --------------------------- env fixes (MAST vs image) ----------------------
@@ -162,12 +162,16 @@ mkdir -p "${WANDB_DIR}" "${CKPT_SAVE_DIR}"
 CKPT_ARGS=(
    --hf-checkpoint "${D}/Qwen3.5-4B"
    --ref-load      "${D}/Qwen3.5-4B_torch_dist"
-   --save          "${CKPT_SAVE_DIR}"
-   --save-interval "${BC_SAVE_INTERVAL:-5}"
 )
-if [[ -f "${CKPT_SAVE_DIR}/latest_checkpointed_iteration.txt" ]]; then
-   echo "[head] resuming from ${CKPT_SAVE_DIR}"
-   CKPT_ARGS+=(--load "${CKPT_SAVE_DIR}")
+if [[ "${BC_SAVE_INTERVAL:-5}" == "0" ]]; then
+   echo "[head] checkpoint saving disabled (BC_SAVE_INTERVAL=0)"
+else
+   mkdir -p "${CKPT_SAVE_DIR}"
+   CKPT_ARGS+=(--save "${CKPT_SAVE_DIR}" --save-interval "${BC_SAVE_INTERVAL:-5}")
+   if [[ -f "${CKPT_SAVE_DIR}/latest_checkpointed_iteration.txt" ]]; then
+      echo "[head] resuming from ${CKPT_SAVE_DIR}"
+      CKPT_ARGS+=(--load "${CKPT_SAVE_DIR}")
+   fi
 fi
 
 ROLLOUT_ARGS=(
@@ -190,12 +194,12 @@ PERF_ARGS=(
    --tensor-model-parallel-size "${BC_TP:-4}"
    --sequence-parallel
    --pipeline-model-parallel-size 1
-   --context-parallel-size 1
+   --context-parallel-size "${BC_CP:-2}"
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 2
    --use-dynamic-batch-size
-   --max-tokens-per-gpu "${BC_MAX_TOKENS_PER_GPU:-32768}"
+   --max-tokens-per-gpu "${BC_MAX_TOKENS_PER_GPU:-49152}"
 )
 
 GRPO_ARGS=(
@@ -211,7 +215,9 @@ OPTIMIZER_ARGS=(
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine "${BC_TP:-4}"
+   # sglang engine TP is INDEPENDENT of megatron TP (canonical: megatron TP=4 but
+   # sglang engine TP=2). Do NOT tie it to BC_TP.
+   --rollout-num-gpus-per-engine "${BC_SGLANG_TP:-2}"
    --sglang-mem-fraction-static 0.7
    --sglang-disable-custom-all-reduce
 )
@@ -227,9 +233,32 @@ CUSTOM_ARGS=(
    --custom-rm-path                 examples.supo_browsecomp.generate_with_bcplus.reward_func
    --reward-key score
    --custom-reward-post-process-path examples.supo_browsecomp.generate_with_bcplus.reward_post_process
+   --custom-advantage-function-path examples.supo_browsecomp.summary_advantage.compute_summary_aware_advantages
    --custom-rollout-log-function-path examples.supo_browsecomp.generate_with_bcplus.log_bcplus
    --rollout-data-postprocess-path   examples.supo_browsecomp.generate_with_bcplus.dump_rollout_data_postprocess
 )
+
+# Offline rollout-state dump (per-iter parquet per DP rank → OILFS) for debugging.
+# ON by default (BC_DUMP_ROLLOUT=1); BCPLUS_DUMP_DIR must reach the ray actors via
+# RUNTIME_ENV_JSON (below). train_old log_probs are OPT-IN via BCPLUS_DUMP_TRAIN_OLD
+# (same knob as run_qwen3p5_4B_colocate.sh): only when truthy do we add
+# --dump-train-old-log-prob (an extra pre-train forward every iter); the env is
+# passed through to the actors as-is (below) so the dump actually writes the
+# column. Flag and env stay in lockstep — the flag alone pays the forward cost
+# but the dump skips train_old (dump_train_old defaults off); the env alone trips
+# the "train_old missing" assert. See generate_with_bcplus.py:128,1698.
+if [[ "${BC_DUMP_ROLLOUT:-1}" == "1" ]]; then
+   export BCPLUS_DUMP_DIR="${STAGE}/rollout_dumps/${RUN_NAME}"
+   mkdir -p "${BCPLUS_DUMP_DIR}"
+   case "$(printf '%s' "${BCPLUS_DUMP_TRAIN_OLD:-}" | tr '[:upper:]' '[:lower:]')" in
+      ""|0|false) _train_old_label=off ;;
+      *) _train_old_label=on; CUSTOM_ARGS+=(--dump-train-old-log-prob) ;;
+   esac
+   echo "[head] rollout dump ENABLED -> ${BCPLUS_DUMP_DIR} (train_old=${_train_old_label})"
+else
+   export BCPLUS_DUMP_DIR=""
+   echo "[head] rollout dump disabled"
+fi
 
 WANDB_ARGS=(
    --use-wandb --wandb-mode offline
@@ -282,7 +311,13 @@ RUNTIME_ENV_JSON="{
     \"BCPLUS_MAX_TURNS\": \"${BCPLUS_MAX_TURNS:-64}\",
     \"BCPLUS_COMPRESS_THRESH\": \"${BCPLUS_COMPRESS_THRESH:-0.85}\",
     \"BCPLUS_MAX_SUB_TRAJS\": \"${BCPLUS_MAX_SUB_TRAJS:-5}\",
-    \"BCPLUS_COMPRESS_PENALTY\": \"${BCPLUS_COMPRESS_PENALTY:-0.5}\"
+    \"BCPLUS_COMPRESS_PENALTY\": \"${BCPLUS_COMPRESS_PENALTY:-0.5}\",
+    \"BCPLUS_DUMP_DIR\": \"${BCPLUS_DUMP_DIR:-}\",
+    \"BCPLUS_DUMP_TRAIN_OLD\": \"${BCPLUS_DUMP_TRAIN_OLD:-}\",
+    \"BCPLUS_JUDGE_MODEL\": \"${BCPLUS_JUDGE_MODEL:-gpt-5-4-genai-dss4}\",
+    \"BCPLUS_JUDGE_BASE_URL\": \"${BCPLUS_JUDGE_BASE_URL:-https://api.llama.com/compat/v1/}\",
+    \"BCPLUS_JUDGE_CONCURRENCY\": \"${BCPLUS_JUDGE_CONCURRENCY:-64}\",
+    \"BCPLUS_SEARCH_CONCURRENCY\": \"${BCPLUS_SEARCH_CONCURRENCY:-128}\"
   }
 }"
 
