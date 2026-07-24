@@ -1172,6 +1172,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="W&B mode: online (default), offline (local only), or disabled. Overrides WANDB_MODE env var.",
             )
             parser.add_argument(
+                "--wandb-explicit-teardown",
+                action="store_true",
+                default=False,
+                help="Explicitly stop the W&B service after finishing a run.",
+            )
+            parser.add_argument(
                 "--wandb-dir",
                 type=str,
                 default=None,

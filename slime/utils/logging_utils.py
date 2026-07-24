@@ -34,11 +34,20 @@ def init_tracking(args, primary: bool = True, **kwargs):
 def finish_tracking(args):
     if not args.use_wandb:
         return
+    if wandb.run is None:
+        return
     try:
-        if wandb.run is not None:
-            wandb.finish()
+        wandb.finish()
     except Exception:
         logging.getLogger(__name__).exception("Failed to finish wandb run")
+    finally:
+        if getattr(args, "wandb_explicit_teardown", False):
+            try:
+                # MAST Ray actors need to unregister W&B's atexit hook before
+                # Ray closes the wandb-core service socket.
+                wandb.teardown()
+            except (Exception, SystemExit):
+                logging.getLogger(__name__).exception("Failed to tear down wandb service")
 
 
 # TODO further refactor, e.g. put TensorBoard init to the "init" part
