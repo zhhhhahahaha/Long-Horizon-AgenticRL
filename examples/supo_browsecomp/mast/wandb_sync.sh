@@ -48,6 +48,7 @@ WANDB_ROOT="${MAST_WANDB_ROOT:-/data/users/hhzhang01/wsfuse_mnt/hhzhang01/supo-s
 SNAPSHOT_ROOT="${MAST_WANDB_SNAPSHOT_ROOT:-/data/users/hhzhang01/wsfuse_mnt/hhzhang01/supo-slime/wandb-snapshots}"
 KEY_FILE="${WANDB_KEY_FILE:-${HOME}/.wandb-key}"
 WANDB_BIN="${WANDB_BIN:-/data/users/hhzhang01/slime-sanity/hfvenv/bin/wandb}"
+WANDB_PYTHON_BIN="${WANDB_PYTHON_BIN:-$(dirname "${WANDB_BIN}")/python}"
 WITH_PROXY_BIN="${WITH_PROXY_BIN:-with-proxy}"
 MAST_BIN="${MAST_BIN:-mast}"
 JQ_BIN="${JQ_BIN:-jq}"
@@ -59,6 +60,10 @@ LOCK_DIR="${WANDB_SYNC_LOCK_DIR:-${XDG_RUNTIME_DIR:-/tmp}/mast-wandb-sync-${USER
 SYNC_CACHE_DIR="${WANDB_SYNC_CACHE_DIR:-${XDG_CACHE_HOME:-/tmp}/mast-wandb-sync-cache-${USER}}"
 RUN_ROOT="${WANDB_ROOT}/${RUN_NAME}/wandb"
 SNAPSHOT_RUN_ROOT="${SNAPSHOT_ROOT}/${RUN_NAME}"
+PRECREATE_RUNS="${MAST_WANDB_PRECREATE:-1}"
+PRECREATE_SCRIPT="${MAST_WANDB_PRECREATE_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/wandb_precreate.py}"
+WANDB_ENTITY="${MAST_WANDB_ENTITY:-hhzhang01}"
+WANDB_PROJECT="${MAST_WANDB_PROJECT:-supo-bcplus-mast}"
 
 require_command "${WITH_PROXY_BIN}"
 require_command flock
@@ -71,6 +76,16 @@ fi
 if [[ ! -x "${WANDB_BIN}" ]]; then
   echo "wandb_sync.sh: W&B CLI is not executable: ${WANDB_BIN}" >&2
   exit 1
+fi
+if [[ "${PRECREATE_RUNS}" == "1" ]]; then
+  [[ -x "${WANDB_PYTHON_BIN}" ]] || {
+    echo "wandb_sync.sh: W&B Python is not executable: ${WANDB_PYTHON_BIN}" >&2
+    exit 1
+  }
+  [[ -r "${PRECREATE_SCRIPT}" ]] || {
+    echo "wandb_sync.sh: W&B pre-create helper is not readable: ${PRECREATE_SCRIPT}" >&2
+    exit 1
+  }
 fi
 if [[ ! -r "${KEY_FILE}" ]]; then
   echo "wandb_sync.sh: cannot read Meta W&B key: ${KEY_FILE}" >&2
@@ -162,6 +177,14 @@ sync_once() {
   fi
 
   log "syncing ${#candidates[@]} offline run(s) to ${WANDB_BASE_URL}"
+  if [[ "${PRECREATE_RUNS}" == "1" ]]; then
+    if ! "${WITH_PROXY_BIN}" "${WANDB_PYTHON_BIN}" "${PRECREATE_SCRIPT}" \
+      --entity "${WANDB_ENTITY}" --project "${WANDB_PROJECT}" \
+      --group "${RUN_NAME}" "${candidates[@]}"; then
+      log "failed to pre-create grouped W&B runs"
+      return 1
+    fi
+  fi
   if ! "${WITH_PROXY_BIN}" "${WANDB_BIN}" sync --append --no-sync-tensorboard "${candidates[@]}"; then
     return 1
   fi

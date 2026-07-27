@@ -202,6 +202,12 @@ devserver and is never copied into MAST or OILFS. Set
 `MAST_WANDB_SNAPSHOT_INTERVAL_SEC` on the trainer to change the 60-second
 snapshot interval.
 
+Before pre-creating a remote run, the watcher validates the offline log's run
+ID, project, group, and entity against `MAST_WANDB_PROJECT`, the MAST job name,
+and `MAST_WANDB_ENTITY`. When overriding the trainer's `BC_WANDB_PROJECT`, set
+`MAST_WANDB_PROJECT` to the same value; a mismatch fails before upload instead
+of creating a run in the wrong project.
+
 At shutdown, the head task also copies Ray text logs to OILFS. This cleanup is
 limited to 120 seconds so a large log directory cannot keep GPUs allocated after
 training has finished. Set `MAST_RAY_LOG_COPY_TIMEOUT_SEC` to change that limit,

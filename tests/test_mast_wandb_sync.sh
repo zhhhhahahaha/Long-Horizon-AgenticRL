@@ -69,6 +69,7 @@ run_sync() {
     MAST_BIN="${TMP_DIR}/bin/mast" \
     JQ_BIN="$(command -v jq)" \
     WANDB_SYNC_LOCK_DIR="${TMP_DIR}/locks" \
+    MAST_WANDB_PRECREATE=0 \
     WANDB_SYNC_INTERVAL_SEC=0 \
     WANDB_FINAL_SYNC_SETTLE_SEC=0 \
     WANDB_FINAL_SYNC_RETRY_INTERVAL_SEC=0 \
