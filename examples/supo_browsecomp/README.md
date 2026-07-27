@@ -250,9 +250,12 @@ bash /home/hhzhang01/slime/examples/supo_browsecomp/debug_scripts/run_qwen3p5_4B
 
 ## Scaling from smoke to real runs
 
-- **9B move**: `source scripts/models/qwen3.5-9B.sh` instead of `qwen3.5-4B.sh`;
-  bump `--tensor-model-parallel-size` to 4 and `--max-tokens-per-gpu` to
-  ~24576 depending on how OOM-y the actor gets.
+- **9B move**: use `run_qwen3p5_9B_colocate.sh`. Its candidate starting topology
+  is Megatron TP=4/CP=2, SGLang TP=4, and `--max-tokens-per-gpu=32768`; these
+  knobs remain experimental because one oversized sub-traj can exceed the
+  packing target. For MAST,
+  set `BC_MODEL_SIZE=9B`; the trainer selects the matching model spec,
+  checkpoints, and 9B memory defaults as one coherent configuration.
 - **Longer rollouts**: raise `BCPLUS_MAX_TURNS` from 5 → 20 → 100 (paper uses
   100 for the branch variant, less for pure ReAct). Also raise
   `--rollout-max-response-len` past 8k to accommodate.

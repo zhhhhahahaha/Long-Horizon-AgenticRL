@@ -12,8 +12,8 @@
 # smaller and TP=4 fits comfortably — no gate bug (TP=4 == num_query_groups=4
 # means no KV replication), no OOM.
 #
-# Physical layout at 8 nodes: TP=4 × CP=1 × PP=1 = 4 GPU per model group,
-# 64 GPU / 4 = DP=16. Global batch 256 / DP=16 = 16 samples per DP per iter.
+# Physical layout at 8 nodes: TP=4 × CP=2 × PP=1 = 8 GPU per model group,
+# 64 GPU / 8 = DP=8. Global batch 256 / DP=8 = 32 trajectories per DP rank.
 #
 # Two-part launcher:
 #   * Outer part (login pod): auto-discovers search server, exports RUN_NAME,
@@ -27,7 +27,7 @@
 #   3. Qwen3.5-4B HF + torch_dist checkpoints on FSx.
 #
 # Debug-only overrides (env vars — leave unset for canonical config):
-#   BC_NUM_ROLLOUT              default 20   (2 EPOCHS ≈ 20 iter × 32 prompts)
+#   BC_NUM_ROLLOUT              default 20   (20 iter × 32 prompts ≈ 1 epoch)
 #   BC_ROLLOUT_BATCH_SIZE       default 32   (prompts per iter)
 #   BC_N_SAMPLES                default 8    (rollouts per prompt)
 #   BC_GLOBAL_BATCH_SIZE        default 256  (= batch × samples, 1 grad step per iter)
@@ -647,18 +647,18 @@ ray job submit --address="http://127.0.0.1:8265" \
    -- python3 train.py \
    --actor-num-nodes ${NUM_NODES} \
    --actor-num-gpus-per-node 8 \
-   ${MODEL_ARGS[@]} \
-   ${CKPT_ARGS[@]} \
-   ${ROLLOUT_ARGS[@]} \
-   ${OPTIMIZER_ARGS[@]} \
-   ${GRPO_ARGS[@]} \
-   ${WANDB_ARGS[@]} \
-   ${PERF_ARGS[@]} \
-   ${SGLANG_ARGS[@]} \
-   ${MISC_ARGS[@]} \
-   ${CUSTOM_ARGS[@]} \
-   ${EVAL_ARGS[@]} \
-   ${COLOCATE_ARGS[@]}
+   "${MODEL_ARGS[@]}" \
+   "${CKPT_ARGS[@]}" \
+   "${ROLLOUT_ARGS[@]}" \
+   "${OPTIMIZER_ARGS[@]}" \
+   "${GRPO_ARGS[@]}" \
+   "${WANDB_ARGS[@]}" \
+   "${PERF_ARGS[@]}" \
+   "${SGLANG_ARGS[@]}" \
+   "${MISC_ARGS[@]}" \
+   "${CUSTOM_ARGS[@]}" \
+   "${EVAL_ARGS[@]}" \
+   "${COLOCATE_ARGS[@]}"
 
 TRAIN_STATUS=$?
 echo "[head] ray job submit returned status=${TRAIN_STATUS}"

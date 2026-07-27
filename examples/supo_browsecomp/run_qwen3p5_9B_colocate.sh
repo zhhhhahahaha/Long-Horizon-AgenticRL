@@ -1,9 +1,9 @@
 #!/bin/bash
 # BrowseComp-Plus RL — Qwen3.5-9B on 8 A100 nodes (colocate mode).
 #
-# Fork of run_qwen3p5_4B_colocate.sh with model swapped to 9B + CP=2 +
-# smaller max_tokens_per_gpu. Same colocate machinery (per-node /dev/shm
-# rootfs staging, COORD_DIR host->container path split, EXIT trap,
+# Tracks run_qwen3p5_4B_colocate.sh's orchestration while preserving the 9B
+# model topology and memory limits. Same colocate machinery (per-node /dev/shm
+# rootfs staging, search-server ensure, stale coordination cleanup, EXIT trap,
 # --sglang-disable-custom-all-reduce, wandb-sync poll, conditional --load).
 #
 # Why CP=2 for 9B: Qwen3.5-9B has hidden=4096 (vs 4B's 2560), so its
@@ -14,13 +14,15 @@
 # TP=4 CP=1 — too tight even with the defrag fix. CP=2 splits seq dim in
 # half so vocab head activation drops to ~12 GB per rank, leaving room.
 #
-# Also using max_tokens_per_gpu=32768 (vs 4B's 65536): further caps
+# Also using max_tokens_per_gpu=32768 (vs 4B's 49152): further caps
 # per-microbatch peak. Oversized single samples (>32k) still get their
 # own microbatch via first_fit_pack. TP=4 == num_query_groups=4 avoids
 # the megatron _apply_output_gate shape bug that broke earlier TP=8 tries.
 #
 # Physical layout at 8 nodes: TP=4 × CP=2 × PP=1 = 8 GPU per model group,
 # 64 GPU / 8 = DP=8. Global batch 256 / DP=8 = 32 samples per DP per iter.
+# This is a conservative candidate topology, not a proven OOM-free guarantee:
+# max_tokens_per_gpu controls packing but cannot split one oversized sub-traj.
 #
 # Two-part launcher:
 #   * Outer part (login pod): auto-discovers search server, exports RUN_NAME,
@@ -34,17 +36,23 @@
 #   3. Qwen3.5-9B HF + torch_dist checkpoints on FSx (see convert_qwen3p5_9B.sh).
 #
 # Debug-only overrides (env vars — leave unset for canonical config):
-#   BC_NUM_ROLLOUT              default 20   (2 EPOCHS ≈ 20 iter × 32 prompts)
+#   BC_NUM_ROLLOUT              default 20   (20 iter × 32 prompts ≈ 1 epoch)
 #   BC_ROLLOUT_BATCH_SIZE       default 32   (prompts per iter)
 #   BC_N_SAMPLES                default 8    (rollouts per prompt)
 #   BC_GLOBAL_BATCH_SIZE        default 256  (= batch × samples, 1 grad step per iter)
 #   BC_MAX_RESPONSE_LEN         default 32768 (sglang per-call max_new_tokens)
 #   BC_MAX_CONTEXT_LEN          default 65536 (per-sample total context budget)
+#   BC_TP                       default 4    (TP>4 previously hit the output-gate bug)
+#   BC_CP                       default 2    (raise to trade throughput for activation headroom)
+#   BC_SGLANG_TP                default 4
+#   BC_MAX_TOKENS_PER_GPU       default 32768 (packing cap, not a hard sample cap)
 #   BCPLUS_MAX_TURNS            default 64
 #   BCPLUS_COMPRESS_THRESH      default 0.85
 #   BCPLUS_MAX_SUB_TRAJS        default 5
 #   BCPLUS_COMPRESS_PENALTY     default 0.5
-#   BCPLUS_DUMP_DIR             default "" (empty = disabled)
+#   BCPLUS_DUMP_DIR             default /genai/fsx-project/hhzhang01/dumps/${RUN_NAME}
+#                               — per-iter rollout parquet dump is ON by default.
+#                               Set BCPLUS_DUMP_DIR="" to disable.
 #   BCPLUS_DUMP_TRAIN_OLD       default "" (empty/0/false = off). Only meaningful
 #                               when BCPLUS_DUMP_DIR is set. When truthy, adds
 #                               --dump-train-old-log-prob (extra pre-training
@@ -55,6 +63,13 @@
 #   BCPLUS_JUDGE_BASE_URL       default "https://api.llama.com/compat/v1/"
 #   BCPLUS_JUDGE_CONCURRENCY    default 64  (judge call semaphore)
 #   BCPLUS_SEARCH_CONCURRENCY   default 128 (search call semaphore)
+#   SEARCH_BUFFER_HOURS         default 4. Extra runway beyond TRAIN_WALLTIME the
+#                               search server must have to be reused; else it is
+#                               scancel'd + relaunched (10s Ctrl-C grace).
+#   SEARCH_QOS                  default a100_dev. QOS for the search server job.
+#   QOS                         default a100_genai_interns_high for training.
+#   MIN_HOURS_REMAINING         overrides the search-server reuse threshold.
+#   LOCAL_SEARCH_URL            set to skip the ensure step and use this server.
 
 set -euo pipefail
 
@@ -64,25 +79,8 @@ set -euo pipefail
 if [[ "${SLIME_INNER:-0}" != "1" ]]; then
     : "${LLAMA_API_KEY:?LLAMA_API_KEY must be set on the login pod (LLM|... key with entitlement)}"
 
-    # Auto-discover the search server if LOCAL_SEARCH_URL wasn't passed in.
-    if [[ -z "${LOCAL_SEARCH_URL:-}" ]]; then
-        HOST_FILE=/genai/fsx-project/hhzhang01/logs/search-server.hostname
-        if [[ -f "${HOST_FILE}" ]]; then
-            SEARCH_TARGET=$(cat "${HOST_FILE}")
-            if curl -sf --max-time 5 "http://${SEARCH_TARGET}/health" > /dev/null; then
-                export LOCAL_SEARCH_URL="http://${SEARCH_TARGET}"
-                echo "auto-discovered LOCAL_SEARCH_URL=${LOCAL_SEARCH_URL}"
-            else
-                echo "ERROR: search server at ${SEARCH_TARGET} not responding." >&2
-                echo "       Run examples/supo_browsecomp/launch_search_server.sh first." >&2
-                exit 1
-            fi
-        else
-            echo "ERROR: LOCAL_SEARCH_URL not set and ${HOST_FILE} missing." >&2
-            echo "       Run examples/supo_browsecomp/launch_search_server.sh first." >&2
-            exit 1
-        fi
-    fi
+    # Search server is ensured after the config block below (that logic needs
+    # TRAIN_WALLTIME / SLURM_ACCOUNT / SLIME_HOST_DIR).
 
     export RUN_NAME="${RUN_NAME:-supo-bcplus-qwen3p5-9b-$(date +%Y%m%d-%H%M)}"
     echo "RUN_NAME=${RUN_NAME}"
@@ -90,11 +88,35 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
     SLIME_HOST_DIR=/home/hhzhang01/slime
     ENROOT_ROOTFS="${ENROOT_ROOTFS:-slime-test}"
     SLURM_ACCOUNT="${SLURM_ACCOUNT:-genai_interns}"
-    QOS="${QOS:-a100_genai_shared}"
+    QOS="${QOS:-a100_genai_interns_high}"
     TRAIN_WALLTIME="${TRAIN_WALLTIME:-24:00:00}"
     NUM_NODES="${NUM_NODES:-8}"
     TRAIN_LOG_PATH="${TRAIN_LOG_PATH:-/genai/fsx-project/hhzhang01/logs/${RUN_NAME}.log}"
     mkdir -p "$(dirname "${TRAIN_LOG_PATH}")"
+
+    # Unset -> dump trajectories; explicitly empty -> disable. train_old log
+    # probabilities stay opt-in because they require an extra forward pass.
+    export BCPLUS_DUMP_DIR="${BCPLUS_DUMP_DIR-/genai/fsx-project/hhzhang01/dumps/${RUN_NAME}}"
+
+    # Reuse a healthy search server only when it has enough time remaining to
+    # outlive this run. Keep its QOS independent from the training allocation.
+    if [[ -z "${LOCAL_SEARCH_URL:-}" ]]; then
+        _wt_hours="${TRAIN_WALLTIME%%:*}"
+        _min_hours="${MIN_HOURS_REMAINING:-}"
+        if [[ -z "${_min_hours}" && "${_wt_hours}" =~ ^[0-9]+$ ]]; then
+            _min_hours="$((_wt_hours + ${SEARCH_BUFFER_HOURS:-4}))"
+        fi
+        echo "[colocate] ensuring search server on qos=${SEARCH_QOS:-a100_dev} (>= ${_min_hours:-48}h runway)"
+        MIN_HOURS_REMAINING="${_min_hours}" QOS="${SEARCH_QOS:-a100_dev}" SLURM_ACCOUNT="${SLURM_ACCOUNT}" \
+            bash "${SLIME_HOST_DIR}/examples/supo_browsecomp/launch_search_server.sh"
+        SEARCH_HOST_FILE=/genai/fsx-project/hhzhang01/logs/search-server.hostname
+        [[ -f "${SEARCH_HOST_FILE}" ]] || {
+            echo "ERROR: ${SEARCH_HOST_FILE} missing after launch_search_server.sh" >&2
+            exit 1
+        }
+        export LOCAL_SEARCH_URL="http://$(cat "${SEARCH_HOST_FILE}")"
+    fi
+    echo "[colocate] LOCAL_SEARCH_URL=${LOCAL_SEARCH_URL}"
 
     # Coordination file on FSx: head node writes its IP here; workers poll for it.
     # DONE file (written when head's ray job returns) tells workers they can exit.
@@ -104,6 +126,9 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
     COORD_DIR_HOST=/genai/fsx-project/hhzhang01/logs/ray-coord/${RUN_NAME}
     COORD_DIR=/genai_hh/logs/ray-coord/${RUN_NAME}
     mkdir -p "${COORD_DIR_HOST}"
+    # Retries reuse RUN_NAME; remove the prior head address and DONE marker so
+    # workers cannot exit early or join a dead Ray head.
+    rm -f "${COORD_DIR_HOST}/done" "${COORD_DIR_HOST}/head.ip"
     echo "coord dir host: ${COORD_DIR_HOST}"
     echo "coord dir container: ${COORD_DIR}"
 
@@ -175,6 +200,11 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
                 --env BC_GLOBAL_BATCH_SIZE='${BC_GLOBAL_BATCH_SIZE:-}' \
                 --env BC_MAX_RESPONSE_LEN='${BC_MAX_RESPONSE_LEN:-}' \
                 --env BC_MAX_CONTEXT_LEN='${BC_MAX_CONTEXT_LEN:-}' \
+                --env BC_TP='${BC_TP:-}' \
+                --env BC_CP='${BC_CP:-}' \
+                --env BC_SGLANG_TP='${BC_SGLANG_TP:-}' \
+                --env BC_MAX_TOKENS_PER_GPU='${BC_MAX_TOKENS_PER_GPU:-}' \
+                --env WANDB_X_FLUSH_INTERVAL_SECONDS='${WANDB_X_FLUSH_INTERVAL_SECONDS:-30}' \
                 ${ENROOT_ROOTFS} \
                 bash /slime/examples/supo_browsecomp/run_qwen3p5_9B_colocate.sh
         " &
@@ -268,6 +298,32 @@ echo "[head node] my_ip=${MY_IP}, num_nodes=${NUM_NODES}"
 source /aws-cluster/wandb-args.sh
 source scripts/models/qwen3.5-9B.sh
 
+TRAIN_TP="${BC_TP:-4}"
+TRAIN_CP="${BC_CP:-2}"
+SGLANG_TP="${BC_SGLANG_TP:-4}"
+MAX_TOKENS_PER_GPU="${BC_MAX_TOKENS_PER_GPU:-32768}"
+for value_name in TRAIN_TP TRAIN_CP SGLANG_TP MAX_TOKENS_PER_GPU; do
+    value="${!value_name}"
+    [[ "${value}" =~ ^[1-9][0-9]*$ ]] || {
+        echo "ERROR: ${value_name} must be a positive integer, got ${value}" >&2
+        exit 1
+    }
+done
+TOTAL_GPUS=$((NUM_NODES * 8))
+MODEL_PARALLEL_SIZE=$((TRAIN_TP * TRAIN_CP))
+(( TOTAL_GPUS % MODEL_PARALLEL_SIZE == 0 )) || {
+    echo "ERROR: total GPUs ${TOTAL_GPUS} must be divisible by TP*CP=${MODEL_PARALLEL_SIZE}" >&2
+    exit 1
+}
+(( TOTAL_GPUS % SGLANG_TP == 0 )) || {
+    echo "ERROR: total GPUs ${TOTAL_GPUS} must be divisible by SGLANG_TP=${SGLANG_TP}" >&2
+    exit 1
+}
+if [[ "${TRAIN_TP}" != "4" ]]; then
+    echo "[head] WARN: 9B TP=${TRAIN_TP} is experimental; TP=8 previously hit the Qwen3.5 output-gate/KV-replication bug" >&2
+fi
+echo "[head] 9B candidate topology: TP=${TRAIN_TP} CP=${TRAIN_CP} DP=$((TOTAL_GPUS / MODEL_PARALLEL_SIZE)) SGLANG_TP=${SGLANG_TP} max_tokens_per_gpu=${MAX_TOKENS_PER_GPU}"
+
 HF_CKPT_HOST=/genai_hh/models/Qwen3.5-9B
 REF_LOAD_HOST=/genai_hh/models/Qwen3.5-9B_torch_dist
 TRAIN_DATA=/genai_hh/datasets/BC+/bc_train.parquet
@@ -292,7 +348,7 @@ CKPT_ARGS=(
 #
 # To resume a specific run:
 #   export RUN_NAME=<the-original-run-name>   # same name as first submission
-#   bash run_qwen3p5_4B_colocate.sh
+#   bash run_qwen3p5_9B_colocate.sh
 # Without the RUN_NAME export the outer part generates a fresh timestamp,
 # CKPT_SAVE_DIR points to a new empty dir, and the branch below no-ops.
 if [[ -f "${CKPT_SAVE_DIR}/latest_checkpointed_iteration.txt" ]]; then
@@ -340,10 +396,10 @@ PERF_ARGS=(
    # 15+ GB fp32 softmax alloc during ref forward would leave too little
    # headroom even after our clear_memory() defrag. CP=2 drops the peak
    # transient to ~7 GB per rank.
-   --tensor-model-parallel-size 4
+   --tensor-model-parallel-size "${TRAIN_TP}"
    --sequence-parallel
    --pipeline-model-parallel-size 1
-   --context-parallel-size 2
+   --context-parallel-size "${TRAIN_CP}"
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 2
@@ -352,7 +408,7 @@ PERF_ARGS=(
    # single samples (>32k) still get their own microbatch via first_fit_pack;
    # this cap just makes shorter samples pack tighter to further trim vocab
    # head peak per microbatch on the 9B.
-   --max-tokens-per-gpu 32768
+   --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
 )
 
 GRPO_ARGS=(
@@ -382,7 +438,7 @@ SGLANG_ARGS=(
    # Colocate: sglang engines run on the same 64 GPUs as the training actor.
    # Slime offloads actor weights to CPU during rollout and re-onloads before
    # training. Engine TP=4 → 64/4 = 16 sglang engines running concurrently.
-   --rollout-num-gpus-per-engine 4
+   --rollout-num-gpus-per-engine "${SGLANG_TP}"
    --sglang-mem-fraction-static 0.7
    # Disable custom all-reduce. sglang's custom_all_reduce.cuh path fails
    # CUDA graph capture with "CUDA error: invalid argument" at TP=4 on our
@@ -469,7 +525,8 @@ RUNTIME_ENV_JSON="{
     \"BCPLUS_JUDGE_MODEL\": \"${BCPLUS_JUDGE_MODEL:-gpt-5-4-genai-dss4}\",
     \"BCPLUS_JUDGE_BASE_URL\": \"${BCPLUS_JUDGE_BASE_URL:-https://api.llama.com/compat/v1/}\",
     \"BCPLUS_JUDGE_CONCURRENCY\": \"${BCPLUS_JUDGE_CONCURRENCY:-64}\",
-    \"BCPLUS_SEARCH_CONCURRENCY\": \"${BCPLUS_SEARCH_CONCURRENCY:-128}\"
+    \"BCPLUS_SEARCH_CONCURRENCY\": \"${BCPLUS_SEARCH_CONCURRENCY:-128}\",
+    \"WANDB_X_FLUSH_INTERVAL_SECONDS\": \"${WANDB_X_FLUSH_INTERVAL_SECONDS:-30}\"
   }
 }"
 # NOTE: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is DELIBERATELY NOT
@@ -477,9 +534,8 @@ RUNTIME_ENV_JSON="{
 # run with expandable_segments, throwing:
 #   RuntimeError: TorchMemorySaver is disabled for the current process
 #   because expandable_segments is not supported yet.
-# The 4B canonical script sets expandable_segments because it uses external
-# sglang and does not activate torch_memory_saver. In colocate mode the two
-# are mutually exclusive.
+# Colocate mode uses torch_memory_saver, so expandable segments and this
+# launcher are mutually exclusive.
 
 # Submit training job. Blocks until run finishes (num_rollout iters done).
 ray job submit --address="http://127.0.0.1:8265" \
@@ -487,17 +543,17 @@ ray job submit --address="http://127.0.0.1:8265" \
    -- python3 train.py \
    --actor-num-nodes ${NUM_NODES} \
    --actor-num-gpus-per-node 8 \
-   ${MODEL_ARGS[@]} \
-   ${CKPT_ARGS[@]} \
-   ${ROLLOUT_ARGS[@]} \
-   ${OPTIMIZER_ARGS[@]} \
-   ${GRPO_ARGS[@]} \
-   ${WANDB_ARGS[@]} \
-   ${PERF_ARGS[@]} \
-   ${SGLANG_ARGS[@]} \
-   ${MISC_ARGS[@]} \
-   ${CUSTOM_ARGS[@]} \
-   ${COLOCATE_ARGS[@]}
+   "${MODEL_ARGS[@]}" \
+   "${CKPT_ARGS[@]}" \
+   "${ROLLOUT_ARGS[@]}" \
+   "${OPTIMIZER_ARGS[@]}" \
+   "${GRPO_ARGS[@]}" \
+   "${WANDB_ARGS[@]}" \
+   "${PERF_ARGS[@]}" \
+   "${SGLANG_ARGS[@]}" \
+   "${MISC_ARGS[@]}" \
+   "${CUSTOM_ARGS[@]}" \
+   "${COLOCATE_ARGS[@]}"
 
 TRAIN_STATUS=$?
 echo "[head] ray job submit returned status=${TRAIN_STATUS}"
@@ -505,7 +561,7 @@ echo "[head] ray job submit returned status=${TRAIN_STATUS}"
 # Disable errexit for the tail cleanup. Long-running training on FSx-mounted
 # /slime can leave the NFS session stale; when bash tries to read the next
 # script line after ray job submit returns, it can fail with:
-#   /slime/examples/.../run_qwen3p5_4B_colocate.sh: error reading input file:
+#   /slime/examples/.../run_qwen3p5_9B_colocate.sh: error reading input file:
 #     Stale file handle
 # Under `set -e` that immediately trips exit 2 even though training itself
 # succeeded (ray job returned status=0). Downgrading errexit here lets the

@@ -13,8 +13,9 @@
 #   * wandb OFFLINE → node-local disk → atomic OILFS snapshots for live sync
 #   * Ray head/worker election from MAST_HPC_TASK_GROUP_HOSTNAMES (multi-node)
 #
-# Defaults are a 1-node (8 GPU) SMOKE: TP=4, CP=2 → DP=1, tiny batch, 2 rollouts.
-# Scale via the BC_* / NUM env overrides once the pipeline is green.
+# Defaults are a 1-node (8 GPU) 4B SMOKE: TP=4, CP=2 → DP=1, tiny batch,
+# 2 rollouts. Set BC_MODEL_SIZE=9B for the 9B topology; scale the remaining
+# BC_* knobs once the pipeline is green.
 set -uo pipefail
 
 # --------------------------- env fixes (MAST vs image) ----------------------
@@ -209,13 +210,70 @@ fi
 # head or an old DONE. Only the head touches COORD_DIR after this point.
 rm -rf "${COORD_DIR}" 2>/dev/null || true
 mkdir -p "${COORD_DIR}"
-source scripts/models/qwen3.5-4B.sh
+
+BC_MODEL_SIZE="${BC_MODEL_SIZE:-4B}"
+case "${BC_MODEL_SIZE,,}" in
+  4b)
+    BC_MODEL_SIZE=4B
+    MODEL_NAME=Qwen3.5-4B
+    MODEL_CONFIG=scripts/models/qwen3.5-4B.sh
+    DEFAULT_MAX_TOKENS_PER_GPU=49152
+    DEFAULT_SGLANG_TP=2
+    ;;
+  9b)
+    BC_MODEL_SIZE=9B
+    MODEL_NAME=Qwen3.5-9B
+    MODEL_CONFIG=scripts/models/qwen3.5-9B.sh
+    DEFAULT_MAX_TOKENS_PER_GPU=32768
+    DEFAULT_SGLANG_TP=4
+    ;;
+  *)
+    echo "ERROR: unsupported BC_MODEL_SIZE=${BC_MODEL_SIZE}; expected 4B or 9B" >&2
+    exit 1
+    ;;
+esac
+
+HF_CHECKPOINT="${D}/${MODEL_NAME}"
+REF_CHECKPOINT="${D}/${MODEL_NAME}_torch_dist"
+for required_path in "${MODEL_CONFIG}" "${HF_CHECKPOINT}" "${REF_CHECKPOINT}"; do
+  [[ -e "${required_path}" ]] || { echo "ERROR: required model path missing: ${required_path}" >&2; exit 1; }
+done
+
+TRAIN_TP="${BC_TP:-4}"
+TRAIN_CP="${BC_CP:-2}"
+MAX_TOKENS_PER_GPU="${BC_MAX_TOKENS_PER_GPU:-${DEFAULT_MAX_TOKENS_PER_GPU}}"
+SGLANG_TP="${BC_SGLANG_TP:-${DEFAULT_SGLANG_TP}}"
+for value_name in TRAIN_TP TRAIN_CP SGLANG_TP MAX_TOKENS_PER_GPU; do
+  value="${!value_name}"
+  [[ "${value}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "ERROR: ${value_name} must be a positive integer, got ${value}" >&2
+    exit 1
+  }
+done
+TOTAL_GPUS=$((NNODES * 8))
+MODEL_PARALLEL_SIZE=$((TRAIN_TP * TRAIN_CP))
+(( TOTAL_GPUS % MODEL_PARALLEL_SIZE == 0 )) || {
+  echo "ERROR: total GPUs ${TOTAL_GPUS} must be divisible by TP*CP=${MODEL_PARALLEL_SIZE}" >&2
+  exit 1
+}
+(( TOTAL_GPUS % SGLANG_TP == 0 )) || {
+  echo "ERROR: total GPUs ${TOTAL_GPUS} must be divisible by SGLANG_TP=${SGLANG_TP}" >&2
+  exit 1
+}
+if [[ "${BC_MODEL_SIZE}" == "9B" && "${TRAIN_TP}" != "4" ]]; then
+  echo "[head] WARN: 9B TP=${TRAIN_TP} is experimental; TP=8 previously hit the Qwen3.5 output-gate/KV-replication bug" >&2
+fi
+if [[ "${BC_MODEL_SIZE}" == "9B" && ( "${TRAIN_CP}" != "2" || "${SGLANG_TP}" != "4" ) ]]; then
+  echo "[head] WARN: non-default 9B topology CP=${TRAIN_CP} SGLANG_TP=${SGLANG_TP}; validate memory and throughput before a full run" >&2
+fi
+echo "[head] model=${BC_MODEL_SIZE} candidate topology: config=${MODEL_CONFIG} TP=${TRAIN_TP} CP=${TRAIN_CP} DP=$((TOTAL_GPUS / MODEL_PARALLEL_SIZE)) SGLANG_TP=${SGLANG_TP} max_tokens_per_gpu=${MAX_TOKENS_PER_GPU}"
+source "${MODEL_CONFIG}"
 
 CKPT_SAVE_DIR="${STAGE}/checkpoints/${RUN_NAME}"
 
 CKPT_ARGS=(
-   --hf-checkpoint "${D}/Qwen3.5-4B"
-   --ref-load      "${D}/Qwen3.5-4B_torch_dist"
+   --hf-checkpoint "${HF_CHECKPOINT}"
+   --ref-load      "${REF_CHECKPOINT}"
 )
 if [[ "${BC_SAVE_INTERVAL:-5}" == "0" ]]; then
    echo "[head] checkpoint saving disabled (BC_SAVE_INTERVAL=0)"
@@ -245,15 +303,15 @@ ROLLOUT_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size "${BC_TP:-4}"
+   --tensor-model-parallel-size "${TRAIN_TP}"
    --sequence-parallel
    --pipeline-model-parallel-size 1
-   --context-parallel-size "${BC_CP:-2}"
+   --context-parallel-size "${TRAIN_CP}"
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 2
    --use-dynamic-batch-size
-   --max-tokens-per-gpu "${BC_MAX_TOKENS_PER_GPU:-49152}"
+   --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
 )
 
 GRPO_ARGS=(
@@ -269,9 +327,9 @@ OPTIMIZER_ARGS=(
 )
 
 SGLANG_ARGS=(
-   # sglang engine TP is INDEPENDENT of megatron TP (canonical: megatron TP=4 but
-   # sglang engine TP=2). Do NOT tie it to BC_TP.
-   --rollout-num-gpus-per-engine "${BC_SGLANG_TP:-2}"
+   # SGLang TP is independent of Megatron TP: 4B uses 2 for more engines,
+   # while 9B uses 4 for model/KV-cache headroom.
+   --rollout-num-gpus-per-engine "${SGLANG_TP}"
    --sglang-mem-fraction-static 0.7
    --sglang-disable-custom-all-reduce
 )
@@ -379,17 +437,17 @@ ray job submit --address="http://127.0.0.1:8265" \
    -- python3 train.py \
    --actor-num-nodes "${NNODES}" \
    --actor-num-gpus-per-node 8 \
-   ${MODEL_ARGS[@]} \
-   ${CKPT_ARGS[@]} \
-   ${ROLLOUT_ARGS[@]} \
-   ${OPTIMIZER_ARGS[@]} \
-   ${GRPO_ARGS[@]} \
-   ${WANDB_ARGS[@]} \
-   ${PERF_ARGS[@]} \
-   ${SGLANG_ARGS[@]} \
-   ${MISC_ARGS[@]} \
-   ${CUSTOM_ARGS[@]} \
-   ${COLOCATE_ARGS[@]}
+   "${MODEL_ARGS[@]}" \
+   "${CKPT_ARGS[@]}" \
+   "${ROLLOUT_ARGS[@]}" \
+   "${OPTIMIZER_ARGS[@]}" \
+   "${GRPO_ARGS[@]}" \
+   "${WANDB_ARGS[@]}" \
+   "${PERF_ARGS[@]}" \
+   "${SGLANG_ARGS[@]}" \
+   "${MISC_ARGS[@]}" \
+   "${CUSTOM_ARGS[@]}" \
+   "${COLOCATE_ARGS[@]}"
 RC=$?
 set +x
 echo "[head] ray job submit returned ${RC}"
