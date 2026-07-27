@@ -520,11 +520,11 @@ async def _call_openai(messages, model, max_retries=3):
         try:
             resp = await client.chat.completions.create(model=model, messages=messages)
             return resp.choices[0].message.content or ""
-        except Exception as e:
+        except Exception:
             if attempt == max_retries - 1:
-                return f"[JUDGE ERROR] {e}"
+                raise
             await asyncio.sleep(1 * (attempt + 1))
-    return ""
+    raise RuntimeError("Judge API retry loop exited without a response")
 
 
 def _patch_browsecomp_typos(correct_answer: str, predicted_answer: str) -> tuple[str, str]:
@@ -567,15 +567,15 @@ async def _judge_one(question: str, correct_answer: str, predicted_answer: str) 
     )
     messages = [{"role": "user", "content": judge_prompt}]
     async with _JUDGE_SEM:
-        score = 0
         for _ in range(BCPLUS_CONFIGS["judge_max_retries"]):
             resp = await _call_openai(messages, model=BCPLUS_CONFIGS["judge_model"])
             g = _parse_judge_response(resp)
             if g["parse_error"]:
                 continue
-            score = int(bool(g["correct"]))
-            break
-    return score
+            return int(bool(g["correct"]))
+    raise RuntimeError(
+        f"Judge response was unparseable after {BCPLUS_CONFIGS['judge_max_retries']} attempts"
+    )
 
 
 async def _judge(question: str, correct_answer: str, predicted_answer: str) -> float:
