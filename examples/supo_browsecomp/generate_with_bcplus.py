@@ -49,7 +49,7 @@ not trainable, and earlier research tokens retain the rollout's answer-based
 advantage. Track ``bcplus/compress_success_rate`` on wandb to see this improve
 over training. Metric ``summary_source`` (per sub-traj) is one of
 ``"extracted"`` (good), ``"fallback"`` (salvage from raw text, negative
-summary-turn advantage), or ``"empty"`` (no generated summary turn).
+summary-turn advantage), or ``"empty"`` (no usable handover was generated).
 
 The reward is a single-model judge routed through the internal MetaGen gateway
 (default: gpt-5-4-genai-dss4). SUPO's original two-model fallback path
@@ -757,18 +757,19 @@ async def _do_compression(
     summary_turn_span_or_None)``. The span is response-relative and half-open;
     it covers every model-generated token in the compression turn (thinking,
     tags, and visible summary), but excludes the non-trainable summary request.
-    ``summary`` is None only when the model produced literally no output.
+    ``summary`` is None when the model produced no usable handover (including
+    a tag-only ``<summary></summary>`` block with no salvageable thinking).
     ``summary_source`` is one of:
       * ``"extracted"`` — model emitted a real <summary>...</summary> block
         (the good path).
-      * ``"fallback"`` — no <summary> block, but non-empty output; we strip
-        the <think> block and salvage the raw text as summary. The downstream
-        custom advantage hook will override this summary turn.
-      * ``"empty"`` — model produced literally no output or an abort; no
-        salvage possible. Sub-traj will be marked ``compress_failed``.
+      * ``"fallback"`` — no usable non-empty <summary> block, but the output
+        contains salvageable visible or thinking text. The downstream custom
+        advantage hook will override this summary turn.
+      * ``"empty"`` — model produced no usable text or aborted; no salvage is
+        possible. The sub-traj will be marked ``compress_failed``.
     ``extra_tokens_added`` is the count added to ``response_token_ids`` this
-    call so the caller can update its running length tracker. Abort and empty
-    generation paths return no summary-turn span.
+    call so the caller can update its running length tracker. Abort and
+    unusable-empty paths return no summary-turn span.
     """
     added_tokens_start = len(response_token_ids)
 
@@ -828,22 +829,33 @@ async def _do_compression(
 
     # Extract the summary. Matches SUPO fold_agent.py:139's
     # `summary = extract_summary(response) or response` — if the model didn't
-    # emit <summary> tags, fall back to using the entire cur_text as the
-    # summary. This handles the common case where the policy under thinking
-    # spends its response inside <think>...</think> and never gets to open
-    # the <summary> block; we still pass forward *something* the next sub-
-    # trajectory can build on. The `summary_source` return tag lets the
+    # emit a usable <summary> body, salvage its visible or thinking text. This
+    # handles the common case where the policy spends its response thinking
+    # and never produces a summary; we still pass forward something the next
+    # sub-trajectory can build on. The `summary_source` return tag lets the
     # advantage hook penalize this fallback path so the model has a gradient
     # signal to actually learn to emit real <summary> blocks.
     summary = _extract_summary(cur_text)
-    if summary is not None:
+    if summary:
         summary_source = "extracted"
     elif cur_text.strip():
-        # Strip the <think> block if present so the summary is just the visible
-        # output the model wrote after thinking.
-        without_think = re.sub(r"^.*?</think>\s*", "", cur_text, count=1, flags=re.DOTALL)
-        summary = (without_think if without_think.strip() else cur_text).strip()
-        summary_source = "fallback"
+        # The prompt already contains the opening <think> tag, so generated
+        # text normally contains only its body and </think>. Prefer visible
+        # text after that boundary, then salvage the thinking body when an
+        # empty summary block follows it. Accept a repeated <think> opener for
+        # compatibility with models that emit one anyway.
+        without_summary_tags = re.sub(r"</?summary>", "", cur_text, flags=re.IGNORECASE)
+        think_end = re.search(r"</think>", without_summary_tags, flags=re.IGNORECASE)
+        if think_end is not None:
+            visible_text = without_summary_tags[think_end.end() :].strip()
+            thinking_text = without_summary_tags[: think_end.start()]
+            thinking_text = re.sub(
+                r"^\s*<think>\s*", "", thinking_text, count=1, flags=re.IGNORECASE
+            ).strip()
+            summary = visible_text or thinking_text or None
+        else:
+            summary = without_summary_tags.strip() or None
+        summary_source = "fallback" if summary is not None else "empty"
     else:
         summary_source = "empty"
     summary_turn_span = (
@@ -941,6 +953,7 @@ async def _run_one_sub_trajectory(
     finish_reason_last: str | None = None
     summary_from_compress: str | None = None
     summary_source: str = ""  # set by _do_compression on the compression turn
+    summary_content_len_tokens: int | None = None
     summary_turn_span: tuple[int, int] | None = None
     outcome: str = "unknown"
     _turn = -1
@@ -958,6 +971,7 @@ async def _run_one_sub_trajectory(
             "outcome": outcome,
             "summary": summary_from_compress,
             "summary_source": summary_source,
+            "summary_content_len_tokens": summary_content_len_tokens,
             "summary_turn_start": summary_turn_span[0] if summary_turn_span is not None else None,
             "summary_turn_end": summary_turn_span[1] if summary_turn_span is not None else None,
             "response_len_tokens": len(response_token_ids),
@@ -1116,6 +1130,10 @@ async def _run_one_sub_trajectory(
                 args, tokenizer, url, sample, sampling_params,
                 prompt_ids, response_token_ids,
             )
+            if summary_source == "extracted" and summary_from_compress:
+                summary_content_len_tokens = len(
+                    tokenizer(summary_from_compress, add_special_tokens=False)["input_ids"]
+                )
             if summary_from_compress is None:
                 sample.status = Sample.Status.TRUNCATED
                 outcome = "compress_failed"
@@ -1184,7 +1202,13 @@ async def generate(args, sample: Sample, sampling_params) -> list[Sample]:
 
         # Compression fired; open the next sub-trajectory with the summary.
         summary = current_sample.metadata["_bcplus"]["summary"]
-        if summary is None:  # defensive; outcome == "compressed" implies summary exists
+        if not isinstance(summary, str) or not summary.strip():
+            # Defensive invariant: a continuation without a non-empty
+            # handover is not a valid compressed sibling. _do_compression
+            # normally classifies this as compress_failed before we get here.
+            current_sample.status = Sample.Status.TRUNCATED
+            current_sample.metadata["_bcplus"]["outcome"] = "compress_failed"
+            current_sample.metadata["_bcplus"]["summary"] = None
             break
 
         new_prompt = _build_continuation_chat(original_prompt, summary)
@@ -1503,6 +1527,7 @@ def log_bcplus(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
     summary_extracted_count = 0
     summary_fallback_count = 0
     summary_empty_count = 0
+    summary_content_token_lengths: list[int] = []
     attempted_compression_count = 0
     for s in flat_samples:
         bc = (s.metadata or {}).get("_bcplus", {}) if isinstance(s.metadata, dict) else {}
@@ -1511,6 +1536,9 @@ def log_bcplus(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
             src = bc.get("summary_source", "")
             if src == "extracted":
                 summary_extracted_count += 1
+                content_len = bc.get("summary_content_len_tokens")
+                if isinstance(content_len, int) and content_len >= 0:
+                    summary_content_token_lengths.append(content_len)
             elif src == "fallback":
                 summary_fallback_count += 1
             elif src == "empty":
@@ -1637,6 +1665,10 @@ def log_bcplus(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
     log["bcplus/summary_extracted_count"] = summary_extracted_count
     log["bcplus/summary_fallback_count"] = summary_fallback_count
     log["bcplus/summary_empty_count"] = summary_empty_count
+    log["bcplus/summary_content_len_tokens_mean"] = (
+        sum(summary_content_token_lengths) / len(summary_content_token_lengths)
+        if summary_content_token_lengths else 0.0
+    )
     log["bcplus/compress_success_rate"] = (
         summary_extracted_count / attempted_compression_count
         if attempted_compression_count else 0.0

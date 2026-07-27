@@ -110,3 +110,4 @@ def test_evidence_docids_are_recorded_only_after_observation_commit(
     assert outcome == expected_outcome
     assert sample.metadata["_bcplus"]["retrieved_docids"] == expected_docids
     assert sample.metadata["_bcplus"]["opened_docids"] == expected_docids
+    assert sample.metadata["_bcplus"]["summary_content_len_tokens"] == (1 if compress else None)

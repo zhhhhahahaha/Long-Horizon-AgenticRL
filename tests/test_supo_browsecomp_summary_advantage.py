@@ -5,8 +5,12 @@ from __future__ import annotations
 import ast
 import asyncio
 import copy
+import math
+import re
+import sys
 from pathlib import Path
 from types import SimpleNamespace
+from types import ModuleType
 
 import _cp_dist_helpers  # noqa: F401
 import pytest
@@ -143,16 +147,51 @@ def _load_do_compression(output):
     async def fake_post(url, payload):
         return output
 
+    def extract_summary(text):
+        matches = re.findall(r"<summary>(.*?)</summary>", text, re.DOTALL)
+        return matches[-1].strip() if matches else None
+
     namespace = {
         "Sample": object,
         "_COMPRESS_PROMPT": "compress",
         "_wrap_summary_request_and_reopen_assistant": lambda prompt: "request",
         "_clamp_max_new_tokens": lambda args, input_length: 16,
-        "_extract_summary": lambda text: "handover" if "<summary>" in text else None,
+        "_extract_summary": extract_summary,
         "post": fake_post,
+        "re": re,
     }
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(GENERATE_PATH), "exec"), namespace)
     return namespace["_do_compression"]
+
+
+def _load_generate(run_one_sub_trajectory, sample_type):
+    tree = ast.parse(GENERATE_PATH.read_text())
+    function = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "generate")
+    namespace = {
+        "Sample": sample_type,
+        "BCPLUS_CONFIGS": {"max_sub_trajs": 5},
+        "_run_one_sub_trajectory": run_one_sub_trajectory,
+        "_build_continuation_chat": lambda prompt, summary: (_ for _ in ()).throw(
+            AssertionError("an empty handover must not create a continuation prompt")
+        ),
+        "copy": copy,
+    }
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(GENERATE_PATH), "exec"), namespace)
+    return namespace["generate"]
+
+
+def _load_log_bcplus():
+    tree = ast.parse(GENERATE_PATH.read_text())
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "log_bcplus")
+    namespace = {
+        "Sample": object,
+        "BCPLUS_CONFIGS": {"compress_penalty": 0.5},
+        "_BCPLUS_METRIC_DEFINED": False,
+        "_evidence_docids": lambda value: set(),
+        "math": math,
+    }
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(GENERATE_PATH), "exec"), namespace)
+    return namespace["log_bcplus"]
 
 
 @pytest.mark.unit
@@ -195,6 +234,191 @@ def test_compression_span_excludes_request_and_covers_all_generated_tokens():
     assert (summary, source, added, span) == ("handover", "extracted", 5, (5, 8))
     assert response_tokens == [1, 2, 3, 10, 11, 20, 21, 22]
     assert [append["trainable"] for append in sample.appends] == [False, True]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "generated_text",
+    [
+        "done</think><summary>\n  </summary>",
+        "<think>done</think><summary>\n  </summary>",
+    ],
+)
+def test_empty_summary_block_salvages_thinking_as_handover(generated_text):
+    output = {
+        "text": generated_text,
+        "meta_info": {
+            "finish_reason": {"type": "stop"},
+            "output_token_logprobs": [(-0.1, 20), (-0.2, 21)],
+        },
+    }
+    do_compression = _load_do_compression(output)
+
+    class Tokenizer:
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [10]}
+
+    class Sample:
+        def append_response_tokens(self, args, **kwargs):
+            pass
+
+    response_tokens = [1, 2]
+    summary, source, added, span = asyncio.run(
+        do_compression(
+            SimpleNamespace(),
+            Tokenizer(),
+            "http://router/generate",
+            Sample(),
+            {},
+            [100],
+            response_tokens,
+        )
+    )
+
+    assert (summary, source, added, span) == ("done", "fallback", 3, (3, 5))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("generated_text", "expected_summary"),
+    [
+        ("reasoning</think>plain handover", "plain handover"),
+        ("reasoning</think>", "reasoning"),
+        ("plain handover", "plain handover"),
+    ],
+)
+def test_missing_summary_block_uses_best_available_fallback(generated_text, expected_summary):
+    output = {
+        "text": generated_text,
+        "meta_info": {
+            "finish_reason": {"type": "stop"},
+            "output_token_logprobs": [(-0.1, 20)],
+        },
+    }
+    do_compression = _load_do_compression(output)
+
+    class Tokenizer:
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [10]}
+
+    class Sample:
+        def append_response_tokens(self, args, **kwargs):
+            pass
+
+    summary, source, added, span = asyncio.run(
+        do_compression(
+            SimpleNamespace(),
+            Tokenizer(),
+            "http://router/generate",
+            Sample(),
+            {},
+            [100],
+            [],
+        )
+    )
+
+    assert (summary, source, added, span) == (expected_summary, "fallback", 2, (1, 2))
+
+
+@pytest.mark.unit
+def test_tag_only_summary_cannot_be_used_as_handover():
+    output = {
+        "text": "<summary>\n  </summary>",
+        "meta_info": {
+            "finish_reason": {"type": "stop"},
+            "output_token_logprobs": [(-0.1, 20)],
+        },
+    }
+    do_compression = _load_do_compression(output)
+
+    class Tokenizer:
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [10]}
+
+    class Sample:
+        def append_response_tokens(self, args, **kwargs):
+            pass
+
+    summary, source, added, span = asyncio.run(
+        do_compression(
+            SimpleNamespace(),
+            Tokenizer(),
+            "http://router/generate",
+            Sample(),
+            {},
+            [100],
+            [],
+        )
+    )
+
+    assert (summary, source, added, span) == (None, "empty", 2, None)
+
+
+@pytest.mark.unit
+def test_generate_does_not_open_sibling_with_empty_handover():
+    class Sample:
+        class Status:
+            TRUNCATED = "truncated"
+
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+            self.metadata = kwargs.get("metadata", {})
+            self.status = None
+            self.rollout_id = None
+
+    async def run_one_sub_trajectory(args, sample, sampling_params):
+        sample.metadata["_bcplus"] = {
+            "outcome": "compressed",
+            "summary": "",
+            "summary_source": "extracted",
+        }
+        return "compressed"
+
+    generate = _load_generate(run_one_sub_trajectory, Sample)
+    sample = Sample(index=7, group_index=3, prompt=[{"role": "user", "content": "question"}], label="answer")
+
+    sub_trajs = asyncio.run(generate(SimpleNamespace(partial_rollout=False), sample, {}))
+
+    assert sub_trajs == [sample]
+    assert sample.status == Sample.Status.TRUNCATED
+    assert sample.metadata["_bcplus"]["outcome"] == "compress_failed"
+    assert sample.metadata["_bcplus"]["summary"] is None
+
+
+@pytest.mark.unit
+def test_summary_content_length_metric_uses_only_extracted_summaries(monkeypatch):
+    logged = []
+    fake_wandb = ModuleType("wandb")
+    fake_wandb.run = object()
+    fake_wandb.define_metric = lambda *args, **kwargs: None
+    fake_wandb.log = logged.append
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+    class Sample:
+        def __init__(self, rollout_id, source, content_len):
+            self.rollout_id = rollout_id
+            self.group_index = rollout_id
+            self.reward = {"score": 0.0}
+            self.metadata = {
+                "_bcplus_sibling": {"is_final": True},
+                "_bcplus": {
+                    "outcome": "compressed",
+                    "summary_source": source,
+                    "summary_content_len_tokens": content_len,
+                    "response_len_tokens": 1,
+                },
+            }
+
+    samples = [
+        Sample(1, "extracted", 3),
+        Sample(2, "extracted", 7),
+        Sample(3, "fallback", 100),
+    ]
+
+    _load_log_bcplus()(42, SimpleNamespace(), samples, {}, 0.0)
+
+    assert logged[-1]["bcplus/summary_extracted_count"] == 2
+    assert logged[-1]["bcplus/summary_content_len_tokens_mean"] == 5.0
 
 
 @pytest.mark.unit
