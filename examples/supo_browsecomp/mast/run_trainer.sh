@@ -81,6 +81,16 @@ MYHOST="$(hostname)"
 IS_HEAD=0
 if [[ "${TW_TASK_ID:-0}" = "0" || "${MYHOST}" = "${HEAD_HOST}" ]]; then IS_HEAD=1; fi
 echo "[trainer] nnodes=${NNODES} host=${MYHOST} head=${HEAD_HOST} is_head=${IS_HEAD}"
+if [[ -n "${BC_EXPECTED_NUM_NODES:-}" ]]; then
+  [[ "${BC_EXPECTED_NUM_NODES}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "ERROR: BC_EXPECTED_NUM_NODES must be a positive integer, got ${BC_EXPECTED_NUM_NODES}" >&2
+    exit 1
+  }
+  [[ "${NNODES}" == "${BC_EXPECTED_NUM_NODES}" ]] || {
+    echo "ERROR: MAST assigned ${NNODES} trainer nodes; experiment requires ${BC_EXPECTED_NUM_NODES}" >&2
+    exit 1
+  }
+fi
 
 pkill -9 sglang 2>/dev/null || true; sleep 2
 ray stop --force 2>/dev/null || true; pkill -9 python 2>/dev/null || true; sleep 2
@@ -302,6 +312,22 @@ ROLLOUT_ARGS=(
    --balance-data
 )
 
+case "$(printf '%s' "${BCPLUS_DYNAMIC_SAMPLING:-0}" | tr '[:upper:]' '[:lower:]')" in
+   1|true)
+      DYNAMIC_FIRST_POOL_SIZE=$((2 * ${BC_ROLLOUT_BATCH_SIZE:-8}))
+      ROLLOUT_ARGS+=(
+         --rollout-function-path examples.supo_browsecomp.dynamic_sampling.generate_rollout
+         --over-sampling-batch-size "${DYNAMIC_FIRST_POOL_SIZE}"
+      )
+      echo "[head] adaptive dynamic sampling enabled: first_pool=${DYNAMIC_FIRST_POOL_SIZE}"
+      ;;
+   ""|0|false) : ;;
+   *)
+      echo "ERROR: BCPLUS_DYNAMIC_SAMPLING must be one of: 1, true, 0, false" >&2
+      exit 2
+      ;;
+esac
+
 PERF_ARGS=(
    --tensor-model-parallel-size "${TRAIN_TP}"
    --sequence-parallel
@@ -427,7 +453,8 @@ RUNTIME_ENV_JSON="{
     \"BCPLUS_JUDGE_MODEL\": \"${BCPLUS_JUDGE_MODEL:-gpt-5-4-genai-dss4}\",
     \"BCPLUS_JUDGE_BASE_URL\": \"${BCPLUS_JUDGE_BASE_URL:-https://api.llama.com/compat/v1/}\",
     \"BCPLUS_JUDGE_CONCURRENCY\": \"${BCPLUS_JUDGE_CONCURRENCY:-64}\",
-    \"BCPLUS_SEARCH_CONCURRENCY\": \"${BCPLUS_SEARCH_CONCURRENCY:-128}\"
+    \"BCPLUS_SEARCH_CONCURRENCY\": \"${BCPLUS_SEARCH_CONCURRENCY:-128}\",
+    \"BCPLUS_DYNAMIC_SAMPLING\": \"${BCPLUS_DYNAMIC_SAMPLING:-0}\"
   }
 }"
 

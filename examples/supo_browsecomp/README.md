@@ -165,6 +165,27 @@ search server's queue.
 
 ### MAST W&B live sync
 
+For config-defined trainer jobs, keep the runner fixed and create one shell
+config per experiment under `examples/supo_browsecomp/mast/configs/`. The
+submission entry point always performs a MAST dry-run first and checks both the
+trainer `taskCount` and `ROLE_ASSIGNMENT_MAP` before submitting:
+
+```bash
+# Validate only: must report taskCount=16 and trainer_0=128.
+examples/supo_browsecomp/mast/submit_experiment.sh --dry-run \
+  examples/supo_browsecomp/mast/configs/4b_16node_dynamic_n16.sh
+
+# Validate again, submit, then start the W&B watcher.
+examples/supo_browsecomp/mast/submit_experiment.sh \
+  examples/supo_browsecomp/mast/configs/4b_16node_dynamic_n16.sh
+```
+
+The example preserves the existing 4B run's `BC_N_SAMPLES=16`. With dynamic
+sampling enabled, its first pool is 64 prompt groups, or 1024 trajectories;
+`BCPLUS_SEARCH_CONCURRENCY=512` bounds active client requests rather than the
+number of generated trajectories. Refresh the configured `MAST_CODE_ARCHIVE`
+before submission whenever trainer code changes.
+
 MAST writes W&B transaction logs to each node's local `/tmp` and publishes an
 immutable tar snapshot to `supo-slime/wandb-snapshots/<job>/` every 60 seconds.
 It does not write active `.wandb` files directly to OILFS. From the devserver,
