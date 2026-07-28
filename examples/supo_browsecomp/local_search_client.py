@@ -13,12 +13,26 @@ import httpx
 
 
 class AsyncSearchClient:
-    def __init__(self, base_url: str, timeout: float = 300.0, retries: int = 3, backoff: float = 0.5):
+    def __init__(
+        self,
+        base_url: str,
+        timeout: float = 300.0,
+        retries: int = 3,
+        backoff: float = 0.5,
+        max_connections: int = 100,
+    ):
+        if max_connections <= 0:
+            raise ValueError("max_connections must be positive")
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.retries = retries
         self.backoff = backoff
-        self._client = httpx.AsyncClient(base_url=self.base_url)
+        limits = httpx.Limits(
+            max_connections=max_connections,
+            max_keepalive_connections=min(max_connections, 128),
+            keepalive_expiry=30.0,
+        )
+        self._client = httpx.AsyncClient(base_url=self.base_url, limits=limits)
 
     async def close(self) -> None:
         await self._client.aclose()

@@ -17,6 +17,14 @@ import pytest
 import torch
 from megatron.core import mpu
 
+from examples.supo_browsecomp.dynamic_sampling import (
+    _CandidateGroup,
+    _build_metrics,
+    _candidate_group,
+    _choose_topup_group_count,
+    _sampling_targets,
+    _select_candidates,
+)
 from examples.supo_browsecomp.summary_advantage import compute_summary_aware_advantages
 
 
@@ -440,3 +448,163 @@ def test_zero_std_group_stays_finite_before_token_level_override():
     assert raw_rewards == [0.0, 0.0, 0.0]
     assert normalized == [0.0, 0.0, 0.0]
     assert all(sample.reward["score"] == 0.0 for sample in samples)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "first_valid,expected_topup",
+    [
+        (18, 64),
+        (19, 64),
+        (20, 56),
+        (21, 48),
+        (22, 40),
+        (23, 40),
+        (24, 32),
+        (25, 24),
+        (26, 24),
+        (27, 16),
+        (28, 16),
+        (29, 8),
+        (30, 0),
+    ],
+)
+def test_dynamic_sampling_beta_binomial_topup_table(first_valid, expected_topup):
+    assert (
+        _choose_topup_group_count(
+            first_pool_valid_count=first_valid,
+            first_pool_group_count=64,
+            target_valid_count=30,
+            max_topup_group_count=64,
+        )
+        == expected_topup
+    )
+
+
+@pytest.mark.unit
+def test_dynamic_sampling_targets_scale_with_rollout_batch_size():
+    assert _sampling_targets(32) == (64, 30, 64)
+    assert _sampling_targets(16) == (32, 14, 32)
+
+
+class _DynamicSample:
+    def __init__(self, index, score, *, final=False):
+        self.index = index
+        self.reward = {"score": score}
+        self.metadata = {"_bcplus_sibling": {"is_final": final}}
+
+    def get_reward_value(self, args):
+        return self.reward[args.reward_key]
+
+
+@pytest.mark.unit
+def test_dynamic_sampling_uses_only_final_fanout_sibling_rewards():
+    expected_rewards = [0.0, 1.0] * 4
+    group = [
+        [
+            _DynamicSample(index, 0.0),
+            _DynamicSample(index, reward, final=True),
+        ]
+        for index, reward in enumerate(expected_rewards)
+    ]
+
+    candidate = _candidate_group(
+        SimpleNamespace(n_samples_per_prompt=8, reward_key="score"),
+        group,
+        from_first_pool=True,
+    )
+
+    assert candidate.rewards == tuple(expected_rewards)
+    assert candidate.has_nonzero_std
+
+
+def _make_candidate(index, rewards, *, first_pool=True):
+    return _CandidateGroup(
+        group=[index],
+        from_first_pool=first_pool,
+        index=index,
+        rewards=tuple(rewards),
+    )
+
+
+@pytest.mark.unit
+def test_dynamic_sampling_selection_and_metrics_cover_all_candidates():
+    first_valid = [_make_candidate(index, (0.0, 1.0)) for index in range(20)]
+    first_all_correct = [_make_candidate(index, (1.0, 1.0)) for index in range(20, 42)]
+    first_all_wrong = [_make_candidate(index, (0.0, 0.0)) for index in range(42, 64)]
+    topup_valid = [
+        _make_candidate(index, (0.0, 1.0), first_pool=False) for index in range(64, 76)
+    ]
+    topup_all_correct = [
+        _make_candidate(index, (1.0, 1.0), first_pool=False) for index in range(76, 98)
+    ]
+    topup_all_wrong = [
+        _make_candidate(index, (0.0, 0.0), first_pool=False) for index in range(98, 120)
+    ]
+    candidates = (
+        first_valid
+        + first_all_correct
+        + first_all_wrong
+        + topup_valid
+        + topup_all_correct
+        + topup_all_wrong
+    )
+
+    selected = _select_candidates(candidates, batch_size=32)
+    metrics = _build_metrics(candidates, selected, topup_group_count=56)
+
+    assert [candidate.index for candidate in selected] == list(range(20)) + list(range(64, 76))
+    assert metrics == {
+        "dynamic_sampling/candidate_zero_std_1_count": 44,
+        "dynamic_sampling/candidate_zero_std_0_count": 44,
+        "dynamic_sampling/topup_requested_group_count": 56,
+        "dynamic_sampling/first_pool_kept_group_count": 20,
+        "dynamic_sampling/selected_group_count": 32,
+    }
+
+
+@pytest.mark.unit
+def test_dynamic_sampling_fills_two_zero_std_groups_without_topup():
+    candidates = [_make_candidate(index, (0.0, 1.0)) for index in range(30)]
+    candidates += [_make_candidate(index, (1.0, 1.0)) for index in range(30, 47)]
+    candidates += [_make_candidate(index, (0.0, 0.0)) for index in range(47, 64)]
+
+    selected = _select_candidates(candidates, batch_size=32)
+    metrics = _build_metrics(candidates, selected, topup_group_count=0)
+
+    assert [candidate.index for candidate in selected] == list(range(32))
+    assert metrics["dynamic_sampling/candidate_zero_std_1_count"] == 17
+    assert metrics["dynamic_sampling/candidate_zero_std_0_count"] == 17
+    assert metrics["dynamic_sampling/first_pool_kept_group_count"] == 32
+    assert metrics["dynamic_sampling/selected_group_count"] == 32
+
+
+@pytest.mark.unit
+def test_search_client_connection_pool_tracks_search_concurrency(monkeypatch):
+    from examples.supo_browsecomp import local_search_client
+
+    captured = {}
+    limits_sentinel = object()
+
+    def fake_limits(**kwargs):
+        captured["limits"] = kwargs
+        return limits_sentinel
+
+    def fake_async_client(**kwargs):
+        captured["client"] = kwargs
+        return object()
+
+    monkeypatch.setattr(local_search_client.httpx, "Limits", fake_limits)
+    monkeypatch.setattr(local_search_client.httpx, "AsyncClient", fake_async_client)
+
+    local_search_client.AsyncSearchClient("http://search", max_connections=512)
+
+    assert captured["limits"] == {
+        "max_connections": 512,
+        "max_keepalive_connections": 128,
+        "keepalive_expiry": 30.0,
+    }
+    assert captured["client"] == {
+        "base_url": "http://search",
+        "limits": limits_sentinel,
+    }

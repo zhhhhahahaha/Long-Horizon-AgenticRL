@@ -142,7 +142,10 @@ def _search_client() -> AsyncSearchClient:
     global _SEARCH_CLIENT
     if _SEARCH_CLIENT is None:
         base_url = os.environ["LOCAL_SEARCH_URL"]
-        _SEARCH_CLIENT = AsyncSearchClient(base_url=base_url)
+        _SEARCH_CLIENT = AsyncSearchClient(
+            base_url=base_url,
+            max_connections=BCPLUS_CONFIGS["search_concurrency"],
+        )
     return _SEARCH_CLIENT
 
 
@@ -1583,6 +1586,7 @@ def log_bcplus(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
     global _BCPLUS_METRIC_DEFINED
     if not _BCPLUS_METRIC_DEFINED:
         wandb.define_metric("bcplus/*", step_metric="rollout/step")
+        wandb.define_metric("dynamic_sampling/*", step_metric="rollout/step")
         _BCPLUS_METRIC_DEFINED = True
 
     log = {}

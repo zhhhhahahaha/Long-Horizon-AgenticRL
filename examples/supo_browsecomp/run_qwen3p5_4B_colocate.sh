@@ -51,6 +51,9 @@
 #   BCPLUS_JUDGE_BASE_URL       default "https://api.llama.com/compat/v1/"
 #   BCPLUS_JUDGE_CONCURRENCY    default 64  (judge call semaphore)
 #   BCPLUS_SEARCH_CONCURRENCY   default 128 (search call semaphore)
+#   BCPLUS_DYNAMIC_SAMPLING     default 0. Set to 1/true to sample an initial
+#                               pool of 2 x rollout_batch_size prompt groups,
+#                               then use a 95% Beta-Binomial top-up policy.
 #   SEARCH_BUFFER_HOURS         default 4. Extra runway beyond TRAIN_WALLTIME the
 #                               search server must have to be reused; else it is
 #                               scancel'd + relaunched (10s Ctrl-C grace).
@@ -206,6 +209,7 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
                 --env BCPLUS_JUDGE_BASE_URL='${BCPLUS_JUDGE_BASE_URL:-}' \
                 --env BCPLUS_JUDGE_CONCURRENCY='${BCPLUS_JUDGE_CONCURRENCY:-}' \
                 --env BCPLUS_SEARCH_CONCURRENCY='${BCPLUS_SEARCH_CONCURRENCY:-}' \
+                --env BCPLUS_DYNAMIC_SAMPLING='${BCPLUS_DYNAMIC_SAMPLING:-}' \
                 --env BC_NUM_ROLLOUT='${BC_NUM_ROLLOUT:-}' \
                 --env BC_ROLLOUT_BATCH_SIZE='${BC_ROLLOUT_BATCH_SIZE:-}' \
                 --env BC_N_SAMPLES='${BC_N_SAMPLES:-}' \
@@ -352,8 +356,8 @@ ROLLOUT_ARGS=(
    --rollout-shuffle
    # Batch: 32 prompts × 8 samples = 256 rollouts per iter. global_batch_size
    # equals num_rollouts so we do exactly 1 gradient step per iter (SUPO-style
-   # fully on-policy). 20 iter × 32 prompts = 640 prompts ≈ 1 epoch of the
-   # 680-prompt training set.
+   # fully on-policy). Without dynamic sampling, 20 iter × 32 prompts = 640
+   # prompts ≈ 1 epoch of the 680-prompt training set.
    --num-rollout ${BC_NUM_ROLLOUT:-20}
    --rollout-batch-size ${BC_ROLLOUT_BATCH_SIZE:-32}
    --n-samples-per-prompt ${BC_N_SAMPLES:-8}
@@ -367,6 +371,22 @@ ROLLOUT_ARGS=(
    --global-batch-size ${BC_GLOBAL_BATCH_SIZE:-256}
    --balance-data
 )
+
+case "$(printf '%s' "${BCPLUS_DYNAMIC_SAMPLING:-0}" | tr '[:upper:]' '[:lower:]')" in
+    1|true)
+        DYNAMIC_FIRST_POOL_SIZE=$((2 * ${BC_ROLLOUT_BATCH_SIZE:-32}))
+        ROLLOUT_ARGS+=(
+            --rollout-function-path examples.supo_browsecomp.dynamic_sampling.generate_rollout
+            --over-sampling-batch-size "${DYNAMIC_FIRST_POOL_SIZE}"
+        )
+        echo "[BCPLUS] adaptive dynamic sampling enabled: first_pool=${DYNAMIC_FIRST_POOL_SIZE}"
+        ;;
+    ""|0|false) : ;;
+    *)
+        echo "BCPLUS_DYNAMIC_SAMPLING must be one of: 1, true, 0, false" >&2
+        exit 2
+        ;;
+esac
 
 PERF_ARGS=(
    # 8 nodes × 8 GPU = 64 GPUs. TP=4 × CP=2 × PP=1 × DP=8 = 64.
