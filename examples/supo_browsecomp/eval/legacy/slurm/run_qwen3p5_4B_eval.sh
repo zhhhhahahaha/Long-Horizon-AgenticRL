@@ -22,7 +22,7 @@
 #   BC_EVAL_LOAD=/genai/fsx-project/hhzhang01/checkpoints/<run>/iter_0000044 \
 #   EVAL_DUMP_DIR=/genai/fsx-project/hhzhang01/evals/<run>-sweep/iter44 \
 #   BC_EVAL_N=4 \
-#   bash examples/supo_browsecomp/eval/run_qwen3p5_4B_eval.sh
+#   bash examples/supo_browsecomp/eval/legacy/slurm/run_qwen3p5_4B_eval.sh
 #
 # For the base model set BC_EVAL_LOAD=base (or leave it empty).
 # The search server must already be up (launch_search_server.sh); auto-discovered

@@ -527,7 +527,7 @@ COLOCATE_ARGS=(
 #     conversion needed: actor.update_weights() (train.py:27) syncs the loaded
 #     megatron checkpoint into sglang BEFORE the eval runs.
 #
-# Driven by eval/run_qwen3p5_4B_eval.sh, one job per checkpoint:
+# Legacy Slurm eval is driven by eval/legacy/slurm/run_qwen3p5_4B_eval.sh:
 #   BC_EVAL_LOAD  = <run>/iter_0000NN (host path) to eval that iter, or
 #                 = "base"/"" -> no --load (base weights from --hf-checkpoint)
 #   BC_EVAL_N     = --n-samples-per-eval-prompt (default 4)

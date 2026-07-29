@@ -15,7 +15,8 @@ Causes (exact templates from _run_action / the rollout loop):
 
 Server-side failures ("[Search server error]") are NOT bad tool calls; counted separately for context.
 
-Run via run_report.sh with REPORT_SCRIPT=examples/supo_browsecomp/eval/bad_tool_breakdown.py
+Run via legacy/slurm/run_report.sh with
+REPORT_SCRIPT=examples/supo_browsecomp/eval/legacy/analysis/bad_tool_breakdown.py
 Output: <eval-root>/bad_tool_breakdown.json  + a table to stdout.
 """
 import argparse, json, os

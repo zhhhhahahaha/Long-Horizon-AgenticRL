@@ -4,11 +4,11 @@
 # (64-GPU / 8-node cap) and queues the rest.
 #
 # Each job writes EVAL_ROOT/<point>/rollout_data/eval_0.pt. Build the report
-# afterwards with eval/build_eval_report.py once all dumps exist.
+# afterwards with legacy/analysis/build_eval_report.py once all dumps exist.
 #
 # Usage (from the login pod):
 #   export LLAMA_API_KEY='LLM|...'
-#   bash examples/supo_browsecomp/eval/eval_all_checkpoints.sh
+#   bash examples/supo_browsecomp/eval/legacy/slurm/eval_all_checkpoints.sh
 #
 # Env overrides:
 #   RUN        training run to evaluate (default: the 20260720-2059 4B run)

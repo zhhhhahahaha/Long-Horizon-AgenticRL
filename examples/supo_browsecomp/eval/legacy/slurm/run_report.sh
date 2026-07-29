@@ -5,7 +5,7 @@
 #
 # Usage (from the login pod):
 #   EVAL_ROOT=/genai/fsx-project/hhzhang01/evals/<run>-sweep \
-#   bash examples/supo_browsecomp/eval/run_report.sh
+#   bash examples/supo_browsecomp/eval/legacy/slurm/run_report.sh
 #
 # Blocks until the builder finishes (srun, foreground) and tails its output to
 # REPORT_LOG. The generated eval_summary.json / summary_table.md / failures land
@@ -25,7 +25,7 @@ QOS="${QOS:-a100_genai_interns_high}"
 REPORT_LOG="${REPORT_LOG:-/genai/fsx-project/hhzhang01/logs/eval-report-$(basename "${EVAL_ROOT}").log}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 # Which analysis script to run (default: the Stage-A report builder).
-REPORT_SCRIPT="${REPORT_SCRIPT:-examples/supo_browsecomp/eval/build_eval_report.py}"
+REPORT_SCRIPT="${REPORT_SCRIPT:-examples/supo_browsecomp/eval/legacy/analysis/build_eval_report.py}"
 
 echo "[report] EVAL_ROOT=${EVAL_ROOT} -> ${EVAL_ROOT_CTR}"
 echo "[report] log -> ${REPORT_LOG}"

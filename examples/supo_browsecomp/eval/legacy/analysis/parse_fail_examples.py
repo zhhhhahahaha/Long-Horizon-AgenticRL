@@ -3,7 +3,8 @@
 into a <tool_call>, i.e. the turn right before a
 "No function call was detected in the model response." observation.
 
-Run via run_report.sh with REPORT_SCRIPT=.../parse_fail_examples.py
+Run via legacy/slurm/run_report.sh with
+REPORT_SCRIPT=examples/supo_browsecomp/eval/legacy/analysis/parse_fail_examples.py
 EXTRA_ARGS="--point iter24 --n 8"
 """
 import argparse, os, re

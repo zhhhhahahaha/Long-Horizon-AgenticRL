@@ -221,14 +221,14 @@ def init_http_client(args):
     if _http_client is None:
         _http_client = httpx.AsyncClient(
             limits=httpx.Limits(max_connections=_client_concurrency),
-            # Bounded read timeout. Prior config was timeout=None which caused
-            # per-POST to wait forever if sglang dropped or lost a response —
-            # observed on an 8-node BC+ run where 8 rollouts hung 15h with no
-            # error log until slurm walltime. read=1200s covers worst-case
-            # legit generation (max_new_tokens=32k / ~30 tok/s per request
-            # when engine is fully loaded at ~16 concurrent = ~18min) with
-            # margin. connect/write bounded to catch TCP hangs early.
-            timeout=httpx.Timeout(connect=30.0, read=1200.0, write=30.0, pool=None),
+            # Keep connect/write bounded and use the router's configured
+            # request deadline for non-streaming generation responses.
+            timeout=httpx.Timeout(
+                connect=30.0,
+                read=float(args.sglang_router_request_timeout_secs),
+                write=30.0,
+                pool=None,
+            ),
             trust_env=False,  # internal SGLang comm only — never route through system proxy
         )
 
@@ -261,12 +261,17 @@ def _init_ray_distributed_post(args):
     # Define the async actor
     @ray.remote
     class _HttpPosterActor:
-        def __init__(self, concurrency: int):
+        def __init__(self, concurrency: int, request_timeout_secs: float):
             # Lazy creation to this actor's event loop. See init_http_client
             # for why timeout is bounded (never leave read=None).
             self._client = httpx.AsyncClient(
                 limits=httpx.Limits(max_connections=max(1, concurrency)),
-                timeout=httpx.Timeout(connect=30.0, read=1200.0, write=30.0, pool=None),
+                timeout=httpx.Timeout(
+                    connect=30.0,
+                    read=float(request_timeout_secs),
+                    write=30.0,
+                    pool=None,
+                ),
                 trust_env=False,  # internal SGLang comm only — never route through system proxy
             )
 
@@ -290,7 +295,7 @@ def _init_ray_distributed_post(args):
                 max_concurrency=per_actor_conc,
                 # Use tiny CPU to schedule
                 num_cpus=0.001,
-            ).remote(per_actor_conc)
+            ).remote(per_actor_conc, args.sglang_router_request_timeout_secs)
             created.append(actor)
 
     _post_actors = created
