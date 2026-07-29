@@ -1,19 +1,28 @@
 #!/bin/bash
-# BrowseComp-Plus RL — Qwen3.5-4B on 8 A100 nodes (colocate mode).
+# BrowseComp-Plus RL — Qwen3.5-9B on 8 A100 nodes (colocate mode).
 #
-# Fork of run_qwen3p5_9B_colocate.sh with model swapped to 4B. Same colocate
-# machinery (per-node /dev/shm rootfs staging, COORD_DIR host->container path
-# split, EXIT trap, --sglang-disable-custom-all-reduce).
+# Tracks run_qwen3p5_4B_colocate.sh's orchestration while preserving the 9B
+# model topology and memory limits. Same colocate machinery (per-node /dev/shm
+# rootfs staging, search-server ensure, stale coordination cleanup, EXIT trap,
+# --sglang-disable-custom-all-reduce, wandb-sync poll, conditional --load).
 #
-# Why 4B here: Qwen3.5-9B triggers a megatron _apply_output_gate shape bug
-# at TP=8 (num_query_groups=4 → KV replication path that the gate code
-# doesn't handle). TP=4 on 9B OOMs during actor backward on vocab head
-# activation at 65k context. 4B has hidden=2560 (vs 4096) so activations are
-# smaller and TP=4 fits comfortably — no gate bug (TP=4 == num_query_groups=4
-# means no KV replication), no OOM.
+# Why CP=2 for 9B: Qwen3.5-9B has hidden=4096 (vs 4B's 2560), so its
+# activations are ~40% larger than 4B. On the 4B 8-node canonical we
+# already had to add clear_memory() before actor.train() to survive the
+# 30 GB PyTorch-cache fragmentation caused by ref forward's 15 GB fp32
+# softmax alloc-free cycles. 9B pushes that alloc to ~24 GB per rank at
+# TP=4 CP=1 — too tight even with the defrag fix. CP=2 splits seq dim in
+# half so vocab head activation drops to ~12 GB per rank, leaving room.
+#
+# Also using max_tokens_per_gpu=32768 (vs 4B's 49152): further caps
+# per-microbatch peak. Oversized single samples (>32k) still get their
+# own microbatch via first_fit_pack. TP=4 == num_query_groups=4 avoids
+# the megatron _apply_output_gate shape bug that broke earlier TP=8 tries.
 #
 # Physical layout at 8 nodes: TP=4 × CP=2 × PP=1 = 8 GPU per model group,
-# 64 GPU / 8 = DP=8. Global batch 256 / DP=8 = 32 trajectories per DP rank.
+# 64 GPU / 8 = DP=8. Global batch 256 / DP=8 = 32 samples per DP per iter.
+# This is a conservative candidate topology, not a proven OOM-free guarantee:
+# max_tokens_per_gpu controls packing but cannot split one oversized sub-traj.
 #
 # Two-part launcher:
 #   * Outer part (login pod): auto-discovers search server, exports RUN_NAME,
@@ -24,7 +33,7 @@
 # Before running:
 #   1. Search server running (see launch_search_server.sh).
 #   2. LLAMA_API_KEY set on the login pod (judge routes via Llama API).
-#   3. Qwen3.5-4B HF + torch_dist checkpoints on FSx.
+#   3. Qwen3.5-9B HF + torch_dist checkpoints on FSx (see convert_qwen3p5_9B.sh).
 #
 # Debug-only overrides (env vars — leave unset for canonical config):
 #   BC_NUM_ROLLOUT              default 20   (20 iter × 32 prompts ≈ 1 epoch)
@@ -33,13 +42,16 @@
 #   BC_GLOBAL_BATCH_SIZE        default 256  (= batch × samples, 1 grad step per iter)
 #   BC_MAX_RESPONSE_LEN         default 32768 (sglang per-call max_new_tokens)
 #   BC_MAX_CONTEXT_LEN          default 65536 (per-sample total context budget)
+#   BC_TP                       default 4    (TP>4 previously hit the output-gate bug)
+#   BC_CP                       default 2    (raise to trade throughput for activation headroom)
+#   BC_SGLANG_TP                default 4
+#   BC_MAX_TOKENS_PER_GPU       default 32768 (packing cap, not a hard sample cap)
 #   BCPLUS_MAX_TURNS            default 64
 #   BCPLUS_COMPRESS_THRESH      default 0.85
 #   BCPLUS_MAX_SUB_TRAJS        default 5
 #   BCPLUS_COMPRESS_PENALTY     default 0.5
 #   BCPLUS_DUMP_DIR             default /genai/fsx-project/hhzhang01/dumps/${RUN_NAME}
-#                               — per-iter rollout parquet dump is ON by default
-#                               so training rollouts can be inspected offline.
+#                               — per-iter rollout parquet dump is ON by default.
 #                               Set BCPLUS_DUMP_DIR="" to disable.
 #   BCPLUS_DUMP_TRAIN_OLD       default "" (empty/0/false = off). Only meaningful
 #                               when BCPLUS_DUMP_DIR is set. When truthy, adds
@@ -57,14 +69,9 @@
 #   SEARCH_BUFFER_HOURS         default 4. Extra runway beyond TRAIN_WALLTIME the
 #                               search server must have to be reused; else it is
 #                               scancel'd + relaunched (10s Ctrl-C grace).
-#   SEARCH_QOS                  default a100_dev. QOS for the search server job
-#                               (decoupled from training QOS; keeps it off the
-#                               a100_*_high quota).
-#   QOS                         default a100_genai_interns_high (fast/high-prio
-#                               for the 8-node training srun). Override for a
-#                               different training queue.
-#   MIN_HOURS_REMAINING         overrides the reuse threshold directly (default
-#                               = TRAIN_WALLTIME hours + SEARCH_BUFFER_HOURS).
+#   SEARCH_QOS                  default a100_dev. QOS for the search server job.
+#   QOS                         default a100_genai_interns_high for training.
+#   MIN_HOURS_REMAINING         overrides the search-server reuse threshold.
 #   LOCAL_SEARCH_URL            set to skip the ensure step and use this server.
 
 set -euo pipefail
@@ -76,9 +83,9 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
     : "${LLAMA_API_KEY:?LLAMA_API_KEY must be set on the login pod (LLM|... key with entitlement)}"
 
     # Search server is ensured after the config block below (that logic needs
-    # TRAIN_WALLTIME / QOS / SLURM_ACCOUNT / SLIME_HOST_DIR).
+    # TRAIN_WALLTIME / SLURM_ACCOUNT / SLIME_HOST_DIR).
 
-    export RUN_NAME="${RUN_NAME:-supo-bcplus-qwen3p5-4b-$(date +%Y%m%d-%H%M)}"
+    export RUN_NAME="${RUN_NAME:-supo-bcplus-qwen3p5-9b-$(date +%Y%m%d-%H%M)}"
     echo "RUN_NAME=${RUN_NAME}"
 
     SLIME_HOST_DIR=/home/hhzhang01/slime
@@ -90,36 +97,21 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
     TRAIN_LOG_PATH="${TRAIN_LOG_PATH:-/genai/fsx-project/hhzhang01/logs/${RUN_NAME}.log}"
     mkdir -p "$(dirname "${TRAIN_LOG_PATH}")"
 
-    # Dump per-iter rollout parquet BY DEFAULT so training rollouts can be
-    # inspected offline (token ids + loss_mask + rollout_logps + advantage +
-    # outcome/score, one file per DP rank per iter, written to fast Lustre).
-    # Uses `-` (not `:-`): unset -> default path (on); explicit BCPLUS_DUMP_DIR=""
-    # -> off. train_old stays off (no extra forward pass) unless
-    # BCPLUS_DUMP_TRAIN_OLD=1.
+    # Unset -> dump trajectories; explicitly empty -> disable. train_old log
+    # probabilities stay opt-in because they require an extra forward pass.
     export BCPLUS_DUMP_DIR="${BCPLUS_DUMP_DIR-/genai/fsx-project/hhzhang01/dumps/${RUN_NAME}}"
 
-    # Ensure a healthy retrieval search server with enough runway for this run.
-    # Idempotent (launch_search_server.sh): reuses a RUNNING server that has
-    # >= MIN_HOURS_REMAINING left, else scancel + resubmit a fresh 7-day job
-    # (with a 10s Ctrl-C grace — abort if another experiment relies on it).
-    # This is the search-server ensure the retired external-sglang orchestrator
-    # used to do. Set LOCAL_SEARCH_URL yourself to skip this and use a specific server.
+    # Reuse a healthy search server only when it has enough time remaining to
+    # outlive this run. Keep its QOS independent from the training allocation.
     if [[ -z "${LOCAL_SEARCH_URL:-}" ]]; then
-        # Default runway = this run's walltime (hours) + buffer, so the server
-        # outlives training. Falls back to launch_search_server.sh's own default
-        # if TRAIN_WALLTIME isn't a plain HH:MM:SS.
         _wt_hours="${TRAIN_WALLTIME%%:*}"
         _min_hours="${MIN_HOURS_REMAINING:-}"
         if [[ -z "${_min_hours}" && "${_wt_hours}" =~ ^[0-9]+$ ]]; then
             _min_hours="$((_wt_hours + ${SEARCH_BUFFER_HOURS:-4}))"
         fi
-        # The search server runs on its OWN qos (SEARCH_QOS, default a100_dev):
-        # decoupled from the training QOS so it never eats the a100_*_high quota,
-        # gets high priority, and can hold the full 7-day walltime. Passed inline
-        # so this run's ${QOS} (used for the training srun below) is untouched.
         echo "[colocate] ensuring search server on qos=${SEARCH_QOS:-a100_dev} (>= ${_min_hours:-48}h runway)"
         MIN_HOURS_REMAINING="${_min_hours}" QOS="${SEARCH_QOS:-a100_dev}" SLURM_ACCOUNT="${SLURM_ACCOUNT}" \
-            bash "${SLIME_HOST_DIR}/examples/supo_browsecomp/launch_search_server.sh"
+            bash "${SLIME_HOST_DIR}/examples/supo_browsecomp/aws/search/launch_search_server.sh"
         SEARCH_HOST_FILE=/genai/fsx-project/hhzhang01/logs/search-server.hostname
         [[ -f "${SEARCH_HOST_FILE}" ]] || {
             echo "ERROR: ${SEARCH_HOST_FILE} missing after launch_search_server.sh" >&2
@@ -137,12 +129,8 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
     COORD_DIR_HOST=/genai/fsx-project/hhzhang01/logs/ray-coord/${RUN_NAME}
     COORD_DIR=/genai_hh/logs/ray-coord/${RUN_NAME}
     mkdir -p "${COORD_DIR_HOST}"
-    # Clean stale coord files from a prior run of the same RUN_NAME. Without
-    # this, resume submits will hang forever: the prior run's EXIT trap
-    # (`touch DONE`) leaves `done` around, and workers on this new job's poll
-    # loop see DONE at startup and immediately exit — only the head node
-    # joins Ray, placement group waits forever for the missing 7 nodes.
-    # Observed on 293413 (6 h wasted before we noticed).
+    # Retries reuse RUN_NAME; remove the prior head address and DONE marker so
+    # workers cannot exit early or join a dead Ray head.
     rm -f "${COORD_DIR_HOST}/done" "${COORD_DIR_HOST}/head.ip"
     echo "coord dir host: ${COORD_DIR_HOST}"
     echo "coord dir container: ${COORD_DIR}"
@@ -216,9 +204,14 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
                 --env BC_GLOBAL_BATCH_SIZE='${BC_GLOBAL_BATCH_SIZE:-}' \
                 --env BC_MAX_RESPONSE_LEN='${BC_MAX_RESPONSE_LEN:-}' \
                 --env BC_MAX_CONTEXT_LEN='${BC_MAX_CONTEXT_LEN:-}' \
+                --env BC_TP='${BC_TP:-}' \
+                --env BC_CP='${BC_CP:-}' \
+                --env BC_SGLANG_TP='${BC_SGLANG_TP:-}' \
+                --env BC_MAX_TOKENS_PER_GPU='${BC_MAX_TOKENS_PER_GPU:-}' \
+                --env BC_LOGPROBS_CHUNK='${BC_LOGPROBS_CHUNK:-}' \
                 --env WANDB_X_FLUSH_INTERVAL_SECONDS='${WANDB_X_FLUSH_INTERVAL_SECONDS:-30}' \
                 ${ENROOT_ROOTFS} \
-                bash /slime/examples/supo_browsecomp/run_qwen3p5_4B_colocate.sh
+                bash /slime/examples/supo_browsecomp/aws/run_qwen3p5_9B_colocate.sh
         " &
     TRAIN_PID=$!
     echo "[outer] srun backgrounded, pid=${TRAIN_PID}; wandb-sync every ${WANDB_SYNC_INTERVAL_SEC}s"
@@ -308,12 +301,38 @@ fi
 # ---------- Head branch: start ray head, launch training, signal DONE --------
 echo "[head node] my_ip=${MY_IP}, num_nodes=${NUM_NODES}"
 source /aws-cluster/wandb-args.sh
-source scripts/models/qwen3.5-4B.sh
+source scripts/models/qwen3.5-9B.sh
 
-HF_CKPT_HOST=/genai_hh/models/Qwen3.5-4B
-REF_LOAD_HOST=/genai_hh/models/Qwen3.5-4B_torch_dist
+TRAIN_TP="${BC_TP:-4}"
+TRAIN_CP="${BC_CP:-2}"
+SGLANG_TP="${BC_SGLANG_TP:-4}"
+MAX_TOKENS_PER_GPU="${BC_MAX_TOKENS_PER_GPU:-32768}"
+for value_name in TRAIN_TP TRAIN_CP SGLANG_TP MAX_TOKENS_PER_GPU; do
+    value="${!value_name}"
+    [[ "${value}" =~ ^[1-9][0-9]*$ ]] || {
+        echo "ERROR: ${value_name} must be a positive integer, got ${value}" >&2
+        exit 1
+    }
+done
+TOTAL_GPUS=$((NUM_NODES * 8))
+MODEL_PARALLEL_SIZE=$((TRAIN_TP * TRAIN_CP))
+(( TOTAL_GPUS % MODEL_PARALLEL_SIZE == 0 )) || {
+    echo "ERROR: total GPUs ${TOTAL_GPUS} must be divisible by TP*CP=${MODEL_PARALLEL_SIZE}" >&2
+    exit 1
+}
+(( TOTAL_GPUS % SGLANG_TP == 0 )) || {
+    echo "ERROR: total GPUs ${TOTAL_GPUS} must be divisible by SGLANG_TP=${SGLANG_TP}" >&2
+    exit 1
+}
+if [[ "${TRAIN_TP}" != "4" ]]; then
+    echo "[head] WARN: 9B TP=${TRAIN_TP} is experimental; TP=8 previously hit the Qwen3.5 output-gate/KV-replication bug" >&2
+fi
+echo "[head] 9B candidate topology: TP=${TRAIN_TP} CP=${TRAIN_CP} DP=$((TOTAL_GPUS / MODEL_PARALLEL_SIZE)) SGLANG_TP=${SGLANG_TP} max_tokens_per_gpu=${MAX_TOKENS_PER_GPU}"
+
+HF_CKPT_HOST=/genai_hh/models/Qwen3.5-9B
+REF_LOAD_HOST=/genai_hh/models/Qwen3.5-9B_torch_dist
 TRAIN_DATA=/genai_hh/datasets/BC+/bc_train.parquet
-TEST_DATA="${BC_TEST_DATA:-/genai_hh/datasets/BC+/bc_test.parquet}"
+TEST_DATA=/genai_hh/datasets/BC+/bc_test.parquet
 CKPT_SAVE_DIR=/genai_hh/checkpoints/${RUN_NAME}
 mkdir -p "${CKPT_SAVE_DIR}"
 
@@ -334,7 +353,7 @@ CKPT_ARGS=(
 #
 # To resume a specific run:
 #   export RUN_NAME=<the-original-run-name>   # same name as first submission
-#   bash run_qwen3p5_4B_colocate.sh
+#   bash run_qwen3p5_9B_colocate.sh
 # Without the RUN_NAME export the outer part generates a fresh timestamp,
 # CKPT_SAVE_DIR points to a new empty dir, and the branch below no-ops.
 if [[ -f "${CKPT_SAVE_DIR}/latest_checkpointed_iteration.txt" ]]; then
@@ -391,31 +410,44 @@ esac
 PERF_ARGS=(
    # 8 nodes × 8 GPU = 64 GPUs. TP=4 × CP=2 × PP=1 × DP=8 = 64.
    # TP=4 == num_query_groups=4: each rank gets exactly 1 KV head, no
-   # replication. Avoids the megatron _apply_output_gate shape bug that
-   # trips at TP > num_query_groups (which is what killed our TP=8 9B run).
-   # CP=2 (was 1): the previous CP=1 config OOM'd on run 292745 at iter 10
-   # (actor train's vocab_parallel_softmax needed 15 GB for a 55834-token
-   # sample × vocab_size/TP=4 × fp32 logits; PyTorch had 25 GB reserved-
-   # but-unallocated i.e. fragmented, couldn't find a contiguous 15 GB
-   # block). --recompute-granularity full doesn't help this because it
-   # only recomputes transformer layers, not the loss-side vocab head.
-   # CP=2 shards along seq dim, halving per-rank loss compute to
-   # 27917 tokens × vocab_size/TP=4 × 4 bytes ≈ 4.2 GB (fits comfortably).
-   --tensor-model-parallel-size 4
+   # replication → avoids the megatron _apply_output_gate shape bug that
+   # trips at TP > num_query_groups.
+   # CP=2: split seq dim across 2 ranks (ring attention). Halves per-rank
+   # activation memory. Needed for 9B (hidden=4096) — with CP=1, the
+   # 15+ GB fp32 softmax alloc during ref forward would leave too little
+   # headroom even after our clear_memory() defrag. CP=2 drops the peak
+   # transient to ~7 GB per rank.
+   --tensor-model-parallel-size "${TRAIN_TP}"
    --sequence-parallel
    --pipeline-model-parallel-size 1
-   --context-parallel-size 2
+   --context-parallel-size "${TRAIN_CP}"
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 2
    --use-dynamic-batch-size
-   # max-tokens-per-gpu: 48k tokens per microbatch per DP rank (was 32k after
-   # the CP=1→CP=2 fix). Empirical peak used_GB on 293928 was 22.58 GB out of
-   # 79.25 GB (28.5% util) with 32k; ~56 GB free. 48k = 1.5x should push
-   # peak to ~30-35 GB, still well within budget. Larger microbatch = fewer
-   # microbatch iterations per training step = less framework overhead.
-   --max-tokens-per-gpu 49152
+   # max-tokens-per-gpu: 32k tokens per microbatch (per DP-rank). Oversized
+   # single samples (>32k) still get their own microbatch via first_fit_pack;
+   # this cap just makes shorter samples pack tighter to further trim vocab
+   # head peak per microbatch on the 9B.
+   --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
 )
+
+# Optional: chunked vocab-head log-prob/entropy computation (token-dim chunking
+# in get_log_probs_and_entropy -> calculate_log_probs_and_entropy). Splits the
+# [T, V=248320] fp32 logits along the token dim into ceil(T/N) blocks so the
+# log_softmax + backward intermediates peak at ~[N, V/TP] instead of [T, V/TP].
+# Directly trims the actor-backward vocab-head peak (does NOT shrink the input
+# logits tensor itself). BC_LOGPROBS_CHUNK=N sets --log-probs-chunk-size N;
+# unset = off (slime default -1 = whole [T,V] at once). Applies to both the
+# ref/old log-prob forward AND the actor training loss (policy_loss_function).
+if [[ -n "${BC_LOGPROBS_CHUNK:-}" ]]; then
+    [[ "${BC_LOGPROBS_CHUNK}" =~ ^[1-9][0-9]*$ ]] || {
+        echo "ERROR: BC_LOGPROBS_CHUNK must be a positive integer, got ${BC_LOGPROBS_CHUNK}" >&2
+        exit 1
+    }
+    PERF_ARGS+=(--log-probs-chunk-size "${BC_LOGPROBS_CHUNK}")
+    echo "[head] log-probs-chunk-size=${BC_LOGPROBS_CHUNK}"
+fi
 
 GRPO_ARGS=(
    --advantage-estimator grpo
@@ -425,7 +457,7 @@ GRPO_ARGS=(
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
-   # Truncated Importance Sampling. See run_qwen3p5_4B.sh for rationale.
+   # Truncated Importance Sampling. See run_qwen3p5_4B_colocate.sh for rationale.
    --use-tis
    --tis-clip 2.0
    --tis-clip-low 0.0
@@ -443,25 +475,14 @@ OPTIMIZER_ARGS=(
 SGLANG_ARGS=(
    # Colocate: sglang engines run on the same 64 GPUs as the training actor.
    # Slime offloads actor weights to CPU during rollout and re-onloads before
-   # training. Engine TP=2 → 64/2 = 32 sglang engines running concurrently.
-   # 4B model at 64k context: KV cache per max-length request ~4.7 GB, so per
-   # engine (2 GPU, ~126 GB free HBM) can hold ~50 concurrent max-len requests
-   # — vast headroom vs BC+ per-engine load of ~8 concurrent. Prior TP=4 was
-   # over-sharded: same aggregate bandwidth but half the engine count, so
-   # per-engine concurrency capacity was under-utilized and rollout was the
-   # main bottleneck (wait_time_ratio ~48%). Actor keeps TP=4 (Megatron topo
-   # unchanged); slime's colocate weight update all-gathers actor's TP=4
-   # shards to full HF tensor, then IPC-distributes to sglang's TP=2 engines
-   # — no manual reshape needed. Precedent: examples/retool/retool_qwen3_4b_rl.sh
-   # (same model size, uses TP=2), examples/on_policy_distillation/run-qwen3-8B-opd.sh
-   # (actor_tp=2 vs sglang_tp=1).
-   --rollout-num-gpus-per-engine 2
+   # training. Engine TP=4 → 64/4 = 16 sglang engines running concurrently.
+   --rollout-num-gpus-per-engine "${SGLANG_TP}"
    --sglang-mem-fraction-static 0.7
-   # Disable custom all-reduce. In colocate mode, torch_memory_saver's CUDA
-   # VMM allocations are incompatible with sglang's custom_all_reduce.cuh
-   # (which relies on cudaIpcGetMemHandle for cross-rank shared memory). NCCL
-   # fallback is slightly slower on small reductions but works. This applies
-   # at any TP > 1.
+   # Disable custom all-reduce. sglang's custom_all_reduce.cuh path fails
+   # CUDA graph capture with "CUDA error: invalid argument" at TP=4 on our
+   # A100 nodes (retool 4B RL uses TP=2 and does not hit it). Falling back
+   # to NCCL for intra-TP reduce is slightly slower on small sizes but
+   # avoids the crash entirely; the 4B canonical script also sets this.
    --sglang-disable-custom-all-reduce
 )
 
@@ -485,13 +506,12 @@ CUSTOM_ARGS=(
    --rollout-data-postprocess-path   examples.supo_browsecomp.generate_with_bcplus.dump_rollout_data_postprocess
 )
 
-# When dumping is enabled, force slime to run the pre-training forward pass
-# that populates rollout_data["log_probs"] (train_old). See run_qwen3p5_4B.sh
-# comments for why can_reuse_log_probs_in_loss otherwise skips it.
+# When dumping is enabled, dump trajectories. train_old log_probs are opt-in
+# via BCPLUS_DUMP_TRAIN_OLD (empty/0/false = off): only then do we add
+# --dump-train-old-log-prob, which forces the pre-training forward pass that
+# populates rollout_data["log_probs"]. See run_qwen3p5_4B_colocate.sh comments for why
+# can_reuse_log_probs_in_loss otherwise skips it.
 if [[ -n "${BCPLUS_DUMP_DIR:-}" ]]; then
-    # train_old log_probs are opt-in via BCPLUS_DUMP_TRAIN_OLD (empty/0/false =
-    # off): only then add --dump-train-old-log-prob to force the pre-training
-    # forward pass. Otherwise trajectories dump without train_old (null column).
     case "$(printf '%s' "${BCPLUS_DUMP_TRAIN_OLD:-}" | tr '[:upper:]' '[:lower:]')" in
         ""|0|false) : ;;
         *) CUSTOM_ARGS+=(--dump-train-old-log-prob) ;;
@@ -508,111 +528,6 @@ fi
 COLOCATE_ARGS=(
    --colocate
 )
-
-# ----------------------------------------------------------------------------
-# Eval-only mode (opt-in via BC_EVAL_MODE=1; no-op otherwise).
-#
-# Reuses the ENTIRE training config above (model / sglang / custom generate +
-# reward + judge / colocate), and only flips to slime's eval-only path:
-#   * --num-rollout 0 + --eval-interval 1 -> train.py runs ONE eval at rollout 0
-#     then exits (train.py:36-37). argparse "last wins" makes the appended
-#     --num-rollout 0 override ROLLOUT_ARGS' --num-rollout ${BC_NUM_ROLLOUT}.
-#   * --eval-prompt-data feeds the 150-question BC+ test set. eval inherits
-#     input/label/metadata keys + temperature + max_response_len + custom_rm
-#     from the training args via slime/utils/eval_config.py fallbacks, and the
-#     eval path dispatches to args.custom_generate_function_path (our multi-turn
-#     ReAct generate) via sglang_rollout.py:251 — same search + judge as train.
-#   * --dump-details writes <dir>/rollout_data/eval_0.pt with every eval Sample
-#     (token ids + decoded response + reward + _bcplus metadata) — no HF
-#     conversion needed: actor.update_weights() (train.py:27) syncs the loaded
-#     megatron checkpoint into sglang BEFORE the eval runs.
-#
-# Legacy Slurm eval is driven by eval/legacy/slurm/run_qwen3p5_4B_eval.sh:
-#   BC_EVAL_LOAD  = <run>/iter_0000NN (host path) to eval that iter, or
-#                 = "base"/"" -> no --load (base weights from --hf-checkpoint)
-#   BC_EVAL_N     = --n-samples-per-eval-prompt (default 4)
-#   EVAL_DUMP_DIR = host dir for the eval dump (auto host->/genai_hh remapped)
-#
-# Checkpoint selection is ELEGANT: point --load at the RUN dir (it has the
-# latest_checkpointed_iteration.txt tracker) and pass --ckpt-step N — megatron
-# overrides the tracker's iteration with args.ckpt_step (checkpointing.py:215,
-# 1188). No per-iter tracker files / symlink dirs needed. Two consequences we
-# handle here:
-#   * --ckpt-step is applied to EVERY checkpoint load (actor AND ref), so eval
-#     runs WITHOUT a reference model — drop --use-kl-loss (=> with_ref=False,
-#     placement_group.py:178) and don't pass --ref-load. Ref/KL are unused in eval.
-#   * a trained checkpoint carries optimizer+scheduler state whose total-iters
-#     (e.g. 5120) would clash with our dummy --lr-decay-iters 1 and trip
-#     `OptimizerParamScheduler ... do not match`. --no-load-optim/--no-load-rng
-#     load ONLY model weights (eval needs no optimizer), sidestepping that.
-# ----------------------------------------------------------------------------
-EVAL_ARGS=()
-if [[ "${BC_EVAL_MODE:-}" == "1" ]]; then
-    : "${EVAL_DUMP_DIR:?BC_EVAL_MODE=1 requires EVAL_DUMP_DIR}"
-    # Host -> container path remap (same idiom as BCPLUS_DUMP_DIR above).
-    if [[ "${EVAL_DUMP_DIR}" == /genai/fsx-project/hhzhang01/* ]]; then
-        EVAL_DUMP_DIR="${EVAL_DUMP_DIR/#\/genai\/fsx-project\/hhzhang01/\/genai_hh}"
-    fi
-
-    EVAL_ARGS=(
-        --num-rollout 0
-        --eval-interval 1
-        --eval-prompt-data bcplus_test "${TEST_DATA}"
-        --n-samples-per-eval-prompt "${BC_EVAL_N:-4}"
-        --dump-details "${EVAL_DUMP_DIR}"
-        # num-rollout 0 makes train_iters=0 (model.py:204), which would zero the
-        # LR-decay schedule and trip `assert lr_decay_steps > 0` in megatron's
-        # OptimizerParamScheduler when the (unused) optimizer is still BUILT.
-        --lr-decay-iters 1
-    )
-
-    # Actor checkpoint: --load <run> + --ckpt-step N selects the iter (no ref, no
-    # symlink view dirs). base = --hf-checkpoint only (no --load / --ckpt-step).
-    NEW_CKPT_ARGS=(--hf-checkpoint "${HF_CKPT_HOST}")
-    if [[ -n "${BC_EVAL_LOAD:-}" && "${BC_EVAL_LOAD}" != "base" ]]; then
-        RUN_DIR="$(dirname "${BC_EVAL_LOAD%/}")"
-        ITER_NAME="$(basename "${BC_EVAL_LOAD%/}")"
-        if [[ ! "${ITER_NAME}" =~ ^iter_[0-9]{7}$ ]]; then
-            echo "[eval] ERROR: BC_EVAL_LOAD must end in iter_NNNNNNN or be 'base', got ${BC_EVAL_LOAD}" >&2
-            exit 1
-        fi
-        CKPT_STEP=$((10#${ITER_NAME#iter_}))
-        if [[ "${RUN_DIR}" == /genai/fsx-project/hhzhang01/* ]]; then
-            RUN_DIR="${RUN_DIR/#\/genai\/fsx-project\/hhzhang01/\/genai_hh}"
-        fi
-        # --no-load-optim/--no-load-rng: load ONLY model weights (a trained
-        # checkpoint's optimizer/scheduler total-iters would clash with the dummy
-        # --lr-decay-iters 1). Only in the iter branch: base has no --load, and
-        # --no-load-optim without --load trips `assert args.load is not None ...`.
-        NEW_CKPT_ARGS+=(--load "${RUN_DIR}" --ckpt-step "${CKPT_STEP}" --no-load-optim --no-load-rng)
-        echo "[eval] loading iter ${CKPT_STEP}: --load ${RUN_DIR} --ckpt-step ${CKPT_STEP}"
-    else
-        # base = untrained model. It still needs a --load: slime asserts
-        # args.load/pretrained_checkpoint in setup_model_and_optimizer (model.py:292),
-        # and with no ref model there is otherwise no checkpoint source. Load the
-        # base torch_dist (a release checkpoint = same base weights as --hf-checkpoint).
-        NEW_CKPT_ARGS+=(--load "${REF_LOAD_HOST}" --no-load-optim --no-load-rng)
-        echo "[eval] base model via --load ${REF_LOAD_HOST} (base torch_dist release)"
-    fi
-    CKPT_ARGS=("${NEW_CKPT_ARGS[@]}")
-
-    # No reference model in eval: args.ckpt_step is global (would also hit the ref
-    # load and break it). Dropping --use-kl-loss => with_ref=False, so no ref is
-    # created/loaded. KL/ref are unused in eval anyway.
-    GRPO_ARGS=(--advantage-estimator grpo)
-
-    # Drop the training-only rollout-data dump hook (fires during train() only)
-    # and --dump-train-old-log-prob (no training step in eval). Keep the custom
-    # generate + reward + reward-post + rollout-log hooks (eval uses all of them).
-    CUSTOM_ARGS=(
-        --custom-generate-function-path examples.supo_browsecomp.generate_with_bcplus.generate
-        --custom-rm-path                 examples.supo_browsecomp.generate_with_bcplus.reward_func
-        --reward-key score
-        --custom-reward-post-process-path examples.supo_browsecomp.generate_with_bcplus.reward_post_process
-        --custom-rollout-log-function-path examples.supo_browsecomp.generate_with_bcplus.log_bcplus
-    )
-    echo "[eval] BC_EVAL_MODE=1 -> eval-only (no ref), n=${BC_EVAL_N:-4}, dump -> ${EVAL_DUMP_DIR}"
-fi
 
 # ---- Start ray head, publish IP, wait for workers ----
 export MASTER_ADDR="${MY_IP}"
@@ -657,9 +572,8 @@ RUNTIME_ENV_JSON="{
 # run with expandable_segments, throwing:
 #   RuntimeError: TorchMemorySaver is disabled for the current process
 #   because expandable_segments is not supported yet.
-# The 4B canonical script sets expandable_segments because it uses external
-# sglang and does not activate torch_memory_saver. In colocate mode the two
-# are mutually exclusive.
+# Colocate mode uses torch_memory_saver, so expandable segments and this
+# launcher are mutually exclusive.
 
 # Submit training job. Blocks until run finishes (num_rollout iters done).
 ray job submit --address="http://127.0.0.1:8265" \
@@ -677,7 +591,6 @@ ray job submit --address="http://127.0.0.1:8265" \
    "${SGLANG_ARGS[@]}" \
    "${MISC_ARGS[@]}" \
    "${CUSTOM_ARGS[@]}" \
-   "${EVAL_ARGS[@]}" \
    "${COLOCATE_ARGS[@]}"
 
 TRAIN_STATUS=$?
@@ -686,7 +599,7 @@ echo "[head] ray job submit returned status=${TRAIN_STATUS}"
 # Disable errexit for the tail cleanup. Long-running training on FSx-mounted
 # /slime can leave the NFS session stale; when bash tries to read the next
 # script line after ray job submit returns, it can fail with:
-#   /slime/examples/.../run_qwen3p5_4B_colocate.sh: error reading input file:
+#   /slime/examples/.../run_qwen3p5_9B_colocate.sh: error reading input file:
 #     Stale file handle
 # Under `set -e` that immediately trips exit 2 even though training itself
 # succeeded (ray job returned status=0). Downgrading errexit here lets the

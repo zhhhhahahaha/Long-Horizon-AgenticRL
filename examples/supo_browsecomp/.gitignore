@@ -1,0 +1,2 @@
+# Ad-hoc probe / scratch scripts (kept on disk, not tracked).
+_probe_*.py

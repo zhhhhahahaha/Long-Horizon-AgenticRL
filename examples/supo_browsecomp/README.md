@@ -37,23 +37,26 @@ This is a **pipeline-first** port:
 - `summary_advantage.py` — expands each rollout's normalized GRPO signal over
   response tokens and assigns a fixed negative advantage only to malformed
   compression-generation turns (thinking plus summary output).
-- `run_qwen3p5_4B_colocate.sh` — the live launcher for the full 8-node run
+- `aws/run_qwen3p5_4B_colocate.sh` — the live launcher for the full 8-node run
   (64 GPU, colocate: sglang shares the training GPUs in a single srun).
   Two-part (login pod → in-container). Auto-ensures the search server (see
   below), then submits training. Training QOS defaults to
   `a100_genai_interns_high`; the search server runs on `SEARCH_QOS` (default
-  `a100_dev`). `run_qwen3p5_9B_colocate.sh` is the 9B sibling. For a quick
+  `a100_dev`). `aws/run_qwen3p5_9B_colocate.sh` is the 9B sibling. For a quick
   1-node dump smoke, see `debug_scripts/run_qwen3p5_4B_1node_dumpsmoke.sh`.
-- `launch_search_server.sh` — idempotent orchestrator that sbatch's a
+- `aws/search/launch_search_server.sh` — idempotent orchestrator that sbatch's a
   long-lived (7-day, 1 GPU) retrieval server on `a100_dev`, waits for
   `/health`, and writes the resolved `host:port` to the hostname file. Reuses
   an existing job if its remaining walltime is `>= MIN_HOURS_REMAINING`
   (default 48h); otherwise scancels + resubmits so a training job doesn't
-  outlive its search server. `run_qwen3p5_4B_colocate.sh` calls this
+  outlive its search server. `aws/run_qwen3p5_4B_colocate.sh` calls this
   automatically (you can also run it standalone).
 
 ## Operations and evaluation
 
+- [`aws/README.md`](aws/README.md) indexes the AWS/Slurm launchers: the 8-node
+  colocate trainers, the search-server orchestrator, and the one-shot HF→mcore
+  conversion.
 - [`mast/README.md`](mast/README.md) indexes the current MAST training, search,
   checkpoint-evaluation, checkpoint-slimming, and W&B workflows.
 - [`mast/eval/README.md`](mast/eval/README.md) is the operational runbook for
@@ -74,7 +77,7 @@ The retrieval corpus + embeddings need ~4 GB and the embedding model ~8 GB. One
 
 **Preferred (scripted, idempotent)** — from the login pod:
 ```bash
-bash /home/hhzhang01/slime/examples/supo_browsecomp/launch_search_server.sh
+bash /home/hhzhang01/slime/examples/supo_browsecomp/aws/search/launch_search_server.sh
 ```
 This sbatch's a `--time=7-00:00:00` `--gpus=1` job on partition `a100`, waits
 until `/health` is 200, and writes `<host>:<port>` to
@@ -168,7 +171,7 @@ Already staged: `/genai/fsx-project/hhzhang01/datasets/BC+/{bc_train,bc_test}.pa
 **One command** — after the Prerequisites are done:
 ```bash
 export LLAMA_API_KEY="LLM|..."
-bash /home/hhzhang01/slime/examples/supo_browsecomp/run_qwen3p5_4B_colocate.sh
+bash /home/hhzhang01/slime/examples/supo_browsecomp/aws/run_qwen3p5_4B_colocate.sh
 ```
 This auto-ensures the search server is up (with enough runway, on `a100_dev`),
 submits the 8-node training srun (QOS `a100_genai_interns_high`), and syncs
@@ -253,7 +256,7 @@ ensure step entirely:
 ```bash
 export LOCAL_SEARCH_URL="http://<search-node>:8000"
 export LLAMA_API_KEY="LLM|..."
-bash /home/hhzhang01/slime/examples/supo_browsecomp/run_qwen3p5_4B_colocate.sh
+bash /home/hhzhang01/slime/examples/supo_browsecomp/aws/run_qwen3p5_4B_colocate.sh
 ```
 
 **1-node dump smoke** — quick end-to-end check (dump on, train_old off):
@@ -284,7 +287,7 @@ bash /home/hhzhang01/slime/examples/supo_browsecomp/debug_scripts/run_qwen3p5_4B
 
 ## Scaling from smoke to real runs
 
-- **9B move**: use `run_qwen3p5_9B_colocate.sh`. Its candidate starting topology
+- **9B move**: use `aws/run_qwen3p5_9B_colocate.sh`. Its candidate starting topology
   is Megatron TP=4/CP=2, SGLang TP=4, and `--max-tokens-per-gpu=32768`; these
   knobs remain experimental because one oversized sub-traj can exceed the
   packing target. For MAST,

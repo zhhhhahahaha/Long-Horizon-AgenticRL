@@ -10,7 +10,7 @@
 #   * Enroot rootfs `slime-test` available (same as the training runs)
 #
 # Usage:
-#   bash examples/supo_browsecomp/convert_qwen3p5_9B.sh
+#   bash examples/supo_browsecomp/aws/convert_qwen3p5_9B.sh
 
 set -euo pipefail
 
@@ -45,7 +45,7 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
                 --mount /genai/fsx-project/hhzhang01:/genai_hh \
                 --env SLIME_INNER=1 \
                 ${ENROOT_ROOTFS} \
-                bash /slime/examples/supo_browsecomp/convert_qwen3p5_9B.sh
+                bash /slime/examples/supo_browsecomp/aws/convert_qwen3p5_9B.sh
         "
 fi
 

@@ -153,7 +153,7 @@ for attempt in \$(seq 1 6); do
         --env BC_ROLLOUT_BATCH_SIZE='${BC_ROLLOUT_BATCH_SIZE}' \
         --env BC_GLOBAL_BATCH_SIZE='${BC_GLOBAL_BATCH_SIZE}' \
         ${ENROOT_ROOTFS} \
-        bash /slime/examples/supo_browsecomp/run_qwen3p5_4B_colocate.sh 2>&1 | tee "\${ATTEMPT_LOG}"
+        bash /slime/examples/supo_browsecomp/aws/run_qwen3p5_4B_colocate.sh 2>&1 | tee "\${ATTEMPT_LOG}"
     rc=\${PIPESTATUS[0]}
     if [ -f "\${DUMP_CHECK}" ]; then
         echo "[eval-node] dump present -> success (enroot rc=\${rc})"; rm -f "\${ATTEMPT_LOG}"; break
