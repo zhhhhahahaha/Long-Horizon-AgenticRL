@@ -66,6 +66,29 @@ require_positive_integer BC_NUM_ROLLOUT
 require_positive_integer BC_ROLLOUT_BATCH_SIZE
 require_positive_integer BC_N_SAMPLES
 require_positive_integer BC_GLOBAL_BATCH_SIZE
+if [[ -v BC_LOG_PROBS_CHUNK_SIZE ]]; then
+  require_positive_integer BC_LOG_PROBS_CHUNK_SIZE
+fi
+if [[ -v BC_SGLANG_MEM_FRACTION_STATIC && ! "${BC_SGLANG_MEM_FRACTION_STATIC}" =~ ^(0\.[0-9]*[1-9][0-9]*|1(\.0+)?)$ ]]; then
+  fail "BC_SGLANG_MEM_FRACTION_STATIC must be in (0, 1], got: ${BC_SGLANG_MEM_FRACTION_STATIC}"
+fi
+if [[ -v BC_SLIM_INTERMEDIATE_CHECKPOINTS ]]; then
+  case "$(printf '%s' "${BC_SLIM_INTERMEDIATE_CHECKPOINTS}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|0|false) ;;
+    *) fail "BC_SLIM_INTERMEDIATE_CHECKPOINTS must be one of: 1, true, 0, false" ;;
+  esac
+fi
+if [[ -v BC_OVERRIDE_OPT_PARAM_SCHEDULER ]]; then
+  case "$(printf '%s' "${BC_OVERRIDE_OPT_PARAM_SCHEDULER}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|0|false) ;;
+    *) fail "BC_OVERRIDE_OPT_PARAM_SCHEDULER must be one of: 1, true, 0, false" ;;
+  esac
+fi
+if [[ -v BC_RUN_NAME ]]; then
+  [[ -n "${BC_RUN_NAME}" ]] || fail "BC_RUN_NAME must not be empty"
+  [[ "${BC_RUN_NAME}" =~ ^[A-Za-z0-9._-]+$ && "${BC_RUN_NAME}" != "." && "${BC_RUN_NAME}" != ".." ]] || \
+    fail "invalid BC_RUN_NAME: ${BC_RUN_NAME}"
+fi
 [[ "${MAST_JOB_NAME}" =~ ^[A-Za-z0-9._-]+$ ]] || fail "invalid MAST_JOB_NAME: ${MAST_JOB_NAME}"
 
 MAST_RL_CLI="${MAST_RL_CLI:-/data/users/hhzhang01/fbsource/genai/msl/rl/cli.sh}"
@@ -103,12 +126,20 @@ if ((CONFIGURED_ASSIGNED_RANKS != EXPECTED_ASSIGNED_RANKS)); then
 fi
 
 export BC_EXPECTED_NUM_NODES="${MAST_NUM_NODES}"
+if [[ -n "${BC_RUN_NAME:-}" ]]; then
+  # The trainer publishes W&B snapshots under the resumed logical run name,
+  # while the watcher must query the newly submitted MAST job's status.
+  export MAST_WANDB_RUN_NAME="${BC_RUN_NAME}"
+fi
 TRAIN_ENV_VARS=(
   BC_EXPECTED_NUM_NODES
+  BC_RUN_NAME
   BC_MODEL_SIZE BC_NUM_ROLLOUT BC_ROLLOUT_BATCH_SIZE BC_N_SAMPLES
   BC_GLOBAL_BATCH_SIZE BC_MAX_RESPONSE_LEN BC_MAX_CONTEXT_LEN
   BC_TP BC_CP BC_SGLANG_TP BC_MAX_TOKENS_PER_GPU
-  BC_SAVE_INTERVAL BC_DUMP_ROLLOUT BC_WANDB_PROJECT
+  BC_LOG_PROBS_CHUNK_SIZE BC_SGLANG_MEM_FRACTION_STATIC
+  BC_SAVE_INTERVAL BC_SLIM_INTERMEDIATE_CHECKPOINTS BC_OVERRIDE_OPT_PARAM_SCHEDULER
+  BC_DUMP_ROLLOUT BC_WANDB_PROJECT
   BCPLUS_MAX_TURNS BCPLUS_COMPRESS_THRESH BCPLUS_MAX_SUB_TRAJS
   BCPLUS_COMPRESS_PENALTY BCPLUS_DUMP_TRAIN_OLD
   BCPLUS_JUDGE_MODEL BCPLUS_JUDGE_BASE_URL

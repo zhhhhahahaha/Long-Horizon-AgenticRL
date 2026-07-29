@@ -38,7 +38,24 @@ export no_proxy="127.0.0.1,localhost,::1" NO_PROXY="127.0.0.1,localhost,::1"
 SLIME=/slime-src
 D=/mnt/wsfuse/hhzhang01/supo-data
 STAGE=/mnt/wsfuse/hhzhang01/supo-slime
-RUN_NAME="${RUN_NAME:-${MAST_HPC_JOB_NAME:-supo-bcplus-mast-local}}"
+RUN_NAME="${BC_RUN_NAME:-${RUN_NAME:-${MAST_HPC_JOB_NAME:-supo-bcplus-mast-local}}}"
+if [[ ! "${RUN_NAME}" =~ ^[A-Za-z0-9._-]+$ || "${RUN_NAME}" == "." || "${RUN_NAME}" == ".." ]]; then
+  echo "ERROR: invalid checkpoint run name: ${RUN_NAME}" >&2
+  exit 1
+fi
+if [[ -n "${BC_RUN_NAME:-}" ]]; then
+  RESUME_TRACKER="${STAGE}/checkpoints/${RUN_NAME}/latest_checkpointed_iteration.txt"
+  if [[ ! -f "${RESUME_TRACKER}" ]]; then
+    echo "ERROR: BC_RUN_NAME requests resume from ${RUN_NAME}, but ${RESUME_TRACKER} does not exist" >&2
+    exit 1
+  fi
+  RESUME_ITERATION="$(tr -d '[:space:]' < "${RESUME_TRACKER}")"
+  if [[ ! "${RESUME_ITERATION}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: invalid checkpoint tracker in ${RESUME_TRACKER}: ${RESUME_ITERATION}" >&2
+    exit 1
+  fi
+  echo "[trainer] explicit resume run=${RUN_NAME} tracker=${RESUME_ITERATION}"
+fi
 cd "${SLIME}"
 
 # --------------------------- LLAMA_API_KEY (judge) --------------------------
@@ -95,7 +112,11 @@ fi
 pkill -9 sglang 2>/dev/null || true; sleep 2
 ray stop --force 2>/dev/null || true; pkill -9 python 2>/dev/null || true; sleep 2
 
-COORD_DIR="${STAGE}/ray-coord/${MAST_HPC_JOB_NAME:-supo-local}"
+TRAINER_ATTEMPT_ID="${MAST_HPC_JOB_ATTEMPT_INDEX:-0}-${MAST_HPC_TASK_GROUP_ATTEMPT_EPOCH:-0}"
+# A task-group retry keeps MAST_HPC_JOB_NAME but starts a different Ray head.
+# Isolate coordination by attempt so an early worker cannot read the previous
+# attempt's head.ip or DONE marker while the new head is still starting.
+COORD_DIR="${STAGE}/ray-coord/${MAST_HPC_JOB_NAME:-supo-local}/attempt-${TRAINER_ATTEMPT_ID}"
 HEAD_IP_FILE="${COORD_DIR}/head.ip"
 DONE_FILE="${COORD_DIR}/done"
 
@@ -137,7 +158,7 @@ echo "[trainer] NCCL/GLOO OOB iface -> ${NCCL_OOB_IFNAME} (frontend; TW_TASK_ASS
 # same path on its own host-local /tmp. Each task publishes immutable tar
 # snapshots into a task-specific OILFS directory; the devserver watcher extracts
 # those snapshots to local disk before running `wandb sync`.
-WANDB_ATTEMPT_ID="${MAST_HPC_JOB_ATTEMPT_INDEX:-0}-${MAST_HPC_TASK_GROUP_ATTEMPT_EPOCH:-0}"
+WANDB_ATTEMPT_ID="${TRAINER_ATTEMPT_ID}"
 WANDB_DIR="${MAST_WANDB_LOCAL_DIR:-/tmp/slime-wandb/${RUN_NAME}/attempt-${WANDB_ATTEMPT_ID}}"
 WANDB_PUBLISHER_DIR="${STAGE}/wandb-snapshots/${RUN_NAME}/attempt-${WANDB_ATTEMPT_ID}-task-${TW_TASK_ID:-0}"
 WANDB_SNAPSHOT_SCRIPT="${SLIME}/examples/supo_browsecomp/mast/wandb_snapshot.sh"
@@ -189,10 +210,9 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # ----- worker branch (multi-node only): join ray, wait for DONE -----
-# Robust against COORD_DIR staleness across retries (same MAST_HPC_JOB_NAME reuses
-# COORD_DIR): the head clears COORD_DIR + rewrites head.ip fresh each attempt, and
-# this worker RE-READS head.ip and RETRIES the join if it fails (e.g. it read a
-# stale head.ip pointing at a dead head, or the head's ray isn't up yet).
+# COORD_DIR is attempt-specific, and the worker still re-reads head.ip and retries
+# transient join failures. Keep a timeout around ray start: without it, an
+# unreachable GCS can wait forever and the retry loop never advances.
 if [[ "${IS_HEAD}" = "0" ]]; then
   joined=0
   for attempt in $(seq 1 120); do          # up to ~20 min of pull-skew + retries
@@ -201,11 +221,12 @@ if [[ "${IS_HEAD}" = "0" ]]; then
     [[ -z "${HEAD_IP}" ]] && { sleep 10; continue; }
     echo "[worker ${MYHOST}] attempt ${attempt}: joining ray at [${HEAD_IP}]:6379"
     ray stop --force 2>/dev/null || true
-    if ray start --address="[${HEAD_IP}]:6379" --num-gpus 8 \
+    if timeout --signal=TERM --kill-after=10s 90s \
+         ray start --address="[${HEAD_IP}]:6379" --num-gpus 8 \
          --node-ip-address "${MASTER_ADDR}" --disable-usage-stats; then
       joined=1; break
     fi
-    echo "[worker ${MYHOST}] join failed (stale head.ip or head not up yet); retrying"
+    echo "[worker ${MYHOST}] join failed or timed out; retrying with current head.ip"
     sleep 10
   done
   [[ "${joined}" = "1" ]] || { echo "ERROR: worker never joined ray" >&2; exit 1; }
@@ -215,9 +236,7 @@ if [[ "${IS_HEAD}" = "0" ]]; then
 fi
 
 # --------------------------- head branch: config + submit -------------------
-# Clear any stale coord state from a previous attempt (retries reuse COORD_DIR)
-# BEFORE starting ray/writing a fresh head.ip, so workers never latch onto a dead
-# head or an old DONE. Only the head touches COORD_DIR after this point.
+# Clean this attempt's namespace before starting Ray and publishing head.ip.
 rm -rf "${COORD_DIR}" 2>/dev/null || true
 mkdir -p "${COORD_DIR}"
 
@@ -253,6 +272,8 @@ TRAIN_TP="${BC_TP:-4}"
 TRAIN_CP="${BC_CP:-2}"
 MAX_TOKENS_PER_GPU="${BC_MAX_TOKENS_PER_GPU:-${DEFAULT_MAX_TOKENS_PER_GPU}}"
 SGLANG_TP="${BC_SGLANG_TP:-${DEFAULT_SGLANG_TP}}"
+LOG_PROBS_CHUNK_SIZE="${BC_LOG_PROBS_CHUNK_SIZE:-}"
+SGLANG_MEM_FRACTION_STATIC="${BC_SGLANG_MEM_FRACTION_STATIC:-0.7}"
 for value_name in TRAIN_TP TRAIN_CP SGLANG_TP MAX_TOKENS_PER_GPU; do
   value="${!value_name}"
   [[ "${value}" =~ ^[1-9][0-9]*$ ]] || {
@@ -260,6 +281,14 @@ for value_name in TRAIN_TP TRAIN_CP SGLANG_TP MAX_TOKENS_PER_GPU; do
     exit 1
   }
 done
+if [[ -n "${LOG_PROBS_CHUNK_SIZE}" && ! "${LOG_PROBS_CHUNK_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: LOG_PROBS_CHUNK_SIZE must be a positive integer, got ${LOG_PROBS_CHUNK_SIZE}" >&2
+  exit 1
+fi
+if [[ ! "${SGLANG_MEM_FRACTION_STATIC}" =~ ^(0\.[0-9]*[1-9][0-9]*|1(\.0+)?)$ ]]; then
+  echo "ERROR: SGLANG_MEM_FRACTION_STATIC must be in (0, 1], got ${SGLANG_MEM_FRACTION_STATIC}" >&2
+  exit 1
+fi
 TOTAL_GPUS=$((NNODES * 8))
 MODEL_PARALLEL_SIZE=$((TRAIN_TP * TRAIN_CP))
 (( TOTAL_GPUS % MODEL_PARALLEL_SIZE == 0 )) || {
@@ -276,7 +305,7 @@ fi
 if [[ "${BC_MODEL_SIZE}" == "9B" && ( "${TRAIN_CP}" != "2" || "${SGLANG_TP}" != "4" ) ]]; then
   echo "[head] WARN: non-default 9B topology CP=${TRAIN_CP} SGLANG_TP=${SGLANG_TP}; validate memory and throughput before a full run" >&2
 fi
-echo "[head] model=${BC_MODEL_SIZE} candidate topology: config=${MODEL_CONFIG} TP=${TRAIN_TP} CP=${TRAIN_CP} DP=$((TOTAL_GPUS / MODEL_PARALLEL_SIZE)) SGLANG_TP=${SGLANG_TP} max_tokens_per_gpu=${MAX_TOKENS_PER_GPU}"
+echo "[head] model=${BC_MODEL_SIZE} candidate topology: config=${MODEL_CONFIG} TP=${TRAIN_TP} CP=${TRAIN_CP} DP=$((TOTAL_GPUS / MODEL_PARALLEL_SIZE)) SGLANG_TP=${SGLANG_TP} max_tokens_per_gpu=${MAX_TOKENS_PER_GPU} log_probs_chunk_size=${LOG_PROBS_CHUNK_SIZE:-default} sglang_mem_fraction_static=${SGLANG_MEM_FRACTION_STATIC}"
 source "${MODEL_CONFIG}"
 
 CKPT_SAVE_DIR="${STAGE}/checkpoints/${RUN_NAME}"
@@ -285,14 +314,41 @@ CKPT_ARGS=(
    --hf-checkpoint "${HF_CHECKPOINT}"
    --ref-load      "${REF_CHECKPOINT}"
 )
+case "$(printf '%s' "${BC_SLIM_INTERMEDIATE_CHECKPOINTS:-0}" | tr '[:upper:]' '[:lower:]')" in
+   1|true) SLIM_INTERMEDIATE_CHECKPOINTS=1 ;;
+   ""|0|false) SLIM_INTERMEDIATE_CHECKPOINTS=0 ;;
+   *)
+      echo "ERROR: BC_SLIM_INTERMEDIATE_CHECKPOINTS must be one of: 1, true, 0, false" >&2
+      exit 2
+      ;;
+esac
 if [[ "${BC_SAVE_INTERVAL:-5}" == "0" ]]; then
+   if [[ "${SLIM_INTERMEDIATE_CHECKPOINTS}" == "1" ]]; then
+      echo "ERROR: rolling checkpoint slimming requires BC_SAVE_INTERVAL > 0" >&2
+      exit 2
+   fi
    echo "[head] checkpoint saving disabled (BC_SAVE_INTERVAL=0)"
 else
    mkdir -p "${CKPT_SAVE_DIR}"
    CKPT_ARGS+=(--save "${CKPT_SAVE_DIR}" --save-interval "${BC_SAVE_INTERVAL:-5}")
+   if [[ "${SLIM_INTERMEDIATE_CHECKPOINTS}" == "1" ]]; then
+      CKPT_ARGS+=(--slim-intermediate-checkpoints)
+      echo "[head] rolling checkpoint slimming enabled"
+   fi
    if [[ -f "${CKPT_SAVE_DIR}/latest_checkpointed_iteration.txt" ]]; then
       echo "[head] resuming from ${CKPT_SAVE_DIR}"
       CKPT_ARGS+=(--load "${CKPT_SAVE_DIR}")
+      case "$(printf '%s' "${BC_OVERRIDE_OPT_PARAM_SCHEDULER:-0}" | tr '[:upper:]' '[:lower:]')" in
+         1|true)
+            CKPT_ARGS+=(--override-opt-param-scheduler)
+            echo "[head] resume will override checkpoint optimizer scheduler configuration"
+            ;;
+         ""|0|false) : ;;
+         *)
+            echo "ERROR: BC_OVERRIDE_OPT_PARAM_SCHEDULER must be one of: 1, true, 0, false" >&2
+            exit 2
+            ;;
+      esac
    fi
 fi
 
@@ -339,6 +395,9 @@ PERF_ARGS=(
    --use-dynamic-batch-size
    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
 )
+if [[ -n "${LOG_PROBS_CHUNK_SIZE}" ]]; then
+   PERF_ARGS+=(--log-probs-chunk-size "${LOG_PROBS_CHUNK_SIZE}")
+fi
 
 GRPO_ARGS=(
    --advantage-estimator grpo
@@ -356,7 +415,7 @@ SGLANG_ARGS=(
    # SGLang TP is independent of Megatron TP: 4B uses 2 for more engines,
    # while 9B uses 4 for model/KV-cache headroom.
    --rollout-num-gpus-per-engine "${SGLANG_TP}"
-   --sglang-mem-fraction-static 0.7
+   --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC}"
    --sglang-disable-custom-all-reduce
 )
 

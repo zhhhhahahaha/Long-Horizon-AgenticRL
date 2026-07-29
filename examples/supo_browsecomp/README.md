@@ -52,6 +52,19 @@ This is a **pipeline-first** port:
   outlive its search server. `run_qwen3p5_4B_colocate.sh` calls this
   automatically (you can also run it standalone).
 
+## Operations and evaluation
+
+- [`mast/README.md`](mast/README.md) indexes the current MAST training, search,
+  checkpoint-evaluation, checkpoint-slimming, and W&B workflows.
+- [`mast/eval/README.md`](mast/eval/README.md) is the operational runbook for
+  evaluating complete or still-running MAST training runs, reusing base,
+  extending a batch with new checkpoints, monitoring jobs, and collecting
+  reports locally.
+- [`eval/README.md`](eval/README.md) defines the scheduler-independent metric,
+  artifact, summary-fallback, and checkpoint-load contracts.
+- [`eval/legacy/README.md`](eval/legacy/README.md) documents the retained older
+  Slurm and research-analysis pipeline. It is not the official metric path.
+
 ## Prerequisites
 
 ### 1. Search server (biggest external dep)

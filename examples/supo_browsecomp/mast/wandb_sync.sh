@@ -12,7 +12,8 @@ Usage:
 "once" performs one incremental sync. "watch" syncs every 5 minutes while
 MAST reports PENDING/RUNNING/SHUTTING_DOWN, then performs a final sync at
 COMPLETE/FAILED/DEAD. Snapshots are extracted to devserver-local disk before
-W&B reads them.
+W&B reads them. Set MAST_WANDB_RUN_NAME when snapshot storage uses a different
+logical run name, as it does when resuming an existing checkpoint namespace.
 Run watch in tmux so it survives disconnects.
 EOF
 }
@@ -34,13 +35,18 @@ if [[ $# -ne 2 ]]; then
 fi
 
 MODE="$1"
-RUN_NAME="$2"
+MAST_JOB_NAME="$2"
 case "${MODE}" in
   once|watch) ;;
   *) usage; exit 2 ;;
 esac
+if [[ ! "${MAST_JOB_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo "wandb_sync.sh: invalid MAST job name: ${MAST_JOB_NAME}" >&2
+  exit 2
+fi
+RUN_NAME="${MAST_WANDB_RUN_NAME:-${MAST_JOB_NAME}}"
 if [[ ! "${RUN_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
-  echo "wandb_sync.sh: invalid MAST job name: ${RUN_NAME}" >&2
+  echo "wandb_sync.sh: invalid W&B run name: ${RUN_NAME}" >&2
   exit 2
 fi
 
@@ -196,7 +202,7 @@ sync_once() {
 
 mast_state() {
   local response
-  if ! response="$("${WITH_PROXY_BIN}" "${MAST_BIN}" --output json get-status "${RUN_NAME}")"; then
+  if ! response="$("${WITH_PROXY_BIN}" "${MAST_BIN}" --output json get-status "${MAST_JOB_NAME}")"; then
     return 1
   fi
   printf '%s' "${response}" | "${JQ_BIN}" -er '.data.state | strings'
@@ -228,7 +234,7 @@ fi
 
 require_command "${MAST_BIN}"
 require_command "${JQ_BIN}"
-log "watching ${RUN_NAME}; interval=${SYNC_INTERVAL_SEC}s"
+log "watching MAST job=${MAST_JOB_NAME}; W&B run=${RUN_NAME}; interval=${SYNC_INTERVAL_SEC}s"
 while true; do
   state=""
   if state="$(mast_state)"; then

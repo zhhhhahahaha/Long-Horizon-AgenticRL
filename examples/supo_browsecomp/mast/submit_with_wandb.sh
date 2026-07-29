@@ -24,7 +24,8 @@ Usage:
 The submit form requires structured `rl/cli.sh mast --json` output. It submits
 the command unchanged, extracts `.job.job_name`, and starts the devserver-side
 W&B sync watcher in tmux. `watch-only` restores a missing watcher without
-submitting another job.
+submitting another job. Set MAST_WANDB_RUN_NAME when snapshots are stored under
+a logical run name different from the newly submitted MAST job name.
 EOF
 }
 
@@ -107,7 +108,7 @@ start_watcher() {
     WANDB_FINAL_SYNC_RETRIES WANDB_FINAL_SYNC_RETRY_INTERVAL_SEC \
     WANDB_SYNC_LOCK_DIR WANDB_SYNC_CACHE_DIR WANDB_PYTHON_BIN \
     MAST_WANDB_PRECREATE MAST_WANDB_PRECREATE_SCRIPT MAST_WANDB_ENTITY \
-    MAST_WANDB_PROJECT; do
+    MAST_WANDB_PROJECT MAST_WANDB_RUN_NAME; do
     if [[ -v "${optional_variable}" ]]; then
       append_export "${optional_variable}"
     fi
