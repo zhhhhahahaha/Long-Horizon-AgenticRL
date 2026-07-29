@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from argparse import Namespace
 from contextlib import nullcontext
 from datetime import timedelta
@@ -8,12 +9,19 @@ from pathlib import Path
 import ray
 import torch
 import torch.distributed as dist
+import torch.distributed.checkpoint as dist_cp
 from megatron.core import mpu
 from torch_memory_saver import torch_memory_saver
 from transformers import AutoConfig, AutoTokenizer
 
 from slime.ray.train_actor import TrainRayActor
 from slime.utils import train_dump_utils
+from slime.utils.checkpoint_rotation import (
+    CheckpointInfo,
+    RollingCheckpointManager,
+    directory_size,
+    sha256_file,
+)
 from slime.utils.data import process_rollout_data
 from slime.utils.distributed_utils import get_gloo_group
 from slime.utils.logging_utils import finish_tracking, init_tracking
@@ -94,6 +102,9 @@ class MegatronTrainRayActor(TrainRayActor):
         self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
             args, role
         )
+        self._rolling_checkpoint_manager = None
+        if self.args.slim_intermediate_checkpoints:
+            self._initialize_rolling_checkpoints(loaded_rollout_id)
 
         vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
         if vpp_size > 1:
@@ -199,6 +210,104 @@ class MegatronTrainRayActor(TrainRayActor):
         self.prof.on_init_end()
 
         return start_rollout_id
+
+    def _run_rank_zero_checkpoint_action(self, label: str, action):
+        payload = [None, None]
+        if dist.get_rank() == 0:
+            try:
+                payload[0] = action()
+            except BaseException as error:
+                payload[1] = f"{type(error).__name__}: {error}"
+        dist.broadcast_object_list(payload, src=0, group=get_gloo_group())
+        if payload[1] is not None:
+            raise RuntimeError(f"rolling checkpoint {label} failed: {payload[1]}")
+        return payload[0]
+
+    @staticmethod
+    def _inspect_rolling_checkpoint(path: Path) -> CheckpointInfo:
+        if not path.is_dir() or not (path / ".metadata").is_file() or not (path / "common.pt").is_file():
+            raise RuntimeError(f"checkpoint is incomplete: {path}")
+        metadata = dist_cp.FileSystemReader(str(path)).read_metadata()
+        distributed_keys = set(metadata.state_dict_metadata)
+        common = torch.load(path / "common.pt", map_location="cpu", weights_only=False)
+        common_keys = set(common)
+        return CheckpointInfo(
+            metadata_sha256=sha256_file(path / ".metadata"),
+            size_bytes=directory_size(path),
+            has_optimizer="optimizer" in common_keys
+            or any(key == "optimizer" or key.startswith("optimizer.") for key in distributed_keys),
+            has_scheduler="opt_param_scheduler" in common_keys
+            or any(key.startswith("opt_param_scheduler") for key in distributed_keys),
+            has_rng="rng_state" in common_keys or any(key.startswith("rng_state") for key in distributed_keys),
+        )
+
+    def _initialize_rolling_checkpoints(self, loaded_rollout_id: int) -> None:
+        manager = RollingCheckpointManager(Path(self.args.save))
+        self._rolling_checkpoint_manager = manager
+        tracker = self._run_rank_zero_checkpoint_action(
+            "startup reconciliation",
+            lambda: manager.reconcile(self._inspect_rolling_checkpoint),
+        )
+        if tracker is None:
+            return
+        if tracker != loaded_rollout_id:
+            raise RuntimeError(
+                f"rolling checkpoint tracker={tracker} does not match loaded iteration={loaded_rollout_id}"
+            )
+        if loaded_rollout_id >= self.args.num_rollout - 1:
+
+            def cleanup_completed_run():
+                manager.retain_full(loaded_rollout_id)
+                manager.cleanup_workdirs()
+
+            self._run_rank_zero_checkpoint_action(
+                "completed-run workdir cleanup",
+                cleanup_completed_run,
+            )
+            return
+        ready = self._run_rank_zero_checkpoint_action(
+            "startup state inspection",
+            lambda: manager.is_rotation_ready(loaded_rollout_id),
+        )
+        if ready:
+            return
+
+        self._save_rolling_stage(loaded_rollout_id, reason="resume bootstrap")
+        self._run_rank_zero_checkpoint_action(
+            "resume bootstrap full-checkpoint registration",
+            lambda: manager.record_full(
+                loaded_rollout_id,
+                self._inspect_rolling_checkpoint(manager.source(loaded_rollout_id)),
+            ),
+        )
+
+    def _save_rolling_stage(self, rollout_id: int, *, reason: str) -> None:
+        manager = self._rolling_checkpoint_manager
+        assert manager is not None
+        started = time.perf_counter()
+        save(
+            rollout_id,
+            self.model,
+            self.optimizer,
+            self.opt_param_scheduler,
+            save_path=manager.staging_root,
+            save_optimizer=False,
+            save_rng=False,
+        )
+        self._run_rank_zero_checkpoint_action(
+            f"{reason} staging validation",
+            lambda: manager.record_staged(
+                rollout_id,
+                self._inspect_rolling_checkpoint(manager.staged(rollout_id)),
+            ),
+        )
+        if dist.get_rank() == 0:
+            logger.info(
+                "rolling checkpoint slim_save_seconds=%.3f iteration=%d reason=%s",
+                time.perf_counter() - started,
+                rollout_id,
+                reason,
+            )
 
     def finish_tracking(self) -> None:
         """Flush wandb from the megatron main rank so the final iter's train
@@ -595,7 +704,52 @@ class MegatronTrainRayActor(TrainRayActor):
 
             maybe_finalize_async_save(blocking=True)
 
-        save(rollout_id, self.model, self.optimizer, self.opt_param_scheduler)
+        if self._rolling_checkpoint_manager is None:
+            save(rollout_id, self.model, self.optimizer, self.opt_param_scheduler)
+        else:
+            manager = self._rolling_checkpoint_manager
+            self._run_rank_zero_checkpoint_action(
+                "pre-save reconciliation",
+                lambda: manager.reconcile(self._inspect_rolling_checkpoint),
+            )
+            final_checkpoint = rollout_id == self.args.num_rollout - 1
+            if not final_checkpoint:
+                self._save_rolling_stage(rollout_id, reason="periodic save")
+
+            full_started = time.perf_counter()
+            save(
+                rollout_id,
+                self.model,
+                self.optimizer,
+                self.opt_param_scheduler,
+                save_path=manager.save_root,
+                save_optimizer=True,
+                save_rng=True,
+            )
+
+            def register_full_and_rotate():
+                tracker = manager.read_tracker()
+                if tracker != rollout_id:
+                    raise RuntimeError(f"full checkpoint tracker={tracker}; expected iteration={rollout_id}")
+                full_info = self._inspect_rolling_checkpoint(manager.source(rollout_id))
+                full_info.require_full(manager.source(rollout_id))
+                if not final_checkpoint:
+                    manager.record_full(rollout_id, full_info)
+                manager.reconcile(self._inspect_rolling_checkpoint)
+                if final_checkpoint:
+                    manager.cleanup_workdirs()
+
+            promotion_started = time.perf_counter()
+            self._run_rank_zero_checkpoint_action("full registration and rotation", register_full_and_rotate)
+            if dist.get_rank() == 0:
+                finished = time.perf_counter()
+                logger.info(
+                    "rolling checkpoint full_save_seconds=%.3f promotion_seconds=%.3f iteration=%d final=%s",
+                    promotion_started - full_started,
+                    finished - promotion_started,
+                    rollout_id,
+                    final_checkpoint,
+                )
 
         if force_sync and self.args.async_save:
             maybe_finalize_async_save(blocking=True)

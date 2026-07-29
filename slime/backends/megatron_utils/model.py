@@ -939,6 +939,10 @@ def save(
     model: Sequence[DDP],
     optimizer: MegatronOptimizer,
     opt_param_scheduler: OptimizerParamScheduler,
+    *,
+    save_path: str | Path | None = None,
+    save_optimizer: bool | None = None,
+    save_rng: bool | None = None,
 ) -> None:
     """Persist a training checkpoint safely with forward hooks disabled.
 
@@ -947,22 +951,40 @@ def save(
         model (Sequence[DDP]): Sequence of DDP-wrapped model chunks.
         optimizer (MegatronOptimizer): Optimizer instance.
         opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.
+        save_path: Optional temporary destination for this save only.
+        save_optimizer: Optional per-save optimizer/scheduler inclusion override.
+        save_rng: Optional per-save RNG-state inclusion override.
     """
     args = get_args()
-    if should_disable_forward_pre_hook(args):
-        disable_forward_pre_hook(model)
-    save_checkpoint(
-        iteration,
-        model,
-        optimizer,
-        opt_param_scheduler,
-        num_floating_point_operations_so_far=0,
-        checkpointing_context=None,
-        train_data_iterator=None,
-        preprocess_common_state_dict_fn=None,
-    )
-    if should_disable_forward_pre_hook(args):
-        enable_forward_pre_hook(model)
+    original = (args.save, args.no_save_optim, args.no_save_rng)
+    if save_path is not None:
+        args.save = str(save_path)
+    if save_optimizer is not None:
+        args.no_save_optim = not save_optimizer
+    if save_rng is not None:
+        args.no_save_rng = not save_rng
+
+    pre_hook_disabled = False
+    try:
+        if should_disable_forward_pre_hook(args):
+            disable_forward_pre_hook(model)
+            pre_hook_disabled = True
+        save_checkpoint(
+            iteration,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            num_floating_point_operations_so_far=0,
+            checkpointing_context=None,
+            train_data_iterator=None,
+            preprocess_common_state_dict_fn=None,
+        )
+    finally:
+        try:
+            if pre_hook_disabled:
+                enable_forward_pre_hook(model)
+        finally:
+            args.save, args.no_save_optim, args.no_save_rng = original
 
 
 def initialize_model_and_optimizer(

@@ -198,6 +198,11 @@ def make_slime_validate_args(**overrides):
         eval_interval=None,
         save_interval=None,
         save=None,
+        async_save=False,
+        no_save_optim=False,
+        no_save_rng=False,
+        save_retain_interval=None,
+        slim_intermediate_checkpoints=False,
         kl_loss_coef=0,
         advantage_estimator="grpo",
         normalize_advantages=False,
@@ -272,6 +277,42 @@ def test_slime_validate_args_preserves_zero_rollout_gpus_under_colocate(monkeypa
     assert args.rollout_num_gpus == 0
     assert args.offload_train is True
     assert args.offload_rollout is True
+
+
+@pytest.mark.unit
+def test_rolling_checkpoint_slimming_accepts_synchronous_megatron_save(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        slim_intermediate_checkpoints=True,
+        save="/tmp/checkpoints",
+        save_interval=5,
+    )
+
+    module.slime_validate_args(args)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("override", "flag"),
+    [
+        ({"async_save": True}, "--async-save"),
+        ({"release_train": True}, "--release-train"),
+        ({"no_save_optim": True}, "--no-save-optim"),
+        ({"no_save_rng": True}, "--no-save-rng"),
+        ({"save_retain_interval": 2}, "--save-retain-interval"),
+    ],
+)
+def test_rolling_checkpoint_slimming_rejects_incompatible_modes(monkeypatch, override, flag):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        slim_intermediate_checkpoints=True,
+        save="/tmp/checkpoints",
+        save_interval=5,
+        **override,
+    )
+
+    with pytest.raises(ValueError, match=flag):
+        module.slime_validate_args(args)
 
 
 @pytest.mark.unit

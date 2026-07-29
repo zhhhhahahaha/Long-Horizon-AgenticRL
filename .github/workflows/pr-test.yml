@@ -272,6 +272,11 @@ jobs:
               "num_gpus": 8,
               "test_args": "--async-save",
               "test_file": "test_qwen3_4B_ckpt.py"
+            },
+            {
+              "num_gpus": 8,
+              "test_args": "--rolling-slim --save-optimizer gpu --load-optimizer gpu",
+              "test_file": "test_qwen3_4B_ckpt.py"
             }
           ]
     defaults:
@@ -471,6 +476,11 @@ jobs:
               "num_gpus": 8,
               "test_args": "--async-save",
               "test_file": "test_qwen3_4B_ckpt.py"
+            },
+            {
+              "num_gpus": 8,
+              "test_args": "--rolling-slim --save-optimizer gpu --load-optimizer gpu",
+              "test_file": "test_qwen3_4B_ckpt.py"
             }
           ]
     defaults:
@@ -628,6 +638,14 @@ jobs:
             {
               "num_gpus": 0,
               "test_file": "test_rollout_validation.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_bcplus_eval_pipeline.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_checkpoint_rotation.py"
             },
             {
               "num_gpus": 0,
@@ -945,6 +963,11 @@ jobs:
             {
               "num_gpus": 8,
               "test_args": "--async-save",
+              "test_file": "test_qwen3_4B_ckpt.py"
+            },
+            {
+              "num_gpus": 8,
+              "test_args": "--rolling-slim --save-optimizer gpu --load-optimizer gpu",
               "test_file": "test_qwen3_4B_ckpt.py"
             }
           ]

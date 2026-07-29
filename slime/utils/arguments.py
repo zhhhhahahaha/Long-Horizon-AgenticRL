@@ -867,6 +867,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--slim-intermediate-checkpoints",
+                action="store_true",
+                default=False,
+                help=(
+                    "Keep the latest Megatron checkpoint as a full resume checkpoint while atomically replacing "
+                    "older checkpoints with weights-only copies. This synchronous rolling mode is incompatible "
+                    "with --async-save, --release-train, --no-save-optim, and --no-save-rng."
+                ),
+            )
+            parser.add_argument(
                 "--save-hf",
                 type=str,
                 default=None,
@@ -1808,6 +1818,25 @@ def slime_validate_args(args):
 
     if args.save_interval is not None:
         assert args.save is not None, "'--save' is required when save_interval is set."
+
+    if getattr(args, "slim_intermediate_checkpoints", False):
+        if args.train_backend != "megatron":
+            raise ValueError("--slim-intermediate-checkpoints is only supported with the Megatron train backend.")
+        if args.save is None or args.save_interval is None:
+            raise ValueError("--slim-intermediate-checkpoints requires --save and --save-interval.")
+        incompatible = [
+            flag
+            for enabled, flag in (
+                (args.async_save, "--async-save"),
+                (args.release_train, "--release-train"),
+                (args.no_save_optim, "--no-save-optim"),
+                (args.no_save_rng, "--no-save-rng"),
+                (getattr(args, "save_retain_interval", None) is not None, "--save-retain-interval"),
+            )
+            if enabled
+        ]
+        if incompatible:
+            raise ValueError("--slim-intermediate-checkpoints is incompatible with " + ", ".join(incompatible) + ".")
 
     assert not (args.kl_coef != 0 and args.kl_loss_coef != 0), "Only one of kl_coef and kl_loss_coef can be set"
 
