@@ -27,7 +27,7 @@ cd /home/hhzhang01/Long-Horizon-AgenticRL
 local_archive=/home/hhzhang01/eag-wsf/hhzhang01/supo-slime/slime-code.tgz
 test -s "${local_archive}"
 tar tzf "${local_archive}" | rg \
-  '^\./examples/supo_browsecomp/(search_server\.py|mast/run_search_server\.sh)$'
+  '^\./examples/supo_browsecomp/(search_server\.py|mast/search/run_search_server\.sh)$'
 
 mast list-jobs \
   --cluster MastGenAICluster \
@@ -87,7 +87,7 @@ search_mast_cmd=(
   --retries=3
   --use_conda_docker=True
   --conda_docker_image=588845226011.dkr.ecr.us-east-2.amazonaws.com/msl_infra/slime:hhz-20260629a
-  "--docker_custom_cmd=mkdir -p /slime-src && tar xzf /mnt/wsfuse/hhzhang01/supo-slime/slime-code.tgz -C /slime-src && bash /slime-src/examples/supo_browsecomp/mast/run_search_server.sh"
+  "--docker_custom_cmd=mkdir -p /slime-src && tar xzf /mnt/wsfuse/hhzhang01/supo-slime/slime-code.tgz -C /slime-src && bash /slime-src/examples/supo_browsecomp/mast/search/run_search_server.sh"
   --host=zionex_80g
   --wsf_src=ws://ws.ai.eag0genai/genai_fair_llm
 )
@@ -106,7 +106,7 @@ search_mast_cmd=(
 ```
 
 只有 `status=ok`、`dryrun=true`、`task_count=1`、`gpu_per_task=8` 且 command 包含
-`run_search_server.sh` 时才能真实提交。
+`search/run_search_server.sh` 时才能真实提交。
 
 ## 3. 真实提交只能执行一次
 
@@ -217,7 +217,7 @@ curl --noproxy '*' -g -fsS \
 
 MAST 可能因为更高优先级任务、容量回收、宿主机故障或维护而重排 search job。新的
 execution attempt 可能保留同一个 full job name，但会获得不同的主机和 IPv6；
-`run_search_server.sh` 会把新地址写回 `search-server.addr`。
+`search/run_search_server.sh` 会把新地址写回 `search-server.addr`。
 
 `CRITICAL` priority 会降低因普通容量竞争而被抢占的概率，但不能提供以下保证：
 

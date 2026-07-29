@@ -25,7 +25,7 @@ checkpoint 核对、配置、归档、dry-run、真实提交和状态核对。�
   map，再调用真实提交器。
 - `submit_with_wandb.sh`：执行真实提交、保存结构化响应，并启动 W&B watcher。
 - `run_trainer.sh`：在 MAST 容器中运行，选择模型、组装 slime 参数并启动 Ray 训练。
-- `SEARCH_SERVER.md`：提交、替换和验证独立 search server；训练提交前必须确认其真实
+- `search/README.md`：提交、替换和验证独立 search server；训练提交前必须确认其真实
   `/search` 请求可用。
 - `wandb_sync.sh`：在 devserver 的 tmux 中追踪 MAST 状态并同步离线 W&B 数据。
 
@@ -410,7 +410,7 @@ test -s /home/hhzhang01/eag-wsf/hhzhang01/supo-slime/search-server.addr
 ```
 
 如果需要新建或替换 search job，完整阅读并执行
-[`SEARCH_SERVER.md`](SEARCH_SERVER.md)。不要仅凭地址文件存在就认为服务可用。
+[`search/README.md`](search/README.md)。不要仅凭地址文件存在就认为服务可用。
 
 模型文件也应存在于同一个 EAG WSF mount。9B 示例：
 
@@ -594,7 +594,7 @@ examples/supo_browsecomp/mast/submit_with_wandb.sh \
 - MAST 状态为 `PENDING`：正常排队，不是提交失败。
 - 容器报 archive 不存在：核对本地 EAG WSF mount 与 config 内 `/mnt/wsfuse` 路径的
   basename 是否完全一致。
-- trainer 报 search server 不健康：按 [`SEARCH_SERVER.md`](SEARCH_SERVER.md) 检查
+- trainer 报 search server 不健康：按 [`search/README.md`](search/README.md) 检查
   `search-server.addr`、execution attempt、当前 task IP 和真实 `/search`，不要因此
   重复提交 trainer。
 - trainer 报模型或 torch-dist checkpoint 缺失：先修复 WSF 上的模型文件，再决定是否

@@ -10,7 +10,7 @@ parent directory.
 |---|---|---|
 | Training | `submit_experiment.sh` | [`SUBMIT_NEW_TRAINING_JOB.md`](SUBMIT_NEW_TRAINING_JOB.md) |
 | Checkpoint evaluation | `eval/eval_sweep.py` | [`eval/README.md`](eval/README.md) |
-| Search service | `run_search_server.sh` | [`SEARCH_SERVER.md`](SEARCH_SERVER.md) |
+| Search service | `search/run_search_server.sh` | [`search/README.md`](search/README.md) |
 | Checkpoint slimming | `checkpoint_slim/checkpoint_slim.py` | [`checkpoint_slim/README.md`](checkpoint_slim/README.md) |
 | W&B synchronization | `submit_with_wandb.sh`, `wandb_sync.sh` | Training runbook and script headers |
 
@@ -22,6 +22,7 @@ parent directory.
   current training configs.
 - `eval/` owns checkpoint discovery, eval submission, monitoring, resumption,
   and report synchronization.
+- `search/` owns the MAST search-service launcher and operational runbook.
 - `checkpoint_slim/` owns weights-only checkpoint conversion and canary
   validation.
 

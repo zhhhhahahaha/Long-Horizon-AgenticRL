@@ -9,10 +9,10 @@
 # Discovery: writes its "[<ipv6>]:<port>" to an OILFS file the trainer polls.
 # No egress needed (server is inbound-only); all model+corpus come from OILFS.
 #
-# Launched via (see SEARCH_SERVER.md for the full submit and validation runbook):
+# Launched via (see search/README.md for the full submit and validation runbook):
 #   --docker_custom_cmd='mkdir -p /slime-src && tar xzf \
 #       /mnt/wsfuse/hhzhang01/supo-slime/slime-code.tgz -C /slime-src && \
-#       bash /slime-src/examples/supo_browsecomp/mast/run_search_server.sh'
+#       bash /slime-src/examples/supo_browsecomp/mast/search/run_search_server.sh'
 set -ex
 export PYTHONUNBUFFERED=1
 # Local model + local HF-format corpus/embeds → force offline so no code path
