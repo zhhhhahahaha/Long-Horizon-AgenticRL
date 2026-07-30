@@ -3,7 +3,7 @@
 #
 # Behavior:
 #   * Looks for a running Slurm job named "supo-search-server" owned by $USER.
-#   * If none exists → sbatch a fresh 7-day 1-GPU job.
+#   * If none exists → sbatch a fresh 7-day job (1 GPU by default).
 #   * If one exists → check TimeLeft; reuse if it has >= MIN_HOURS_REMAINING
 #     hours left, otherwise scancel + resubmit (with a loud warning first).
 #   * Waits for /health to return 200, then writes the hostname to
@@ -30,6 +30,15 @@
 #   SERVER_PORT           Port the retrieval server binds to. Default 8000.
 #   SEARCH_JOB_NAME       Slurm job name (used for squeue matching too).
 #                         Default supo-search-server.
+#   SEARCH_GPUS           GPUs exposed to the server. Default 1. The server
+#                         starts one embedding worker per visible GPU.
+#   SEARCH_CPUS           Slurm CPUs for the server. Default 8 per GPU.
+#   SEARCH_MEM            Slurm memory request. Default 128G. Use 0 for all
+#                         node memory on an 8-GPU full-node server.
+#   SEARCH_HOST_FILE      Address file written only after health succeeds.
+#                         Default $GENAI_ROOT/logs/search-server.hostname.
+#   SEARCH_LOG_FILE       Slurm output file. Default
+#                         $GENAI_ROOT/logs/search-server.log.
 #
 # Outputs:
 #   * $GENAI_ROOT/logs/search-server.hostname  ← one line: "<hostname>:<port>"
@@ -49,12 +58,23 @@ SLURM_ACCOUNT="${SLURM_ACCOUNT:-genai_interns}"
 QOS="${QOS:-a100_dev}"
 SERVER_PORT="${SERVER_PORT:-8000}"
 SEARCH_JOB_NAME="${SEARCH_JOB_NAME:-supo-search-server}"
+SEARCH_GPUS="${SEARCH_GPUS:-1}"
+if [[ ! "${SEARCH_GPUS}" =~ ^[1-9][0-9]*$ ]] || (( SEARCH_GPUS > 8 )); then
+    echo "SEARCH_GPUS must be an integer from 1 through 8" >&2
+    exit 2
+fi
+SEARCH_CPUS="${SEARCH_CPUS:-$((SEARCH_GPUS * 8))}"
+if [[ ! "${SEARCH_CPUS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "SEARCH_CPUS must be a positive integer" >&2
+    exit 2
+fi
+SEARCH_MEM="${SEARCH_MEM:-128G}"
 
 LOG_DIR="${GENAI_ROOT}/logs"
-HOST_FILE="${LOG_DIR}/search-server.hostname"
-SERVER_LOG="${LOG_DIR}/search-server.log"
+HOST_FILE="${SEARCH_HOST_FILE:-${LOG_DIR}/search-server.hostname}"
+SERVER_LOG="${SEARCH_LOG_FILE:-${LOG_DIR}/search-server.log}"
 
-mkdir -p "${LOG_DIR}"
+mkdir -p "${LOG_DIR}" "$(dirname "${HOST_FILE}")" "$(dirname "${SERVER_LOG}")"
 
 log() { echo "[launch_search_server] $*" >&2; }
 
@@ -79,7 +99,7 @@ wait_for_health() {
 }
 
 submit_new_server() {
-    log "submitting new 7-day search-server job on qos=${QOS}"
+    log "submitting new 7-day search-server job on qos=${QOS} gpus=${SEARCH_GPUS} cpus=${SEARCH_CPUS} mem=${SEARCH_MEM}"
     # Build the enroot command as a single string to hand to sbatch --wrap.
     # ENROOT_TEMP_PATH=/dev/shm avoids overlay whiteout failures on this
     # cluster (memory: slime-enroot-import). We start from an already-imported
@@ -93,6 +113,7 @@ submit_new_server() {
         ENROOT_MOUNT_HOME=false \
         enroot start \
             --env PYTHONUNBUFFERED=1 \
+            --env NUM_GPUS=${SEARCH_GPUS} \
             --mount ${SLIME_HOST_DIR}:/slime \
             --mount ${GENAI_ROOT}:/genai_hh \
             ${ENROOT_ROOTFS} \
@@ -104,7 +125,8 @@ submit_new_server() {
 
     local jobid
     jobid=$(sbatch \
-        --nodes=1 --gpus=1 --time=7-00:00:00 --mem=128G --cpus-per-task=8 \
+        --nodes=1 --gpus="${SEARCH_GPUS}" --time=7-00:00:00 \
+        --mem="${SEARCH_MEM}" --cpus-per-task="${SEARCH_CPUS}" \
         --account="${SLURM_ACCOUNT}" --qos="${QOS}" \
         --job-name="${SEARCH_JOB_NAME}" \
         --output="${SERVER_LOG}" \

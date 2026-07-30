@@ -31,6 +31,29 @@ The operation is idempotent. It looks for the current user's job named
 The default allocation is one GPU, 128 GB RAM, 8 CPUs, seven days, account
 `genai_interns`, and QOS `a100_dev`. Override `MIN_HOURS_REMAINING`, `QOS`,
 `SERVER_PORT`, or `SEARCH_JOB_NAME` through environment variables when needed.
+`SEARCH_GPUS` controls both the Slurm GPU request and the number of embedding
+workers; `SEARCH_CPUS` defaults to eight CPUs per GPU. `SEARCH_MEM` accepts a
+Slurm memory value such as `128G` or `0` for all node memory.
+
+## Blue-green full-node replacement
+
+Do not stop a search server that an active trainer is using. Start and validate
+the replacement under a different job name, address file, and log file first:
+
+```bash
+SEARCH_JOB_NAME=supo-search-server-8gpu \
+SEARCH_GPUS=8 SEARCH_CPUS=64 SEARCH_MEM=0 \
+SEARCH_HOST_FILE=/genai/fsx-project/hhzhang01/logs/search-server-8gpu.hostname \
+SEARCH_LOG_FILE=/genai/fsx-project/hhzhang01/logs/search-server-8gpu.log \
+bash examples/supo_browsecomp/aws/search/launch_search_server.sh
+```
+
+The two jobs may use the same port because they run on different hosts. Before
+switching a consumer, require `/health` to report eight workers and send a real
+`/search` request. Promote the new address to `search-server.hostname` only at
+a checkpoint boundary. Existing trainers pin `LOCAL_SEARCH_URL` at startup and
+must be resumed to change servers; pending eval jobs should resolve the address
+file when they start.
 
 ## Monitor and connect
 
