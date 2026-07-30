@@ -18,6 +18,32 @@ counterparts live under [`../mast/`](../mast/README.md).
 See [`../README.md`](../README.md) for prerequisites (search server, MetaGen
 judge, checkpoints, parquet) and the full run walkthrough.
 
+## Checkpoint storage
+
+Run `/genai` filesystem checks and all Slurm submissions from the cluster login
+shell reached through `/home/hhzhang01/.tmux-forclaude` (session `v2_dev`). The
+Codex execution container does not expose the cluster's `/genai` mounts, so a
+missing path there does not mean the path is absent on the AWS cluster.
+
+The 4B launcher saves new checkpoints under the large intern FSx filesystem by
+default:
+
+```text
+/genai/fsx-llm/interns/hhzhang01/checkpoints/${RUN_NAME}
+```
+
+It mounts `/genai/fsx-llm/interns/hhzhang01` as `/genai_llm` inside enroot and
+passes the container-visible path to slime. Override `BCPLUS_CHECKPOINT_ROOT`
+only when a run needs another location. In particular, resuming an older run
+that was saved on the project FSx requires both its original `RUN_NAME` and:
+
+```bash
+BCPLUS_CHECKPOINT_ROOT=/genai/fsx-project/hhzhang01/checkpoints
+```
+
+Logs, rollout dumps, and coordination files remain under
+`/genai/fsx-project/hhzhang01`; this setting changes checkpoint storage only.
+
 ## Rootfs rules for single-node and multi-node runs
 
 | Run mode | Required behavior |

@@ -57,6 +57,9 @@
 #                               evaluation-compatible .pt format. This includes
 #                               decoded prompt/response, label, reward, tool and
 #                               compression metadata, tokens, and loss masks.
+#   BCPLUS_CHECKPOINT_ROOT      default /genai/fsx-llm/interns/hhzhang01/checkpoints.
+#                               Override with the old FSx root when resuming a
+#                               run stored under /genai/fsx-project.
 #   BCPLUS_JUDGE_MODEL          default "gpt-5-4-genai-dss4" (MetaGen judge id)
 #   BCPLUS_JUDGE_BASE_URL       default "https://api.llama.com/compat/v1/"
 #   BCPLUS_JUDGE_CONCURRENCY    default 64  (judge call semaphore)
@@ -127,6 +130,7 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
     fi
     TRAIN_LOG_PATH="${TRAIN_LOG_PATH:-/genai/fsx-project/hhzhang01/logs/${RUN_NAME}.log}"
     mkdir -p "$(dirname "${TRAIN_LOG_PATH}")"
+    export BCPLUS_CHECKPOINT_ROOT="${BCPLUS_CHECKPOINT_ROOT:-/genai/fsx-llm/interns/hhzhang01/checkpoints}"
 
     # Dump per-iter rollout parquet BY DEFAULT so training rollouts can be
     # inspected offline (token ids + loss_mask + rollout_logps + advantage +
@@ -266,6 +270,7 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
                 --mount ${SLIME_HOST_DIR}:/slime \
                 --mount ${SLIME_HOST_DIR}/aws-cluster:/aws-cluster \
                 --mount /genai/fsx-project/hhzhang01:/genai_hh \
+                --mount /genai/fsx-llm/interns/hhzhang01:/genai_llm \
                 --mount /genai/fsx-project/hhzhang01/wandb:/data/wandb \
                 --env RUN_NAME='${RUN_NAME}' \
                 --env SLIME_INNER=1 \
@@ -285,6 +290,7 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
                 --env BCPLUS_DUMP_DIR='${BCPLUS_DUMP_DIR:-}' \
                 --env BCPLUS_DUMP_TRAIN_OLD='${BCPLUS_DUMP_TRAIN_OLD:-}' \
                 --env BCPLUS_RAW_ROLLOUT_DIR='${BCPLUS_RAW_ROLLOUT_DIR:-}' \
+                --env BCPLUS_CHECKPOINT_ROOT='${BCPLUS_CHECKPOINT_ROOT}' \
                 --env BCPLUS_JUDGE_MODEL='${BCPLUS_JUDGE_MODEL:-}' \
                 --env BCPLUS_JUDGE_BASE_URL='${BCPLUS_JUDGE_BASE_URL:-}' \
                 --env BCPLUS_JUDGE_CONCURRENCY='${BCPLUS_JUDGE_CONCURRENCY:-}' \
@@ -394,8 +400,18 @@ HF_CKPT_HOST=/genai_hh/models/Qwen3.5-4B
 REF_LOAD_HOST=/genai_hh/models/Qwen3.5-4B_torch_dist
 TRAIN_DATA=/genai_hh/datasets/BC+/bc_train.parquet
 TEST_DATA="${BC_TEST_DATA:-/genai_hh/datasets/BC+/bc_test.parquet}"
-CKPT_SAVE_DIR=/genai_hh/checkpoints/${RUN_NAME}
+CHECKPOINT_ROOT="${BCPLUS_CHECKPOINT_ROOT:-/genai/fsx-llm/interns/hhzhang01/checkpoints}"
+case "${CHECKPOINT_ROOT}" in
+    /genai/fsx-llm/interns/hhzhang01*)
+        CHECKPOINT_ROOT="/genai_llm${CHECKPOINT_ROOT#/genai/fsx-llm/interns/hhzhang01}"
+        ;;
+    /genai/fsx-project/hhzhang01*)
+        CHECKPOINT_ROOT="/genai_hh${CHECKPOINT_ROOT#/genai/fsx-project/hhzhang01}"
+        ;;
+esac
+CKPT_SAVE_DIR="${CHECKPOINT_ROOT}/${RUN_NAME}"
 mkdir -p "${CKPT_SAVE_DIR}"
+echo "[head] checkpoint directory: ${CKPT_SAVE_DIR}"
 
 CKPT_ARGS=(
    --hf-checkpoint "${HF_CKPT_HOST}"
