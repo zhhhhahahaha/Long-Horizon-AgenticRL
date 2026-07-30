@@ -1,9 +1,10 @@
 # BrowseComp-Plus search server on AWS
 
 This directory owns the long-lived retrieval service used by BrowseComp-Plus
-rollouts. The service runs on one A100 in Slurm and serves the shared corpus on
-port 8000. Fixed search top-k and `open_page` word limits are rollout-client
-settings; they do not require separate baseline and V2 search servers.
+rollouts. The service runs on one 8-GPU A100 node in Slurm and serves the
+shared corpus on port 8000. Fixed search top-k and `open_page` word limits are
+rollout-client settings; they do not require separate baseline and V2 search
+servers.
 
 ## Start or reuse the service
 
@@ -28,12 +29,13 @@ The operation is idempotent. It looks for the current user's job named
   warning window;
 - otherwise submits a new job and waits for `/health`.
 
-The default allocation is one GPU, 128 GB RAM, 8 CPUs, seven days, account
-`genai_interns`, and QOS `a100_dev`. Override `MIN_HOURS_REMAINING`, `QOS`,
-`SERVER_PORT`, or `SEARCH_JOB_NAME` through environment variables when needed.
-`SEARCH_GPUS` controls both the Slurm GPU request and the number of embedding
-workers; `SEARCH_CPUS` defaults to eight CPUs per GPU. `SEARCH_MEM` accepts a
-Slurm memory value such as `128G` or `0` for all node memory.
+The default allocation is eight GPUs, all node memory, 64 CPUs, seven days,
+account `genai_interns`, and QOS `a100_dev`. The default job name is
+`supo-search-server-8gpu`. Override `MIN_HOURS_REMAINING`, `QOS`, `SERVER_PORT`,
+or `SEARCH_JOB_NAME` when needed. `SEARCH_GPUS` controls both the Slurm GPU
+request and the number of embedding workers; `SEARCH_CPUS` defaults to eight
+CPUs per GPU. `SEARCH_MEM` accepts a Slurm memory value such as `128G` or `0`
+for all node memory.
 
 ## Blue-green full-node replacement
 
@@ -58,7 +60,7 @@ file when they start.
 ## Monitor and connect
 
 ```bash
-squeue -u "$USER" -n supo-search-server -o '%.18i %.12T %.12L %.20N'
+squeue -u "$USER" -n supo-search-server-8gpu -o '%.18i %.12T %.12L %.20N'
 tail -f /genai/fsx-project/hhzhang01/logs/search-server.log
 cat /genai/fsx-project/hhzhang01/logs/search-server.hostname
 curl -sf "http://$(cat /genai/fsx-project/hhzhang01/logs/search-server.hostname)/health"
@@ -93,7 +95,7 @@ The server is shared by training and evaluation jobs. Check for consumers
 before cancellation, then stop it by job ID:
 
 ```bash
-squeue -u "$USER" -n supo-search-server
+squeue -u "$USER" -n supo-search-server-8gpu
 scancel <job-id>
 ```
 

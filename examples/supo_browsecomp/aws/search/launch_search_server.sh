@@ -2,8 +2,8 @@
 # Launch the BrowseComp-Plus retrieval server on Slurm (idempotent).
 #
 # Behavior:
-#   * Looks for a running Slurm job named "supo-search-server" owned by $USER.
-#   * If none exists → sbatch a fresh 7-day job (1 GPU by default).
+#   * Looks for a running Slurm job named "supo-search-server-8gpu" owned by $USER.
+#   * If none exists → sbatch a fresh 7-day full-node job by default.
 #   * If one exists → check TimeLeft; reuse if it has >= MIN_HOURS_REMAINING
 #     hours left, otherwise scancel + resubmit (with a loud warning first).
 #   * Waits for /health to return 200, then writes the hostname to
@@ -29,12 +29,11 @@
 #                         for this long-lived retrieval service.
 #   SERVER_PORT           Port the retrieval server binds to. Default 8000.
 #   SEARCH_JOB_NAME       Slurm job name (used for squeue matching too).
-#                         Default supo-search-server.
-#   SEARCH_GPUS           GPUs exposed to the server. Default 1. The server
+#                         Default supo-search-server-8gpu.
+#   SEARCH_GPUS           GPUs exposed to the server. Default 8. The server
 #                         starts one embedding worker per visible GPU.
 #   SEARCH_CPUS           Slurm CPUs for the server. Default 8 per GPU.
-#   SEARCH_MEM            Slurm memory request. Default 128G. Use 0 for all
-#                         node memory on an 8-GPU full-node server.
+#   SEARCH_MEM            Slurm memory request. Default 0 (all node memory).
 #   SEARCH_HOST_FILE      Address file written only after health succeeds.
 #                         Default $GENAI_ROOT/logs/search-server.hostname.
 #   SEARCH_LOG_FILE       Slurm output file. Default
@@ -57,8 +56,8 @@ GENAI_ROOT="${GENAI_ROOT:-/genai/fsx-project/hhzhang01}"
 SLURM_ACCOUNT="${SLURM_ACCOUNT:-genai_interns}"
 QOS="${QOS:-a100_dev}"
 SERVER_PORT="${SERVER_PORT:-8000}"
-SEARCH_JOB_NAME="${SEARCH_JOB_NAME:-supo-search-server}"
-SEARCH_GPUS="${SEARCH_GPUS:-1}"
+SEARCH_JOB_NAME="${SEARCH_JOB_NAME:-supo-search-server-8gpu}"
+SEARCH_GPUS="${SEARCH_GPUS:-8}"
 if [[ ! "${SEARCH_GPUS}" =~ ^[1-9][0-9]*$ ]] || (( SEARCH_GPUS > 8 )); then
     echo "SEARCH_GPUS must be an integer from 1 through 8" >&2
     exit 2
@@ -68,7 +67,7 @@ if [[ ! "${SEARCH_CPUS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "SEARCH_CPUS must be a positive integer" >&2
     exit 2
 fi
-SEARCH_MEM="${SEARCH_MEM:-128G}"
+SEARCH_MEM="${SEARCH_MEM:-0}"
 
 LOG_DIR="${GENAI_ROOT}/logs"
 HOST_FILE="${SEARCH_HOST_FILE:-${LOG_DIR}/search-server.hostname}"
