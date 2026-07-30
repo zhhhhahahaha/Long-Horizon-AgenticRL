@@ -12,8 +12,8 @@
 # Env vars (all optional):
 #   MIN_HOURS_REMAINING   Minimum hours the server must have left to be
 #                         considered "fresh enough" for reuse. Default 48.
-#   SLIME_HOST_DIR        Where the slime repo lives on the host. Default
-#                         /home/hhzhang01/slime.
+#   SLIME_HOST_DIR        Where the slime repo lives on the host. Defaults to
+#                         the repo/worktree that contains this script.
 #   ENROOT_ROOTFS         Name of the pre-imported enroot rootfs (see
 #                         `enroot list`). Default slime-test. The login pod
 #                         has no squashfuse, so we cannot mount a .sqsh
@@ -38,8 +38,11 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+DEFAULT_SLIME_HOST_DIR="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+
 MIN_HOURS_REMAINING="${MIN_HOURS_REMAINING:-48}"
-SLIME_HOST_DIR="${SLIME_HOST_DIR:-/home/hhzhang01/slime}"
+SLIME_HOST_DIR="${SLIME_HOST_DIR:-${DEFAULT_SLIME_HOST_DIR}}"
 ENROOT_ROOTFS="${ENROOT_ROOTFS:-slime-test}"
 GENAI_ROOT="${GENAI_ROOT:-/genai/fsx-project/hhzhang01}"
 SLURM_ACCOUNT="${SLURM_ACCOUNT:-genai_interns}"

@@ -78,10 +78,12 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
     # Search server is ensured after the config block below (that logic needs
     # TRAIN_WALLTIME / QOS / SLURM_ACCOUNT / SLIME_HOST_DIR).
 
+    SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+    SLIME_HOST_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+
     export RUN_NAME="${RUN_NAME:-supo-bcplus-qwen3p5-4b-$(date +%Y%m%d-%H%M)}"
     echo "RUN_NAME=${RUN_NAME}"
 
-    SLIME_HOST_DIR=/home/hhzhang01/slime
     ENROOT_ROOTFS="${ENROOT_ROOTFS:-slime-test}"
     SLURM_ACCOUNT="${SLURM_ACCOUNT:-genai_interns}"
     QOS="${QOS:-a100_genai_interns_high}"
@@ -155,7 +157,7 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
     # loss curves on wandb.ai mid-run without waiting for the whole job to
     # finish. Sync interval defaults to 5 min (override via WANDB_SYNC_INTERVAL_SEC).
     WANDB_SYNC_INTERVAL_SEC="${WANDB_SYNC_INTERVAL_SEC:-300}"
-    SYNC_SCRIPT=/home/hhzhang01/slime/aws-cluster/wandb-sync.sh
+    SYNC_SCRIPT="${SLIME_HOST_DIR}/aws-cluster/wandb-sync.sh"
 
     srun \
         --nodes=${NUM_NODES} --gpus-per-node=8 --ntasks-per-node=1 --exclusive \
