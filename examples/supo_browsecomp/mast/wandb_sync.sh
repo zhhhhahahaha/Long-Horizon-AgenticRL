@@ -50,6 +50,18 @@ if [[ ! "${RUN_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
   exit 2
 fi
 
+declare -A EXCLUDED_RUN_ID_SET=()
+if [[ -n "${WANDB_SYNC_EXCLUDE_RUN_IDS:-}" ]]; then
+  IFS=',' read -r -a excluded_run_ids <<< "${WANDB_SYNC_EXCLUDE_RUN_IDS}"
+  for run_id in "${excluded_run_ids[@]}"; do
+    if [[ ! "${run_id}" =~ ^[A-Za-z0-9]+$ ]]; then
+      echo "wandb_sync.sh: invalid excluded W&B run id: ${run_id:-<empty>}" >&2
+      exit 2
+    fi
+    EXCLUDED_RUN_ID_SET["${run_id}"]=1
+  done
+fi
+
 WANDB_ROOT="${MAST_WANDB_ROOT:-/data/users/hhzhang01/wsfuse_mnt/hhzhang01/supo-slime/wandb}"
 SNAPSHOT_ROOT="${MAST_WANDB_SNAPSHOT_ROOT:-/data/users/hhzhang01/wsfuse_mnt/hhzhang01/supo-slime/wandb-snapshots}"
 KEY_FILE="${WANDB_KEY_FILE:-${HOME}/.wandb-key}"
@@ -120,6 +132,7 @@ sync_once() {
   local pending_keys=()
   local pending_snapshots=()
   local path
+  local run_id
   local publisher_dir publisher_key latest_snapshot
   local cache_parent cache_current cache_previous cache_tmp
   local found_run snapshot_error=0
@@ -127,7 +140,13 @@ sync_once() {
 
   shopt -s nullglob
   for path in "${RUN_ROOT}"/offline-run-*; do
-    [[ -d "${path}" ]] && candidates+=("${path}")
+    [[ -d "${path}" ]] || continue
+    run_id="${path##*-}"
+    if [[ -n "${EXCLUDED_RUN_ID_SET[${run_id}]:-}" ]]; then
+      log "skipping excluded offline run ${run_id}: ${path}"
+      continue
+    fi
+    candidates+=("${path}")
   done
   shopt -u nullglob
 
@@ -165,6 +184,11 @@ sync_once() {
 
       found_run=0
       while IFS= read -r -d '' path; do
+        run_id="${path##*-}"
+        if [[ -n "${EXCLUDED_RUN_ID_SET[${run_id}]:-}" ]]; then
+          log "skipping excluded offline run ${run_id}: ${path}"
+          continue
+        fi
         candidates+=("${path}")
         found_run=1
       done < <(find "${cache_current}" -type d -name 'offline-run-*' -print0)

@@ -92,6 +92,16 @@ expected="wandb	sync	--append	--no-sync-tensorboard	${RUN_ROOT}/offline-run-a	${
 grep -Fqx "${expected}" "${FAKE_WANDB_LOG}" || fail "once did not pass the expected sync arguments"
 
 reset_fakes
+run_sync env WANDB_SYNC_EXCLUDE_RUN_IDS=b bash "${SYNC_SCRIPT}" once "${JOB}"
+expected="wandb	sync	--append	--no-sync-tensorboard	${RUN_ROOT}/offline-run-a"
+grep -Fqx "${expected}" "${FAKE_WANDB_LOG}" || fail "excluded W&B run was not filtered"
+
+if run_sync env WANDB_SYNC_EXCLUDE_RUN_IDS='bad-id' bash \
+  "${SYNC_SCRIPT}" once "${JOB}" >/dev/null 2>&1; then
+  fail "sync accepted an invalid excluded W&B run id list"
+fi
+
+reset_fakes
 run_sync bash "${SYNC_SCRIPT}" once no-offline-runs
 [[ ! -s "${FAKE_WANDB_LOG}" ]] || fail "no-run sync unexpectedly invoked W&B"
 
@@ -109,6 +119,12 @@ expected_snapshot_dir="${TMP_DIR}/cache/${SNAPSHOT_JOB}/attempt-0-task-0/current
 grep -Fqx "$(printf 'wandb\tsync\t--append\t--no-sync-tensorboard\t%s' "${expected_snapshot_dir}")" \
   "${FAKE_WANDB_LOG}" || \
   fail "snapshot run was not extracted to local cache before sync: $(cat "${FAKE_WANDB_LOG}")"
+
+reset_fakes
+run_sync env WANDB_SYNC_EXCLUDE_RUN_IDS=snapshot bash \
+  "${SYNC_SCRIPT}" once "${SNAPSHOT_JOB}"
+[[ ! -s "${FAKE_WANDB_LOG}" ]] || \
+  fail "excluded snapshot W&B run was unexpectedly synced: $(cat "${FAKE_WANDB_LOG}")"
 
 if env \
   MAST_WANDB_ROOT="${TMP_DIR}/missing-oilfs-mount" \
