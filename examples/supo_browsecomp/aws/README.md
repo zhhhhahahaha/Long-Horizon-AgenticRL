@@ -18,6 +18,69 @@ counterparts live under [`../mast/`](../mast/README.md).
 See [`../README.md`](../README.md) for prerequisites (search server, MetaGen
 judge, checkpoints, parquet) and the full run walkthrough.
 
+## Rootfs rules for single-node and multi-node runs
+
+| Run mode | Required behavior |
+|---|---|
+| Persistent single-node debug | Set `DEV_ALLOCATION_JOB_ID` and `NUM_NODES=1`. Use the shared imported rootfs directly; do not stage it to `/dev/shm`. |
+| Normal multi-node job | Leave `DEV_ALLOCATION_JOB_ID` unset. Each node stages the rootfs once under `/dev/shm/enroot-${USER}-${SLURM_JOB_ID}`. |
+| Persistent multi-node allocation | Use staged mode. The first step stages once on every node; later steps in the same allocation reuse the same path because `SLURM_JOB_ID` and the node list are unchanged. |
+
+For persistent multi-node runs, never start all nodes directly from the shared
+rootfs. Confirm the first step logs `copying rootfs` followed by `rootfs staged`.
+Later steps should skip the copy. If the launcher logs `using shared enroot
+rootfs for dev allocation` with `NUM_NODES` greater than 1, stop the run because
+the wrong rootfs mode was selected.
+
+During staging, this warning can appear:
+
+```text
+cp: cannot access '.../slime-test/tmp_host': Permission denied
+```
+
+The inaccessible `tmp_host` directory is disposable. Treat the copy as
+successful only if the log later prints `rootfs staged` and the job continues.
+If staging exits early or a step is stopped before it finishes, remove its
+partial `/dev/shm/enroot-${USER}-${SLURM_JOB_ID}` directory before retrying.
+
+Reuse lasts only for the lifetime of the same persistent allocation. Before
+releasing a persistent multi-node allocation, remove its staging directory on
+every node, then cancel the holder job. A new allocation has a new
+`SLURM_JOB_ID` and stages again.
+
+## Persistent one-node development allocation
+
+The 4B topology uses all eight GPUs on one node (`TP=4`, `CP=2`). For repeated
+smoke runs, keep one node allocated and attach each run as a Slurm job step.
+This development path uses the shared, already-imported enroot rootfs directly,
+so retries do not pull or copy the image. Normal multi-node launches still stage
+the rootfs under `/dev/shm` to avoid concurrent NFS lock races.
+
+From a persistent login-node tmux session, create a 24-hour holder job:
+
+```bash
+sbatch --parsable \
+  --nodes=1 --gpus-per-node=8 --ntasks-per-node=1 --exclusive \
+  --cpus-per-task=64 --mem=0 \
+  --account=genai_interns --qos=a100_genai_interns_high \
+  --time=24:00:00 --job-name=supo-dev-node \
+  --output=/genai/fsx-project/hhzhang01/logs/supo-dev-node-%j.log \
+  --wrap='while true; do sleep 3600; done'
+```
+
+After the holder reaches `RUNNING`, pass its numeric job ID to the launcher:
+
+```bash
+DEV_ALLOCATION_JOB_ID=<job-id> \
+NUM_NODES=1 \
+BC_NUM_ROLLOUT=1 \
+bash examples/supo_browsecomp/aws/run_qwen3p5_4B_colocate.sh
+```
+
+The launcher uses `srun --jobid=<job-id> --overlap` instead of requesting a new
+allocation. Run only one training step at a time. When development is finished,
+confirm no step is active and release the holder with `scancel <job-id>`.
+
 ## Directory ownership
 
 - Training launchers live at this root because both 4B and 9B share the same

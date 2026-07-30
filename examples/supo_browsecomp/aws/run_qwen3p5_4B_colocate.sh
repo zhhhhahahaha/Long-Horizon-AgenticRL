@@ -63,6 +63,9 @@
 #   QOS                         default a100_genai_interns_high (fast/high-prio
 #                               for the 8-node training srun). Override for a
 #                               different training queue.
+#   DEV_ALLOCATION_JOB_ID       default empty. Set to an existing persistent
+#                               Slurm allocation job ID to run training as a
+#                               job step and reuse the imported rootfs.
 #   MIN_HOURS_REMAINING         overrides the reuse threshold directly (default
 #                               = TRAIN_WALLTIME hours + SEARCH_BUFFER_HOURS).
 #   LOCAL_SEARCH_URL            set to skip the ensure step and use this server.
@@ -89,6 +92,11 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
     QOS="${QOS:-a100_genai_interns_high}"
     TRAIN_WALLTIME="${TRAIN_WALLTIME:-24:00:00}"
     NUM_NODES="${NUM_NODES:-8}"
+    DEV_ALLOCATION_JOB_ID="${DEV_ALLOCATION_JOB_ID:-}"
+    if [[ -n "${DEV_ALLOCATION_JOB_ID}" && ! "${DEV_ALLOCATION_JOB_ID}" =~ ^[0-9]+$ ]]; then
+        echo "DEV_ALLOCATION_JOB_ID must be a numeric Slurm job ID or empty" >&2
+        exit 2
+    fi
     TRAIN_LOG_PATH="${TRAIN_LOG_PATH:-/genai/fsx-project/hhzhang01/logs/${RUN_NAME}.log}"
     mkdir -p "$(dirname "${TRAIN_LOG_PATH}")"
 
@@ -149,8 +157,10 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
     echo "coord dir host: ${COORD_DIR_HOST}"
     echo "coord dir container: ${COORD_DIR}"
 
-    # One srun spanning all N nodes. `--ntasks-per-node=1` → one enroot per node.
-    # `--exclusive` reserves the full node so nothing else lands on our GPUs.
+    # One srun spanning all N nodes. `--ntasks-per-node=1` -> one enroot per node.
+    # Normally this creates an exclusive allocation. For iterative development,
+    # DEV_ALLOCATION_JOB_ID attaches the step to a persistent sbatch allocation;
+    # --overlap lets it coexist with that allocation's lightweight holder loop.
     #
     # We background srun and drive a wandb-sync poll loop from this login-pod
     # shell while training runs. This lets you watch
@@ -159,29 +169,53 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
     WANDB_SYNC_INTERVAL_SEC="${WANDB_SYNC_INTERVAL_SEC:-300}"
     SYNC_SCRIPT="${SLIME_HOST_DIR}/aws-cluster/wandb-sync.sh"
 
-    srun \
-        --nodes=${NUM_NODES} --gpus-per-node=8 --ntasks-per-node=1 --exclusive \
-        --cpus-per-task=64 --mem=0 \
-        --account="${SLURM_ACCOUNT}" --qos="${QOS}" \
-        --time="${TRAIN_WALLTIME}" \
-        --mpi=none \
-        --job-name="${RUN_NAME}" \
-        --output="${TRAIN_LOG_PATH}" \
+    SRUN_ARGS=(
+        --nodes="${NUM_NODES}"
+        --gpus-per-node=8
+        --ntasks-per-node=1
+        --cpus-per-task=64
+        --mem=0
+        --mpi=none
+        --job-name="${RUN_NAME}"
+        --output="${TRAIN_LOG_PATH}"
+    )
+    if [[ -n "${DEV_ALLOCATION_JOB_ID}" ]]; then
+        SRUN_ARGS+=(--jobid="${DEV_ALLOCATION_JOB_ID}" --overlap)
+        echo "[outer] attaching to persistent Slurm allocation ${DEV_ALLOCATION_JOB_ID}"
+        if [[ "${NUM_NODES}" == "1" ]]; then
+            ENROOT_DATA_MODE=shared
+        else
+            ENROOT_DATA_MODE=staged
+        fi
+    else
+        ENROOT_DATA_MODE=staged
+        SRUN_ARGS+=(
+            --exclusive
+            --account="${SLURM_ACCOUNT}"
+            --qos="${QOS}"
+            --time="${TRAIN_WALLTIME}"
+        )
+    fi
+
+    srun "${SRUN_ARGS[@]}" \
         bash -c "
-            # Pre-stage rootfs to per-node local /dev/shm to avoid flock()
-            # failures on shared FSx (NFS4). enroot's runtime.sh:243 does
-            # 'flock -w 30' on \${rootfs}/.enroot.lock; on NFS4 flock is
-            # unreliable and with 8 nodes racing, 6/8 immediately fail with
-            # 'Could not acquire rootfs lock'. Local tmpfs sidesteps this
-            # entirely. cp -a is ~30-60s from FSx to tmpfs; each subsequent
-            # enroot start reuses the local copy.
-            LOCAL_ENROOT_DATA=/dev/shm/enroot-\${USER}-\${SLURM_JOB_ID}
-            LOCAL_ROOTFS=\${LOCAL_ENROOT_DATA}/${ENROOT_ROOTFS}
-            if [[ ! -d \${LOCAL_ROOTFS} ]]; then
-                mkdir -p \${LOCAL_ENROOT_DATA}
-                echo \"[node \${SLURM_NODEID:-0}] copying rootfs FSx -> \${LOCAL_ROOTFS} ...\"
-                time cp -a /storage/home/hhzhang01/.local/share/enroot/${ENROOT_ROOTFS} \${LOCAL_ENROOT_DATA}/
-                echo \"[node \${SLURM_NODEID:-0}] rootfs staged\"
+            if [[ '${ENROOT_DATA_MODE}' == shared ]]; then
+                # Persistent dev allocations run one enroot step at a time, so
+                # they can reuse the shared imported rootfs without the
+                # multi-node flock race or a 24 GB copy on every retry.
+                LOCAL_ENROOT_DATA=/storage/home/hhzhang01/.local/share/enroot
+                echo \"[node \${SLURM_NODEID:-0}] using shared enroot rootfs for dev allocation\"
+            else
+                # Pre-stage rootfs to per-node local /dev/shm to avoid flock()
+                # failures when multiple nodes start concurrently on NFS4.
+                LOCAL_ENROOT_DATA=/dev/shm/enroot-\${USER}-\${SLURM_JOB_ID}
+                LOCAL_ROOTFS=\${LOCAL_ENROOT_DATA}/${ENROOT_ROOTFS}
+                if [[ ! -d \${LOCAL_ROOTFS} ]]; then
+                    mkdir -p \${LOCAL_ENROOT_DATA}
+                    echo \"[node \${SLURM_NODEID:-0}] copying rootfs FSx -> \${LOCAL_ROOTFS} ...\"
+                    time cp -a /storage/home/hhzhang01/.local/share/enroot/${ENROOT_ROOTFS} \${LOCAL_ENROOT_DATA}/
+                    echo \"[node \${SLURM_NODEID:-0}] rootfs staged\"
+                fi
             fi
 
             ENROOT_TEMP_PATH=/dev/shm \
@@ -634,6 +668,10 @@ echo "[head] wrote ${HEAD_IP_FILE}=${MY_IP}, waiting 30s for workers to join"
 sleep 30
 ray status || true
 
+# RUNTIME_ENV_JSON contains LLAMA_API_KEY. Keep xtrace disabled until the Ray
+# submission returns so neither the assignment nor the CLI argument leaks the
+# credential into the Slurm training log.
+set +x
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
     \"PYTHONPATH\": \"/root/Megatron-LM/:/slime\",
@@ -683,6 +721,8 @@ ray job submit --address="http://127.0.0.1:8265" \
    "${COLOCATE_ARGS[@]}"
 
 TRAIN_STATUS=$?
+unset RUNTIME_ENV_JSON
+set -x
 echo "[head] ray job submit returned status=${TRAIN_STATUS}"
 
 # Disable errexit for the tail cleanup. Long-running training on FSx-mounted
