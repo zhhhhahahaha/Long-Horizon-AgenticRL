@@ -68,6 +68,31 @@ This is a **pipeline-first** port:
 - [`eval/legacy/README.md`](eval/legacy/README.md) documents the retained older
   Slurm and research-analysis pipeline. It is not the official metric path.
 
+## Search and open-page variants
+
+The canonical rollout keeps the original SUPO behavior by default: `search`
+lets the model choose `topk` (default 10, capped at 20), and `open_page` returns
+at most 4096 words. Two independent environment variables select experimental
+variants without forking the rollout implementation:
+
+| Variable | Unset (baseline) | Example override |
+|---|---|---|
+| `BCPLUS_FIXED_SEARCH_TOPK` | Model-controlled topk | `5` removes topk from the tool schema and forces top-5 |
+| `BCPLUS_DOC_WORDS_FULL` | `4096` | `10000` raises the open-page full-text cap |
+
+For the combined fixed-top5/open-10000 variant on AWS:
+
+```bash
+BCPLUS_FIXED_SEARCH_TOPK=5 \
+BCPLUS_DOC_WORDS_FULL=10000 \
+bash examples/supo_browsecomp/aws/run_qwen3p5_4B_colocate.sh
+```
+
+Either variable can be set alone. The 4B AWS launcher includes the effective
+combination in its default `RUN_NAME`, so checkpoints, dumps, logs, Ray
+coordination files, and W&B runs stay separate. An explicit `RUN_NAME` still
+overrides that generated name.
+
 ## Prerequisites
 
 ### 1. Search server (biggest external dep)

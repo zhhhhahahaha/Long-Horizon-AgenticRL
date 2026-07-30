@@ -84,14 +84,36 @@ from slime.utils.http_utils import post
 from slime.utils.types import Sample
 
 from .local_search_client import AsyncSearchClient
-from .tool_schemas import TOOLS
+from .tool_schemas import build_tools
+
+
+def _optional_positive_int_env(name: str) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}")
+    return value
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    value = _optional_positive_int_env(name)
+    return default if value is None else value
 
 BCPLUS_CONFIGS = {
     "max_turns": int(os.environ.get("BCPLUS_MAX_TURNS", "64")),
+    # Unset preserves the SUPO baseline: the model chooses topk (default 10,
+    # capped at 20). A positive value removes topk from the tool schema and
+    # forces that value in the execution layer, ignoring stray model args.
+    "fixed_search_topk": _optional_positive_int_env("BCPLUS_FIXED_SEARCH_TOPK"),
     "search_topk_default": 10,
     "search_topk_cap": 20,
     "doc_words_snippet": 512,  # matches SUPO reference impl (search result snippet)
-    "doc_words_full": 4096,    # matches SUPO reference impl (open_page full content)
+    "doc_words_full": _positive_int_env("BCPLUS_DOC_WORDS_FULL", 4096),
     "search_concurrency": int(os.environ.get("BCPLUS_SEARCH_CONCURRENCY", "128")),
     "judge_concurrency": int(os.environ.get("BCPLUS_JUDGE_CONCURRENCY", "64")),
     # Judge calls go through the internal MetaGen gateway via the Llama API
@@ -125,6 +147,8 @@ BCPLUS_CONFIGS = {
     "dump_train_old": os.environ.get("BCPLUS_DUMP_TRAIN_OLD", "").strip().lower()
     not in ("", "0", "false"),
 }
+
+TOOLS = build_tools(BCPLUS_CONFIGS["fixed_search_topk"])
 
 _SEARCH_SEM = asyncio.Semaphore(BCPLUS_CONFIGS["search_concurrency"])
 _JUDGE_SEM = asyncio.Semaphore(BCPLUS_CONFIGS["judge_concurrency"])
@@ -600,6 +624,19 @@ async def _judge(question: str, correct_answer: str, predicted_answer: str) -> f
 # ---------------------------------------------------------------------------
 
 
+def _resolve_search_topk(args: Mapping) -> int:
+    fixed_topk = BCPLUS_CONFIGS["fixed_search_topk"]
+    if fixed_topk is not None:
+        return fixed_topk
+
+    topk_raw = args.get("topk", BCPLUS_CONFIGS["search_topk_default"])
+    try:
+        topk = int(topk_raw)
+    except (TypeError, ValueError):
+        topk = BCPLUS_CONFIGS["search_topk_default"]
+    return max(1, min(topk, BCPLUS_CONFIGS["search_topk_cap"]))
+
+
 async def _run_action(
     fn_calls: list[dict], visited: set[str]
 ) -> tuple[str, str | None, bool, set[str], set[str]]:
@@ -625,12 +662,7 @@ async def _run_action(
         args = fn["arguments"]
         if name == "search":
             query = args.get("query", "").strip()
-            topk_raw = args.get("topk", BCPLUS_CONFIGS["search_topk_default"])
-            try:
-                topk = int(topk_raw)
-            except (TypeError, ValueError):
-                topk = BCPLUS_CONFIGS["search_topk_default"]
-            topk = max(1, min(topk, BCPLUS_CONFIGS["search_topk_cap"]))
+            topk = _resolve_search_topk(args)
             if not query:
                 observation += '[Error] The "search" function requires a "query" argument.'
                 continue

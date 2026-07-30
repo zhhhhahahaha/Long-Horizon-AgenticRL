@@ -37,6 +37,11 @@
 #   BCPLUS_COMPRESS_THRESH      default 0.85
 #   BCPLUS_MAX_SUB_TRAJS        default 5
 #   BCPLUS_COMPRESS_PENALTY     default 0.5
+#   BCPLUS_FIXED_SEARCH_TOPK    default empty (model-controlled topk, default
+#                               10 and cap 20). Set to 5 for fixed top-5; the
+#                               model-facing schema then hides the topk arg.
+#   BCPLUS_DOC_WORDS_FULL       default 4096. Set to 10000 to raise the
+#                               open_page full-text word cap independently.
 #   BCPLUS_DUMP_DIR             default /genai/fsx-project/hhzhang01/dumps/${RUN_NAME}
 #                               — per-iter rollout parquet dump is ON by default
 #                               so training rollouts can be inspected offline.
@@ -84,8 +89,26 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
     SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
     SLIME_HOST_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
-    export RUN_NAME="${RUN_NAME:-supo-bcplus-qwen3p5-4b-$(date +%Y%m%d-%H%M)}"
+    FIXED_SEARCH_TOPK="${BCPLUS_FIXED_SEARCH_TOPK:-}"
+    DOC_WORDS_FULL="${BCPLUS_DOC_WORDS_FULL:-4096}"
+    if [[ -n "${FIXED_SEARCH_TOPK}" && ! "${FIXED_SEARCH_TOPK}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "BCPLUS_FIXED_SEARCH_TOPK must be a positive integer or empty" >&2
+        exit 2
+    fi
+    if [[ ! "${DOC_WORDS_FULL}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "BCPLUS_DOC_WORDS_FULL must be a positive integer" >&2
+        exit 2
+    fi
+    if [[ -n "${FIXED_SEARCH_TOPK}" ]]; then
+        SEARCH_CONFIG_TAG="fixedtopk${FIXED_SEARCH_TOPK}"
+    else
+        SEARCH_CONFIG_TAG="modeltopk"
+    fi
+    CONFIG_TAG="${SEARCH_CONFIG_TAG}-open${DOC_WORDS_FULL}w"
+
+    export RUN_NAME="${RUN_NAME:-supo-bcplus-${CONFIG_TAG}-qwen3p5-4b-$(date +%Y%m%d-%H%M)}"
     echo "RUN_NAME=${RUN_NAME}"
+    echo "BC+ tool config: ${CONFIG_TAG}"
 
     ENROOT_ROOTFS="${ENROOT_ROOTFS:-slime-test}"
     SLURM_ACCOUNT="${SLURM_ACCOUNT:-genai_interns}"
@@ -239,6 +262,8 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
                 --env BCPLUS_MAX_SUB_TRAJS='${BCPLUS_MAX_SUB_TRAJS:-}' \
                 --env BCPLUS_MAX_TURNS='${BCPLUS_MAX_TURNS:-}' \
                 --env BCPLUS_COMPRESS_PENALTY='${BCPLUS_COMPRESS_PENALTY:-}' \
+                --env BCPLUS_FIXED_SEARCH_TOPK='${BCPLUS_FIXED_SEARCH_TOPK:-}' \
+                --env BCPLUS_DOC_WORDS_FULL='${BCPLUS_DOC_WORDS_FULL:-}' \
                 --env BCPLUS_DUMP_DIR='${BCPLUS_DUMP_DIR:-}' \
                 --env BCPLUS_DUMP_TRAIN_OLD='${BCPLUS_DUMP_TRAIN_OLD:-}' \
                 --env BCPLUS_JUDGE_MODEL='${BCPLUS_JUDGE_MODEL:-}' \
@@ -683,6 +708,8 @@ RUNTIME_ENV_JSON="{
     \"BCPLUS_COMPRESS_THRESH\": \"${BCPLUS_COMPRESS_THRESH:-0.85}\",
     \"BCPLUS_MAX_SUB_TRAJS\": \"${BCPLUS_MAX_SUB_TRAJS:-5}\",
     \"BCPLUS_COMPRESS_PENALTY\": \"${BCPLUS_COMPRESS_PENALTY:-0.5}\",
+    \"BCPLUS_FIXED_SEARCH_TOPK\": \"${BCPLUS_FIXED_SEARCH_TOPK:-}\",
+    \"BCPLUS_DOC_WORDS_FULL\": \"${BCPLUS_DOC_WORDS_FULL:-4096}\",
     \"BCPLUS_DUMP_DIR\": \"${BCPLUS_DUMP_DIR:-}\",
     \"BCPLUS_DUMP_TRAIN_OLD\": \"${BCPLUS_DUMP_TRAIN_OLD:-}\",
     \"BCPLUS_JUDGE_MODEL\": \"${BCPLUS_JUDGE_MODEL:-gpt-5-4-genai-dss4}\",

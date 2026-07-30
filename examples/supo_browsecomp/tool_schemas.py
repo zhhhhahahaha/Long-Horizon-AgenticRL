@@ -12,6 +12,8 @@ reference implementation apart from the tool-call wrapper format.
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 SEARCH_SCHEMA = {
     "type": "function",
     "function": {
@@ -101,7 +103,31 @@ FINISH_SCHEMA = {
     },
 }
 
-TOOLS = [SEARCH_SCHEMA, OPEN_PAGE_SCHEMA, FINISH_SCHEMA]
+def build_tools(fixed_search_topk: int | None = None) -> list[dict]:
+    """Build tool schemas for baseline or fixed-top-k search rollouts."""
+    if fixed_search_topk is not None and (
+        not isinstance(fixed_search_topk, int) or isinstance(fixed_search_topk, bool) or fixed_search_topk < 1
+    ):
+        raise ValueError("fixed_search_topk must be a positive integer or None")
+
+    tools = deepcopy([SEARCH_SCHEMA, OPEN_PAGE_SCHEMA, FINISH_SCHEMA])
+    if fixed_search_topk is None:
+        return tools
+
+    search_function = tools[0]["function"]
+    search_function["description"] = (
+        "Performs a web search: supply a string 'query'. "
+        f"The tool retrieves the top {fixed_search_topk} results for the query, "
+        "returning their docid, url, and document content "
+        "(may be truncated based on token limits)."
+    )
+    search_function["parameters"]["properties"].pop("topk")
+    return tools
+
+
+# Public baseline schema retained for callers that do not select a rollout
+# variant. generate_with_bcplus builds its schema from the runtime config.
+TOOLS = build_tools()
 
 # Future-facing: compress is not yet exposed to the model. When we later
 # support model-driven compression (policy decides *when* to summarize), we
