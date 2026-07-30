@@ -32,16 +32,12 @@ Later steps should skip the copy. If the launcher logs `using shared enroot
 rootfs for dev allocation` with `NUM_NODES` greater than 1, stop the run because
 the wrong rootfs mode was selected.
 
-During staging, this warning can appear:
-
-```text
-cp: cannot access '.../slime-test/tmp_host': Permission denied
-```
-
-The inaccessible `tmp_host` directory is disposable. Treat the copy as
-successful only if the log later prints `rootfs staged` and the job continues.
-If staging exits early or a step is stopped before it finishes, remove its
-partial `/dev/shm/enroot-${USER}-${SLURM_JOB_ID}` directory before retrying.
+Staging uses `rsync` and excludes only imported host/Slurm runtime residue:
+`tmp_host/` and `var/spool/slurmd/pmix.*`. These paths are recreated when the
+container starts and are not image contents. A `.slime-stage-complete` marker
+is written only after a successful copy, so a retry completes a partial stage
+instead of treating the directory itself as proof of success. Confirm the log
+prints `rootfs staged` before relying on the local copy.
 
 Reuse lasts only for the lifetime of the same persistent allocation. Before
 releasing a persistent multi-node allocation, remove its staging directory on

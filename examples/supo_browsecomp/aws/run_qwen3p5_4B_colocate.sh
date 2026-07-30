@@ -238,10 +238,23 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
                 # failures when multiple nodes start concurrently on NFS4.
                 LOCAL_ENROOT_DATA=/dev/shm/enroot-\${USER}-\${SLURM_JOB_ID}
                 LOCAL_ROOTFS=\${LOCAL_ENROOT_DATA}/${ENROOT_ROOTFS}
-                if [[ ! -d \${LOCAL_ROOTFS} ]]; then
-                    mkdir -p \${LOCAL_ENROOT_DATA}
-                    echo \"[node \${SLURM_NODEID:-0}] copying rootfs FSx -> \${LOCAL_ROOTFS} ...\"
-                    time cp -a /storage/home/hhzhang01/.local/share/enroot/${ENROOT_ROOTFS} \${LOCAL_ENROOT_DATA}/
+                ROOTFS_READY=\${LOCAL_ROOTFS}/.slime-stage-complete
+                if [[ ! -f \${ROOTFS_READY} ]]; then
+                    mkdir -p \${LOCAL_ROOTFS}
+                    echo \"[node \${SLURM_NODEID:-0}] staging rootfs FSx -> \${LOCAL_ROOTFS} ...\"
+                    # Imported rootfs directories can retain host/Slurm runtime
+                    # mounts that are unreadable and are recreated at launch.
+                    # Exclude only those transient paths; a completion marker
+                    # prevents a partial copy from being reused after failure.
+                    if ! time rsync -a \
+                        --exclude='/tmp_host/' \
+                        --exclude='/var/spool/slurmd/pmix.*' \
+                        /storage/home/hhzhang01/.local/share/enroot/${ENROOT_ROOTFS}/ \
+                        \${LOCAL_ROOTFS}/; then
+                        echo \"[node \${SLURM_NODEID:-0}] rootfs staging failed\" >&2
+                        exit 1
+                    fi
+                    touch \${ROOTFS_READY}
                     echo \"[node \${SLURM_NODEID:-0}] rootfs staged\"
                 fi
             fi
