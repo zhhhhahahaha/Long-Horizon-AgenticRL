@@ -93,6 +93,29 @@ combination in its default `RUN_NAME`, so checkpoints, dumps, logs, Ray
 coordination files, and W&B runs stay separate. An explicit `RUN_NAME` still
 overrides that generated name.
 
+## Training trajectory artifacts
+
+The AWS launcher writes a per-DP-rank parquet dump by default. It contains the
+token IDs, loss masks, rollout log probabilities, rewards, and advantages used
+by training. For complete research trajectories in the same raw format as
+evaluation's `eval_0.pt`, also set `BCPLUS_RAW_ROLLOUT_DIR`:
+
+```bash
+RUN_NAME=supo-bcplus-fixedtopk5-open10000w-run \
+BCPLUS_DUMP_DIR="" \
+BCPLUS_RAW_ROLLOUT_DIR=/genai/fsx-project/hhzhang01/raw-rollouts/supo-bcplus-fixedtopk5-open10000w-run \
+bash examples/supo_browsecomp/aws/run_qwen3p5_4B_colocate.sh
+```
+
+This writes one `rollout_<iteration>.pt` file per training iteration. Each file
+contains full `Sample` records: decoded prompt and response, gold label, reward,
+tool/compression metadata, tokens, and loss masks. The sibling chains can be
+analyzed with the same helpers used by
+[`eval/eval_pipeline.py`](eval/eval_pipeline.py), especially
+`analyze_samples`. Keep the parquet dump enabled when logprob or advantage
+auditing is required. Set `BCPLUS_DUMP_DIR=""` as above when the native `.pt`
+trajectory is sufficient and the extra parquet is not needed.
+
 ## Prerequisites
 
 ### 1. Search server (biggest external dep)

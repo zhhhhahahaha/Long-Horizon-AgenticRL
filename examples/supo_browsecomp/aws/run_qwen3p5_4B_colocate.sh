@@ -52,6 +52,11 @@
 #                               forward pass every iter) and fills the
 #                               train_old_logps column. Leave off to dump
 #                               trajectories cheaply for inspection.
+#   BCPLUS_RAW_ROLLOUT_DIR      default empty (off). When set, writes one full
+#                               Sample dump per iteration using slime's native
+#                               evaluation-compatible .pt format. This includes
+#                               decoded prompt/response, label, reward, tool and
+#                               compression metadata, tokens, and loss masks.
 #   BCPLUS_JUDGE_MODEL          default "gpt-5-4-genai-dss4" (MetaGen judge id)
 #   BCPLUS_JUDGE_BASE_URL       default "https://api.llama.com/compat/v1/"
 #   BCPLUS_JUDGE_CONCURRENCY    default 64  (judge call semaphore)
@@ -266,6 +271,7 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
                 --env BCPLUS_DOC_WORDS_FULL='${BCPLUS_DOC_WORDS_FULL:-}' \
                 --env BCPLUS_DUMP_DIR='${BCPLUS_DUMP_DIR:-}' \
                 --env BCPLUS_DUMP_TRAIN_OLD='${BCPLUS_DUMP_TRAIN_OLD:-}' \
+                --env BCPLUS_RAW_ROLLOUT_DIR='${BCPLUS_RAW_ROLLOUT_DIR:-}' \
                 --env BCPLUS_JUDGE_MODEL='${BCPLUS_JUDGE_MODEL:-}' \
                 --env BCPLUS_JUDGE_BASE_URL='${BCPLUS_JUDGE_BASE_URL:-}' \
                 --env BCPLUS_JUDGE_CONCURRENCY='${BCPLUS_JUDGE_CONCURRENCY:-}' \
@@ -562,6 +568,21 @@ if [[ -n "${BCPLUS_DUMP_DIR:-}" ]]; then
         echo "[BCPLUS] auto-translated BCPLUS_DUMP_DIR host=${BCPLUS_DUMP_DIR} -> container=${BCPLUS_DUMP_DIR_CONTAINER}"
         export BCPLUS_DUMP_DIR="${BCPLUS_DUMP_DIR_CONTAINER}"
     fi
+fi
+
+# Optional full-Sample trajectory dump. This is the same raw format used by
+# evaluation's eval_0.pt and can be consumed by eval/eval_pipeline.py helpers.
+# Keep it separate from the parquet dump above: the .pt owns decoded research
+# trajectories and metadata, while parquet owns training-time logprob tensors.
+if [[ -n "${BCPLUS_RAW_ROLLOUT_DIR:-}" ]]; then
+    if [[ "${BCPLUS_RAW_ROLLOUT_DIR}" == /genai/fsx-project/hhzhang01/* ]]; then
+        BCPLUS_RAW_ROLLOUT_DIR="${BCPLUS_RAW_ROLLOUT_DIR/#\/genai\/fsx-project\/hhzhang01/\/genai_hh}"
+    fi
+    CUSTOM_ARGS+=(
+        --save-debug-rollout-data
+        "${BCPLUS_RAW_ROLLOUT_DIR}/rollout_{rollout_id}.pt"
+    )
+    echo "[BCPLUS] full Sample trajectories: ${BCPLUS_RAW_ROLLOUT_DIR}/rollout_{rollout_id}.pt"
 fi
 
 # Colocate + offload: sglang engines and training actor share the same 64
