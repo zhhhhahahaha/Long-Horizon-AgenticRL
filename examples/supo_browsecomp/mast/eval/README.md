@@ -32,6 +32,7 @@ checkpoint discovery -> frozen sweep_config.json -> code archive
 | SGLang memory fraction | 0.8 | 0.8 |
 | SGLang server concurrency per engine | 36 | 32 |
 | SGLang router request timeout | 5400 seconds | 5400 seconds |
+| NCCL timeout debug dump | disabled | disabled |
 | Max response / context | 32768 / 65536 | 32768 / 65536 |
 | Questions x samples | 150 x 4 | 150 x 4 |
 | Search / judge concurrency | 64 / 16 | 64 / 16 |
@@ -43,6 +44,13 @@ The model-specific SGLang concurrency leaves headroom above the observed
 long-context running set without restoring the effectively unbounded historical
 load. It can be overridden explicitly with
 `BCPLUS_SGLANG_SERVER_CONCURRENCY` for a controlled experiment.
+
+Eval jobs set `TORCH_NCCL_DUMP_ON_TIMEOUT=0`. Eight independent TP1 engines on
+one host are all NCCL rank 0; leaving the timeout dump enabled lets them race
+for the shared `/tmp/nccl_trace_rank0.pipe` and can abort one engine before
+rollout starts. This disables only the detailed NCCL timeout dump. Normal NCCL
+errors, watchdog behavior, SGLang request timeouts, and eval results are
+unchanged.
 
 The controller also recognizes the pre-reorganization archive path
 `mast/run_eval.sh` when extending an older batch. It never rewrites that frozen
@@ -78,6 +86,34 @@ python examples/supo_browsecomp/mast/eval/eval_sweep.py orchestrate \
 A batch cannot mix model sizes because its base result is shared. A 9B run uses
 the Qwen3.5-9B HF and torch-distributed checkpoints and evaluates a separate 9B
 base; it never reuses a 4B base.
+
+## Resume training and keep the original report
+
+A resumed MAST job normally has a new MAST job name but retains the original
+`BC_RUN_NAME`. In that case it writes new checkpoints into the original
+checkpoint root, and evaluation should extend the original eval batch rather
+than start a new one:
+
+```bash
+OLD_BATCH=<batch-that-produced-the-existing-report>
+
+python examples/supo_browsecomp/mast/eval/eval_sweep.py orchestrate \
+  --batch-id "$OLD_BATCH" \
+  --extend-checkpoints
+```
+
+Do not pass `--run` or `--reuse-base-from` when extending an existing batch.
+Its frozen `sweep_config.json` already owns the run names, base source,
+evaluation settings, and code archive. Existing `_SUCCESS` points remain in
+place, only newly discovered complete checkpoints are submitted, and the
+report is regenerated at the same cloud and local report paths.
+
+Check `sweep_config.json` before extending. The controller rediscovers every
+run configured in the batch. A single-run batch therefore extends only the
+resumed run. For a multi-run batch, use the same command only when new complete
+checkpoints from all configured runs may be appended. The controller currently
+has no per-run extension selector; use a separate batch when one run must be
+isolated rather than manually editing the frozen configuration.
 
 ## Extend an unfinished training run
 

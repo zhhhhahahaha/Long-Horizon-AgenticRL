@@ -216,6 +216,8 @@ def test_mast_command_is_single_host_and_has_checkpoint_contract(tmp_path, monke
     assert "BCPLUS_SEARCH_CONCURRENCY=64" in joined
     assert "BCPLUS_JUDGE_CONCURRENCY=16" in joined
     assert "BC_MODEL_SIZE=4B" in joined
+    assert "TORCH_NCCL_DUMP_ON_TIMEOUT=0" in joined
+    assert "--job_priority=HIGH" in command
     assert "examples/supo_browsecomp/mast/eval/run_eval.sh" in joined
     assert "examples/supo_browsecomp/mast/run_eval.sh" in joined
     assert command[-1] == "--dryrun"
@@ -252,6 +254,8 @@ def test_eval_runner_has_model_specific_sglang_concurrency_defaults():
     assert "DEFAULT_SGLANG_SERVER_CONCURRENCY=36" in runner
     assert "DEFAULT_SGLANG_SERVER_CONCURRENCY=32" in runner
     assert 'BCPLUS_SGLANG_SERVER_CONCURRENCY="${BCPLUS_SGLANG_SERVER_CONCURRENCY:-${DEFAULT_SGLANG_SERVER_CONCURRENCY}}"' in runner
+    assert 'export TORCH_NCCL_DUMP_ON_TIMEOUT="${TORCH_NCCL_DUMP_ON_TIMEOUT:-0}"' in runner
+    assert '\\"TORCH_NCCL_DUMP_ON_TIMEOUT\\": \\"${TORCH_NCCL_DUMP_ON_TIMEOUT}\\"' in runner
 
 
 @pytest.mark.unit

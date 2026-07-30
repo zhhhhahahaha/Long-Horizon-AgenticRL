@@ -7,6 +7,9 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export RAY_AUTH_MODE=disabled
 export SGLANG_NUMA_BIND_V2=0
 export PYTORCH_CUDA_ALLOC_CONF=""
+# Eight independent TP1 engines are all NCCL rank 0 and otherwise race on the
+# default timeout-dump pipe. Normal NCCL error reporting remains enabled.
+export TORCH_NCCL_DUMP_ON_TIMEOUT="${TORCH_NCCL_DUMP_ON_TIMEOUT:-0}"
 unset TRITON_CACHE_MANAGER
 export TRITON_CACHE_DIR=/tmp/triton_cache_slime_eval
 
@@ -192,6 +195,7 @@ RUNTIME_ENV_JSON="{
     \"SLIME_HOST_IP\": \"127.0.0.1\",
     \"SGLANG_NUMA_BIND_V2\": \"0\",
     \"PYTORCH_CUDA_ALLOC_CONF\": \"\",
+    \"TORCH_NCCL_DUMP_ON_TIMEOUT\": \"${TORCH_NCCL_DUMP_ON_TIMEOUT}\",
     \"TRITON_CACHE_DIR\": \"/tmp/triton_cache_slime_eval\",
     \"HF_HUB_OFFLINE\": \"1\",
     \"TRANSFORMERS_OFFLINE\": \"1\",
@@ -215,6 +219,7 @@ RUNTIME_ENV_JSON="{
 
 echo "[eval] model=${MODEL_NAME} run=${EVAL_RUN_NAME} point=${EVAL_POINT} step=${EVAL_REQUESTED_STEP} output=${EVAL_OUTPUT_DIR}"
 echo "[eval] sglang_tp=1 server_concurrency=${BCPLUS_SGLANG_SERVER_CONCURRENCY} request_timeout_secs=${BCPLUS_SGLANG_REQUEST_TIMEOUT_SECS}"
+echo "[eval] torch_nccl_dump_on_timeout=${TORCH_NCCL_DUMP_ON_TIMEOUT}"
 ray start --head --node-ip-address=127.0.0.1 --num-gpus 8 \
   --disable-usage-stats --dashboard-host=127.0.0.1 --dashboard-port=8265
 

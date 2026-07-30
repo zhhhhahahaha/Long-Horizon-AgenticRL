@@ -548,6 +548,7 @@ def build_mast_command(
                         ("BC_MODEL_SIZE", config.model_size),
                         ("BCPLUS_SEARCH_CONCURRENCY", config.search_concurrency),
                         ("BCPLUS_JUDGE_CONCURRENCY", config.judge_concurrency),
+                        ("TORCH_NCCL_DUMP_ON_TIMEOUT", 0),
                     )
                 ]
             ),
@@ -562,7 +563,7 @@ def build_mast_command(
         "--json",
         "--tenant=rhea_assistant_interns",
         "--region=nha",
-        "--job_priority=CRITICAL",
+        "--job_priority=HIGH",
         "--workspace=None",
         "--main_package=xlformers_pretrain1:latest",
         "program",
