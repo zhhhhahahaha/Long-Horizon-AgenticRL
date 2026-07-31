@@ -342,6 +342,25 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     temporary.replace(path)
 
 
+def sampling_manifest(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "samples_per_question": args.samples_per_question,
+        "rollout_seed": args.rollout_seed,
+        "sampling_seeds": list(
+            range(args.rollout_seed, args.rollout_seed + args.samples_per_question)
+        ),
+        "deterministic": True,
+        "temperature": args.temperature,
+        "max_response_len": args.max_response_len,
+        "max_context_len": args.max_context_len,
+        "max_turns": args.max_turns,
+        "max_sub_trajs": args.max_sub_trajs,
+        "compression_threshold": args.compression_threshold,
+        "fixed_search_topk": args.fixed_search_topk,
+        "doc_words_full": args.doc_words_full,
+    }
+
+
 def analyze_point(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -367,18 +386,7 @@ def analyze_point(args: argparse.Namespace) -> None:
         "mast_job_name": args.mast_job_name,
         "judge_model": args.judge_model,
         "search_url": args.search_url,
-        "sampling": {
-            "samples_per_question": args.samples_per_question,
-            "rollout_seed": args.rollout_seed,
-            "sampling_seeds": list(range(args.rollout_seed, args.rollout_seed + args.samples_per_question)),
-            "deterministic": True,
-            "temperature": args.temperature,
-            "max_response_len": args.max_response_len,
-            "max_context_len": args.max_context_len,
-            "max_turns": args.max_turns,
-            "max_sub_trajs": args.max_sub_trajs,
-            "compression_threshold": args.compression_threshold,
-        },
+        "sampling": sampling_manifest(args),
     }
     _write_json(output_dir / "manifest.json", manifest)
     _write_json(output_dir / "point_metrics.json", metrics)
@@ -460,6 +468,8 @@ def build_run_report(args: argparse.Namespace) -> None:
     run_root = Path(args.run_root)
     base_root = Path(args.base_root)
     point_dirs = [path for path in run_root.iterdir() if path.is_dir() and re.fullmatch(r"iter\d+", path.name)]
+    if args.allow_partial:
+        point_dirs = [path for path in point_dirs if (path / "_SUCCESS").is_file()]
     point_dirs = [base_root, *sorted(point_dirs, key=lambda path: _point_sort_key(path.name))]
     if not point_dirs:
         raise ValueError(f"no eval points found under {run_root}")
@@ -719,6 +729,8 @@ def _point_parser(subparsers) -> None:
     parser.add_argument("--max-turns", type=int, default=64)
     parser.add_argument("--max-sub-trajs", type=int, default=5)
     parser.add_argument("--compression-threshold", type=float, default=0.85)
+    parser.add_argument("--fixed-search-topk", type=int)
+    parser.add_argument("--doc-words-full", type=int, default=4096)
     parser.set_defaults(func=analyze_point)
 
 
@@ -731,6 +743,11 @@ def main() -> None:
     report.add_argument("--base-root", required=True)
     report.add_argument("--run-name", required=True)
     report.add_argument("--output-dir")
+    report.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="build an incremental report from only points with _SUCCESS",
+    )
     report.set_defaults(func=build_run_report)
     args = parser.parse_args()
     args.func(args)

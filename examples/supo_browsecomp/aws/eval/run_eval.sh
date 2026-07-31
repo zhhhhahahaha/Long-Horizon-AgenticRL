@@ -1,5 +1,5 @@
 #!/bin/bash
-# One-checkpoint BC+ eval runner for a single 8-GPU MAST host.
+# One-checkpoint BC+ evaluation runner inside an exclusive 8-GPU AWS node.
 set -euo pipefail
 
 export PYTHONUNBUFFERED=1
@@ -7,25 +7,25 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export RAY_AUTH_MODE=disabled
 export SGLANG_NUMA_BIND_V2=0
 export PYTORCH_CUDA_ALLOC_CONF=""
-# Eight independent TP1 engines are all NCCL rank 0 and otherwise race on the
-# default timeout-dump pipe. Normal NCCL error reporting remains enabled.
-export TORCH_NCCL_DUMP_ON_TIMEOUT="${TORCH_NCCL_DUMP_ON_TIMEOUT:-0}"
 unset TRITON_CACHE_MANAGER
 export TRITON_CACHE_DIR=/tmp/triton_cache_slime_eval
-
-unset http_proxy HTTP_PROXY
-export https_proxy="http://127.0.0.1:9080" HTTPS_PROXY="http://127.0.0.1:9080"
+unset http_proxy HTTP_PROXY https_proxy HTTPS_PROXY
 export no_proxy="127.0.0.1,localhost,::1" NO_PROXY="127.0.0.1,localhost,::1"
 
-SLIME=/slime-src
-D=/mnt/wsfuse/hhzhang01/supo-data
-STAGE=/mnt/wsfuse/hhzhang01/supo-slime
+SLIME=/slime
+DATA_ROOT=/genai_hh
+LLM_ROOT=/genai_llm
 
 : "${EVAL_RUN_NAME:?set EVAL_RUN_NAME (or shared-base)}"
 : "${EVAL_POINT:?set EVAL_POINT (base or iterNN)}"
 : "${EVAL_REQUESTED_STEP:?set EVAL_REQUESTED_STEP (base or integer)}"
-: "${EVAL_OUTPUT_DIR:?set EVAL_OUTPUT_DIR}"
+: "${EVAL_OUTPUT_DIR:?set EVAL_OUTPUT_DIR inside /genai_llm}"
 : "${EVAL_CODE_ARCHIVE_SHA256:?set EVAL_CODE_ARCHIVE_SHA256}"
+: "${LOCAL_SEARCH_URL:?set LOCAL_SEARCH_URL}"
+if [[ -z "${LLAMA_API_KEY:-}" && -f "${LLAMA_KEY_FILE:-}" ]]; then
+  export LLAMA_API_KEY="$(tr -d ' \t\r\n' < "${LLAMA_KEY_FILE}")"
+fi
+: "${LLAMA_API_KEY:?set LLAMA_API_KEY or mount LLAMA_KEY_FILE}"
 
 EVAL_N="${EVAL_N:-4}"
 EVAL_SEED="${EVAL_SEED:-42}"
@@ -35,8 +35,8 @@ BC_MAX_CONTEXT_LEN="${BC_MAX_CONTEXT_LEN:-65536}"
 BCPLUS_MAX_TURNS="${BCPLUS_MAX_TURNS:-64}"
 BCPLUS_MAX_SUB_TRAJS="${BCPLUS_MAX_SUB_TRAJS:-5}"
 BCPLUS_COMPRESS_THRESH="${BCPLUS_COMPRESS_THRESH:-0.85}"
-BCPLUS_FIXED_SEARCH_TOPK="${BCPLUS_FIXED_SEARCH_TOPK:-}"
-BCPLUS_DOC_WORDS_FULL="${BCPLUS_DOC_WORDS_FULL:-4096}"
+BCPLUS_FIXED_SEARCH_TOPK="${BCPLUS_FIXED_SEARCH_TOPK:-5}"
+BCPLUS_DOC_WORDS_FULL="${BCPLUS_DOC_WORDS_FULL:-10000}"
 BCPLUS_SEARCH_CONCURRENCY="${BCPLUS_SEARCH_CONCURRENCY:-64}"
 BCPLUS_JUDGE_CONCURRENCY="${BCPLUS_JUDGE_CONCURRENCY:-16}"
 BCPLUS_SGLANG_REQUEST_TIMEOUT_SECS="${BCPLUS_SGLANG_REQUEST_TIMEOUT_SECS:-5400}"
@@ -52,11 +52,6 @@ if [[ ! "${BCPLUS_DOC_WORDS_FULL}" =~ ^[1-9][0-9]*$ ]]; then
   echo "ERROR: BCPLUS_DOC_WORDS_FULL must be a positive integer" >&2
   exit 2
 fi
-
-if [[ "${MAST_HPC_TASK_GROUP_SIZE:-1}" != "1" ]]; then
-  echo "ERROR: eval runner requires exactly one MAST task, got ${MAST_HPC_TASK_GROUP_SIZE}" >&2
-  exit 1
-fi
 if [[ -e "${EVAL_OUTPUT_DIR}/_SUCCESS" ]]; then
   echo "[eval] already complete: ${EVAL_OUTPUT_DIR}"
   exit 0
@@ -67,17 +62,6 @@ if [[ -e "${EVAL_OUTPUT_DIR}/rollout_data/eval_0.pt" ]]; then
 fi
 mkdir -p "${EVAL_OUTPUT_DIR}"
 
-KEY_FILE="${LLAMA_KEY_FILE:-${STAGE}/.llama_key}"
-if [[ -z "${LLAMA_API_KEY:-}" && -f "${KEY_FILE}" ]]; then
-  export LLAMA_API_KEY="$(tr -d ' \t\r\n' < "${KEY_FILE}")"
-fi
-: "${LLAMA_API_KEY:?LLAMA_API_KEY is unavailable}"
-
-ADDR_FILE="${SEARCH_ADDR_FILE:-${STAGE}/search-server.addr}"
-if [[ -z "${LOCAL_SEARCH_URL:-}" ]]; then
-  [[ -f "${ADDR_FILE}" ]] || { echo "ERROR: missing ${ADDR_FILE}" >&2; exit 1; }
-  export LOCAL_SEARCH_URL="http://$(tr -d ' \t\r\n' < "${ADDR_FILE}")"
-fi
 echo "[eval] search=${LOCAL_SEARCH_URL}; waiting for health"
 healthy=0
 for _ in $(seq 1 72); do
@@ -93,10 +77,13 @@ export MASTER_ADDR=127.0.0.1
 export SLIME_HOST_IP=127.0.0.1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
+cleanup() {
+  ray stop --force >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
 pkill -9 sglang 2>/dev/null || true
 ray stop --force 2>/dev/null || true
 pkill -9 ray 2>/dev/null || true
-pkill -9 python 2>/dev/null || true
 sleep 2
 
 cd "${SLIME}"
@@ -121,15 +108,15 @@ esac
 BCPLUS_SGLANG_SERVER_CONCURRENCY="${BCPLUS_SGLANG_SERVER_CONCURRENCY:-${DEFAULT_SGLANG_SERVER_CONCURRENCY}}"
 source "${MODEL_CONFIG}"
 
-HF_CHECKPOINT="${D}/${MODEL_NAME}"
-BASE_CHECKPOINT="${D}/${MODEL_NAME}_torch_dist"
-for required_path in "${HF_CHECKPOINT}" "${BASE_CHECKPOINT}"; do
-  [[ -e "${required_path}" ]] || { echo "ERROR: missing model path ${required_path}" >&2; exit 1; }
+HF_CHECKPOINT="${DATA_ROOT}/models/${MODEL_NAME}"
+BASE_CHECKPOINT="${DATA_ROOT}/models/${MODEL_NAME}_torch_dist"
+TRAIN_DATA="${DATA_ROOT}/datasets/BC+/bc_train.parquet"
+TEST_DATA="${DATA_ROOT}/datasets/BC+/bc_test.parquet"
+for required_path in "${HF_CHECKPOINT}" "${BASE_CHECKPOINT}" "${TRAIN_DATA}" "${TEST_DATA}"; do
+  [[ -e "${required_path}" ]] || { echo "ERROR: missing path ${required_path}" >&2; exit 1; }
 done
-TRAIN_DATA="${D}/BC+/bc_train.parquet"
-TEST_DATA="${D}/BC+/bc_test.parquet"
-CHECKPOINT_ROOT="${STAGE}/checkpoints/${EVAL_RUN_NAME}"
 
+CHECKPOINT_ROOT="${LLM_ROOT}/checkpoints/${EVAL_RUN_NAME}"
 CKPT_ARGS=(--hf-checkpoint "${HF_CHECKPOINT}" --no-load-optim --no-load-rng)
 if [[ "${EVAL_REQUESTED_STEP}" == "base" ]]; then
   [[ "${EVAL_POINT}" == "base" ]] || { echo "ERROR: base step requires point=base" >&2; exit 1; }
@@ -137,7 +124,10 @@ if [[ "${EVAL_REQUESTED_STEP}" == "base" ]]; then
   CHECKPOINT_METADATA="${BASE_CHECKPOINT}/release/.metadata"
   CKPT_ARGS+=(--load "${BASE_CHECKPOINT}")
 else
-  [[ "${EVAL_REQUESTED_STEP}" =~ ^[0-9]+$ ]] || { echo "ERROR: invalid step ${EVAL_REQUESTED_STEP}" >&2; exit 1; }
+  [[ "${EVAL_REQUESTED_STEP}" =~ ^[0-9]+$ ]] || {
+    echo "ERROR: invalid step ${EVAL_REQUESTED_STEP}" >&2
+    exit 1
+  }
   ITER_DIR="${CHECKPOINT_ROOT}/iter_$(printf '%07d' "${EVAL_REQUESTED_STEP}")"
   [[ -f "${CHECKPOINT_ROOT}/latest_checkpointed_iteration.txt" ]] || {
     echo "ERROR: checkpoint root lacks tracker: ${CHECKPOINT_ROOT}" >&2
@@ -150,7 +140,7 @@ fi
 
 CHECKPOINT_METADATA_SHA256="$(sha256sum "${CHECKPOINT_METADATA}" | awk '{print $1}')"
 DATASET_SHA256="$(sha256sum "${TEST_DATA}" | awk '{print $1}')"
-LOCAL_LOG="/tmp/bcplus-eval-${MAST_HPC_JOB_NAME:-local}.log"
+LOCAL_LOG="/tmp/bcplus-eval-${SLURM_JOB_ID:-local}.log"
 
 ROLLOUT_ARGS=(
   --prompt-data "${TRAIN_DATA}"
@@ -206,7 +196,6 @@ RUNTIME_ENV_JSON="{
     \"SLIME_HOST_IP\": \"127.0.0.1\",
     \"SGLANG_NUMA_BIND_V2\": \"0\",
     \"PYTORCH_CUDA_ALLOC_CONF\": \"\",
-    \"TORCH_NCCL_DUMP_ON_TIMEOUT\": \"${TORCH_NCCL_DUMP_ON_TIMEOUT}\",
     \"TRITON_CACHE_DIR\": \"/tmp/triton_cache_slime_eval\",
     \"HF_HUB_OFFLINE\": \"1\",
     \"TRANSFORMERS_OFFLINE\": \"1\",
@@ -214,8 +203,8 @@ RUNTIME_ENV_JSON="{
     \"LLAMA_API_KEY\": \"${LLAMA_API_KEY}\",
     \"http_proxy\": \"\",
     \"HTTP_PROXY\": \"\",
-    \"https_proxy\": \"http://127.0.0.1:9080\",
-    \"HTTPS_PROXY\": \"http://127.0.0.1:9080\",
+    \"https_proxy\": \"\",
+    \"HTTPS_PROXY\": \"\",
     \"no_proxy\": \"127.0.0.1,localhost,::1\",
     \"NO_PROXY\": \"127.0.0.1,localhost,::1\",
     \"BCPLUS_MAX_TURNS\": \"${BCPLUS_MAX_TURNS}\",
@@ -230,9 +219,8 @@ RUNTIME_ENV_JSON="{
   }
 }"
 
-echo "[eval] model=${MODEL_NAME} run=${EVAL_RUN_NAME} point=${EVAL_POINT} step=${EVAL_REQUESTED_STEP} output=${EVAL_OUTPUT_DIR}"
-echo "[eval] sglang_tp=1 server_concurrency=${BCPLUS_SGLANG_SERVER_CONCURRENCY} request_timeout_secs=${BCPLUS_SGLANG_REQUEST_TIMEOUT_SECS}"
-echo "[eval] torch_nccl_dump_on_timeout=${TORCH_NCCL_DUMP_ON_TIMEOUT}"
+echo "[eval] model=${MODEL_NAME} run=${EVAL_RUN_NAME} point=${EVAL_POINT} step=${EVAL_REQUESTED_STEP}"
+echo "[eval] tool=fixed_topk:${BCPLUS_FIXED_SEARCH_TOPK:-model},open:${BCPLUS_DOC_WORDS_FULL}; output=${EVAL_OUTPUT_DIR}"
 ray start --head --node-ip-address=127.0.0.1 --num-gpus 8 \
   --disable-usage-stats --dashboard-host=127.0.0.1 --dashboard-port=8265
 
@@ -250,7 +238,6 @@ RC=${PIPESTATUS[0]}
 set -e
 
 cp "${LOCAL_LOG}" "${EVAL_OUTPUT_DIR}/eval.log"
-ray stop --force 2>/dev/null || true
 if [[ "${RC}" != "0" ]]; then
   echo "ERROR: ray eval job failed with rc=${RC}" >&2
   exit "${RC}"
@@ -260,14 +247,13 @@ TOOL_PROTOCOL_ARGS=(--doc-words-full "${BCPLUS_DOC_WORDS_FULL}")
 if [[ -n "${BCPLUS_FIXED_SEARCH_TOPK}" ]]; then
   TOOL_PROTOCOL_ARGS+=(--fixed-search-topk "${BCPLUS_FIXED_SEARCH_TOPK}")
 fi
-
 python3 examples/supo_browsecomp/eval/eval_pipeline.py point \
   --dump "${EVAL_OUTPUT_DIR}/rollout_data/eval_0.pt" \
   --output-dir "${EVAL_OUTPUT_DIR}" --load-log "${EVAL_OUTPUT_DIR}/eval.log" \
   --run-name "${EVAL_RUN_NAME}" --point "${EVAL_POINT}" --requested-step "${EVAL_REQUESTED_STEP}" \
   --checkpoint-root "${CHECKPOINT_ROOT}" --checkpoint-metadata-sha256 "${CHECKPOINT_METADATA_SHA256}" \
   --code-archive-sha256 "${EVAL_CODE_ARCHIVE_SHA256}" --dataset-sha256 "${DATASET_SHA256}" \
-  --mast-job-name "${MAST_HPC_JOB_NAME:-local}" --model-name "${MODEL_NAME}" \
+  --mast-job-name "slurm-${SLURM_JOB_ID:-local}" --model-name "${MODEL_NAME}" \
   --judge-model "${BCPLUS_JUDGE_MODEL}" \
   --search-url "${LOCAL_SEARCH_URL}" --expected-questions "${EVAL_EXPECTED_QUESTIONS}" \
   --samples-per-question "${EVAL_N}" --rollout-seed "${EVAL_SEED}" \
