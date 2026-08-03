@@ -121,3 +121,47 @@ def test_open_page_execution_honors_word_limit(word_limit, expected_words):
     content = observation.split("content: ", 1)[1].split("\n\n", 1)[0]
 
     assert len(content.split()) == expected_words
+
+
+@pytest.mark.unit
+def test_fixed_topk_preserves_weighted_result_budget():
+    pages = [
+        {
+            "docid": f"doc-{index}",
+            "url": f"https://example.test/{index}",
+            "text": f"content {index}",
+        }
+        for index in range(20)
+    ]
+
+    class FakeSearchClient:
+        async def search(self, query, count):
+            assert query == "query"
+            assert count == 50
+            return pages
+
+    namespace = {
+        "_search_client": lambda: FakeSearchClient(),
+        "_SEARCH_SEM": asyncio.Semaphore(1),
+        "_resolve_search_topk": lambda args: 5,
+        "BCPLUS_CONFIGS": {
+            "doc_words_snippet": 512,
+            "doc_words_full": 4096,
+        },
+    }
+    function = next(
+        node
+        for node in ast.parse(GENERATE_PATH.read_text()).body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_action"
+    )
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(GENERATE_PATH), "exec"), namespace)
+
+    observation, *_ = asyncio.run(
+        namespace["_run_action"](
+            [{"function": "search", "arguments": {"query": "query"}}],
+            {page["docid"] for page in pages},
+        )
+    )
+
+    # Each repeated result consumes 0.25, so 20 snippets exhaust budget 5.
+    assert observation.count("\n--- #") == 20

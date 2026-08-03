@@ -27,6 +27,7 @@ pipeline = _load("bcplus_eval_pipeline", ROOT / "examples/supo_browsecomp/eval/e
 sweep = _load("bcplus_eval_sweep", ROOT / "examples/supo_browsecomp/mast/eval/eval_sweep.py")
 
 EVAL_RUNNER = ROOT / "examples/supo_browsecomp/mast/eval/run_eval.sh"
+EVAL_CONFIGS = ROOT / "examples/supo_browsecomp/mast/eval/configs"
 
 
 def _sweep_config(*, local_report_root="/tmp/reports", base_source_batch=None):
@@ -213,6 +214,8 @@ def test_mast_command_is_single_host_and_has_checkpoint_contract(tmp_path, monke
     joined = " ".join(command)
     assert "data_parallel_size=1" in joined
     assert "EVAL_REQUESTED_STEP=39" in joined
+    assert "BCPLUS_FIXED_SEARCH_TOPK=5" in joined
+    assert "BCPLUS_DOC_WORDS_FULL=10000" in joined
     assert "BCPLUS_SEARCH_CONCURRENCY=64" in joined
     assert "BCPLUS_JUDGE_CONCURRENCY=16" in joined
     assert "BC_MODEL_SIZE=4B" in joined
@@ -335,6 +338,147 @@ def test_sweep_config_round_trip_and_local_report_sync(tmp_path):
 
 
 @pytest.mark.unit
+def test_legacy_sweep_config_preserves_original_tool_protocol():
+    config = sweep.SweepConfig.from_dict(
+        {
+            "runs": [{"name": "old-run", "alias": "r01", "steps": [4]}],
+            "evaluation": {},
+        }
+    )
+
+    assert config.fixed_search_topk is None
+    assert config.doc_words_full == 4096
+
+
+@pytest.mark.unit
+def test_legacy_manifest_preserves_original_tool_protocol(tmp_path):
+    run = sweep.RunConfig(name="old-run", alias="r01", steps=(4,))
+    config = sweep.SweepConfig(
+        runs=(run,),
+        base_source_batch="old-batch",
+        fixed_search_topk=None,
+        doc_words_full=4096,
+    )
+    batch_root = tmp_path / "evals/new-batch"
+    base_root = tmp_path / "evals/old-batch/base"
+    base_root.mkdir(parents=True)
+    sampling = {
+        "samples_per_question": 4,
+        "rollout_seed": 42,
+        "sampling_seeds": [42, 43, 44, 45],
+        "deterministic": True,
+        "temperature": 1.0,
+    }
+    manifest = {
+        "model_name": "Qwen3.5-4B",
+        "load_verification": {"actual_step": "base"},
+        "dataset_sha256": "dataset-hash",
+        "judge_model": "judge-model",
+        "sampling": sampling,
+    }
+    sweep._write_json(base_root / "manifest.json", manifest)
+    sweep._write_json(
+        base_root / "point_metrics.json",
+        {"n_questions": 150, "n_rollouts": 600, "samples_per_question": 4},
+    )
+    sweep._write_json(base_root / "_SUCCESS", {"status": "ok"})
+    (base_root / "questions.jsonl").write_text("{}\n")
+
+    sweep.validate_base_source(config, batch_root)
+    with pytest.raises(RuntimeError, match="sampling"):
+        sweep.validate_base_source(
+            sweep.SweepConfig(runs=(run,), base_source_batch="old-batch"),
+            batch_root,
+        )
+
+    point = sweep.sweep_points(config)[0]
+    point_root = sweep.output_dir(batch_root, point)
+    sweep._write_json(
+        point_root / "manifest.json",
+        {
+            **manifest,
+            "load_verification": {"actual_step": 4},
+            "sampling": {**sampling, "fixed_search_topk": None, "doc_words_full": 4096},
+        },
+    )
+    sweep.validate_base_against_point(config, batch_root, point)
+
+
+@pytest.mark.unit
+def test_custom_eval_config_applies_defaults_and_cli_overrides():
+    args = SimpleNamespace(
+        eval_config=EVAL_CONFIGS / "fixed_topk5_open10000.json",
+        doc_words_full=12000,
+    )
+
+    sweep.apply_evaluation_config(args)
+
+    assert args.fixed_search_topk == 5
+    assert args.doc_words_full == 12000
+    assert args.eval_n == 4
+    assert args.search_concurrency == 64
+
+
+@pytest.mark.unit
+def test_model_controlled_eval_config_is_explicit():
+    args = SimpleNamespace(eval_config=EVAL_CONFIGS / "model_topk_open4096.json")
+
+    sweep.apply_evaluation_config(args)
+
+    assert args.fixed_search_topk is None
+    assert args.doc_words_full == 4096
+
+
+@pytest.mark.unit
+def test_custom_eval_config_rejects_unknown_or_invalid_settings(tmp_path):
+    unknown = tmp_path / "unknown.json"
+    unknown.write_text('{"evaluation":{"topk":5}}')
+    with pytest.raises(RuntimeError, match="unknown evaluation settings"):
+        sweep.load_evaluation_config(unknown)
+
+    invalid = tmp_path / "invalid.json"
+    invalid.write_text('{"evaluation":{"fixed_search_topk":true}}')
+    with pytest.raises(RuntimeError, match="positive integer or null"):
+        sweep.load_evaluation_config(invalid)
+
+
+@pytest.mark.unit
+def test_existing_batch_accepts_matching_eval_config_and_rejects_changes(tmp_path):
+    config = sweep.SweepConfig(runs=(sweep.RunConfig(name="run-1", alias="r01", steps=(4,)),))
+    sweep._write_json(tmp_path / "sweep_config.json", config.to_dict())
+    args = SimpleNamespace(
+        command="report",
+        run_names=None,
+        reuse_base_from=None,
+        eval_config=EVAL_CONFIGS / "fixed_topk5_open10000.json",
+    )
+    sweep.apply_evaluation_config(args)
+
+    assert sweep.load_or_create_config(args, tmp_path, {"jobs": {}}) == config
+
+    args = SimpleNamespace(
+        command="report",
+        run_names=None,
+        reuse_base_from=None,
+        eval_config=EVAL_CONFIGS / "model_topk_open4096.json",
+    )
+    sweep.apply_evaluation_config(args)
+    with pytest.raises(RuntimeError, match="already frozen"):
+        sweep.load_or_create_config(args, tmp_path, {"jobs": {}})
+
+    args = SimpleNamespace(
+        command="report",
+        run_names=None,
+        reuse_base_from=None,
+        eval_config=None,
+        doc_words_full=4096,
+    )
+    sweep.apply_evaluation_config(args)
+    with pytest.raises(RuntimeError, match="already frozen"):
+        sweep.load_or_create_config(args, tmp_path, {"jobs": {}})
+
+
+@pytest.mark.unit
 def test_report_loads_legacy_config_without_touching_training_checkpoints(tmp_path, monkeypatch):
     config = _sweep_config()
     legacy = config.to_dict()
@@ -369,6 +513,8 @@ def test_reused_base_omits_job_and_requires_matching_checkpoint_protocol(tmp_pat
         "sampling_seeds": [42, 43, 44, 45],
         "deterministic": True,
         "temperature": 1.0,
+        "fixed_search_topk": 5,
+        "doc_words_full": 10000,
     }
     manifest = {
         "model_name": "Qwen3.5-4B",
@@ -392,6 +538,16 @@ def test_reused_base_omits_job_and_requires_matching_checkpoint_protocol(tmp_pat
                 runs=config.runs,
                 model_size="9B",
                 base_source_batch=config.base_source_batch,
+            ),
+            batch_root,
+        )
+    with pytest.raises(RuntimeError, match="sampling"):
+        sweep.validate_base_source(
+            sweep.SweepConfig(
+                runs=config.runs,
+                base_source_batch=config.base_source_batch,
+                fixed_search_topk=None,
+                doc_words_full=4096,
             ),
             batch_root,
         )

@@ -38,11 +38,33 @@ export no_proxy="127.0.0.1,localhost,::1" NO_PROXY="127.0.0.1,localhost,::1"
 SLIME=/slime-src
 D=/mnt/wsfuse/hhzhang01/supo-data
 STAGE=/mnt/wsfuse/hhzhang01/supo-slime
+DEFAULT_TRAIN_DATA="${D}/BC+/bc_train_exclude_stable91_20260730.parquet"
+TRAIN_DATA="${BC_TRAIN_DATA:-${DEFAULT_TRAIN_DATA}}"
+if [[ "${TRAIN_DATA}" != /* ]]; then
+  echo "ERROR: BC_TRAIN_DATA must be an absolute container path: ${TRAIN_DATA}" >&2
+  exit 1
+fi
+if [[ ! -r "${TRAIN_DATA}" ]]; then
+  echo "ERROR: training data is not readable: ${TRAIN_DATA}" >&2
+  exit 1
+fi
+echo "[trainer] training data=${TRAIN_DATA}"
 RUN_NAME="${BC_RUN_NAME:-${RUN_NAME:-${MAST_HPC_JOB_NAME:-supo-bcplus-mast-local}}}"
 if [[ ! "${RUN_NAME}" =~ ^[A-Za-z0-9._-]+$ || "${RUN_NAME}" == "." || "${RUN_NAME}" == ".." ]]; then
   echo "ERROR: invalid checkpoint run name: ${RUN_NAME}" >&2
   exit 1
 fi
+BCPLUS_FIXED_SEARCH_TOPK="${BCPLUS_FIXED_SEARCH_TOPK:-}"
+BCPLUS_DOC_WORDS_FULL="${BCPLUS_DOC_WORDS_FULL:-4096}"
+if [[ -n "${BCPLUS_FIXED_SEARCH_TOPK}" && ! "${BCPLUS_FIXED_SEARCH_TOPK}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: BCPLUS_FIXED_SEARCH_TOPK must be a positive integer or empty" >&2
+  exit 2
+fi
+if [[ ! "${BCPLUS_DOC_WORDS_FULL}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: BCPLUS_DOC_WORDS_FULL must be a positive integer" >&2
+  exit 2
+fi
+export BCPLUS_FIXED_SEARCH_TOPK BCPLUS_DOC_WORDS_FULL
 if [[ -n "${BC_RUN_NAME:-}" ]]; then
   RESUME_TRACKER="${STAGE}/checkpoints/${RUN_NAME}/latest_checkpointed_iteration.txt"
   if [[ ! -f "${RESUME_TRACKER}" ]]; then
@@ -98,6 +120,9 @@ MYHOST="$(hostname)"
 IS_HEAD=0
 if [[ "${TW_TASK_ID:-0}" = "0" || "${MYHOST}" = "${HEAD_HOST}" ]]; then IS_HEAD=1; fi
 echo "[trainer] nnodes=${NNODES} host=${MYHOST} head=${HEAD_HOST} is_head=${IS_HEAD}"
+if [[ "${IS_HEAD}" == "1" ]]; then
+  echo "[trainer] tool protocol: search_topk=${BCPLUS_FIXED_SEARCH_TOPK:-model} open_words=${BCPLUS_DOC_WORDS_FULL}"
+fi
 if [[ -n "${BC_EXPECTED_NUM_NODES:-}" ]]; then
   [[ "${BC_EXPECTED_NUM_NODES}" =~ ^[1-9][0-9]*$ ]] || {
     echo "ERROR: BC_EXPECTED_NUM_NODES must be a positive integer, got ${BC_EXPECTED_NUM_NODES}" >&2
@@ -353,7 +378,7 @@ else
 fi
 
 ROLLOUT_ARGS=(
-   --prompt-data "${D}/BC+/bc_train.parquet"
+   --prompt-data "${TRAIN_DATA}"
    --input-key prompt
    --label-key answer
    --metadata-key extra_info
@@ -507,6 +532,8 @@ RUNTIME_ENV_JSON="{
     \"BCPLUS_COMPRESS_THRESH\": \"${BCPLUS_COMPRESS_THRESH:-0.85}\",
     \"BCPLUS_MAX_SUB_TRAJS\": \"${BCPLUS_MAX_SUB_TRAJS:-5}\",
     \"BCPLUS_COMPRESS_PENALTY\": \"${BCPLUS_COMPRESS_PENALTY:-0.5}\",
+    \"BCPLUS_FIXED_SEARCH_TOPK\": \"${BCPLUS_FIXED_SEARCH_TOPK}\",
+    \"BCPLUS_DOC_WORDS_FULL\": \"${BCPLUS_DOC_WORDS_FULL}\",
     \"BCPLUS_DUMP_DIR\": \"${BCPLUS_DUMP_DIR:-}\",
     \"BCPLUS_DUMP_TRAIN_OLD\": \"${BCPLUS_DUMP_TRAIN_OLD:-}\",
     \"BCPLUS_JUDGE_MODEL\": \"${BCPLUS_JUDGE_MODEL:-gpt-5-4-genai-dss4}\",

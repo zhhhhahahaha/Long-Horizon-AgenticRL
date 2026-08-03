@@ -325,6 +325,21 @@ bash /home/hhzhang01/slime/examples/supo_browsecomp/debug_scripts/run_qwen3p5_4B
   can also reach `api.llama.com` (it should — that's the whole point of the
   internal Llama API endpoint).
 
+### W&B metric sections
+
+BC+ metrics use separate top-level namespaces because W&B groups charts by the
+text before the first `/`:
+
+- `bcplus_health/*`: judge and search-service failures; every value should remain zero.
+- `bcplus_sub_traj/*`: per-sub-trajectory tool and lifecycle diagnostics.
+- `bcplus_trajectory/*`: complete-trajectory tool, lifecycle, and size metrics.
+- `bcplus_reward/*`: judge scores, zero-variance groups, and pass@k.
+- `bcplus_compression/*`: compression frequency and summary quality.
+- `bcplus_evidence/*`: gold-document retrieval, opening, and answer correlations.
+
+Runs resumed after this namespace change retain the historical `bcplus/*`
+charts in W&B, but new steps are logged only to the six sections above.
+
 ## Not (yet) ported from the SUPO paper
 
 - Search branching / model-selected compression (`workflow="search_branch"`).

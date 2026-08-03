@@ -35,11 +35,13 @@ checkpoint discovery -> frozen sweep_config.json -> code archive
 | NCCL timeout debug dump | disabled | disabled |
 | Max response / context | 32768 / 65536 | 32768 / 65536 |
 | Questions x samples | 150 x 4 | 150 x 4 |
+| Fixed search budget / open-page words | 5 / 10000 | 5 / 10000 |
 | Search / judge concurrency | 64 / 16 | 64 / 16 |
 
-These defaults are frozen into the submitted code archive. Search concurrency,
-judge concurrency, question count, sample count, and seed are controller
-options. The remaining runtime defaults are currently owned by `run_eval.sh`.
+These defaults are frozen into the submitted code archive and
+`sweep_config.json`. Search protocol, open-page limit, search concurrency, judge
+concurrency, question count, sample count, and seed are controller options. The
+remaining runtime defaults are currently owned by `run_eval.sh`.
 The model-specific SGLang concurrency leaves headroom above the observed
 long-context running set without restoring the effectively unbounded historical
 load. It can be overridden explicitly with
@@ -57,6 +59,32 @@ The controller also recognizes the pre-reorganization archive path
 archive, so old and newly appended points keep the batch's original runtime
 profile.
 
+## Confirm the training protocol before submission
+
+Before submitting any eval job, identify which tool protocol the target
+training run used. Check its original immutable file under `mast/configs/`, the
+config stored in its submitted code archive, or the trainer startup log. New
+trainer logs print a line like:
+
+```text
+[trainer] tool protocol: search_topk=5 open_words=10000
+```
+
+Select the eval preset that matches that evidence:
+
+| Training config | Eval preset |
+|---|---|
+| `BCPLUS_FIXED_SEARCH_TOPK=5` and `BCPLUS_DOC_WORDS_FULL=10000` | `configs/fixed_topk5_open10000.json` |
+| fixed top-k unset and `BCPLUS_DOC_WORDS_FULL=4096` or unset | `configs/model_topk_open4096.json` |
+
+Do not infer the protocol only from the run name, and do not rely on the eval
+controller's default when the training config is unknown. Resolve the training
+settings first. A resume of an existing logical training run must retain that
+run's original protocol, and its eval batch must use the same preset. The
+controller freezes the effective settings in `sweep_config.json` and rejects a
+later attempt to change them, but it cannot infer the correct protocol from a
+checkpoint by itself.
+
 ## Start a new run
 
 Choose a unique batch id so the sweep can be resumed without rediscovery:
@@ -64,11 +92,30 @@ Choose a unique batch id so the sweep can be resumed without rediscovery:
 ```bash
 RUN=<mast-training-run-name>
 BATCH=bcplus-4b-eval-$(date +%Y%m%d-%H%M%S)
+EVAL_CONFIG=examples/supo_browsecomp/mast/eval/configs/fixed_topk5_open10000.json
 
 python examples/supo_browsecomp/mast/eval/eval_sweep.py orchestrate \
   --batch-id "$BATCH" \
+  --eval-config "$EVAL_CONFIG" \
   --run "$RUN"
 ```
+
+The provided presets are:
+
+- `configs/fixed_topk5_open10000.json`: fixed weighted search budget 5 and a
+  10,000-word `open_page` cap.
+- `configs/model_topk_open4096.json`: model-controlled top-k and the original
+  4096-word cap.
+
+The JSON `evaluation` object may also set `expected_questions`,
+`samples_per_question`, `rollout_seed`, `search_concurrency`, and
+`judge_concurrency`. Explicit CLI options override the preset. Omitting
+`--eval-config` keeps the fixed-top5/open-10000 defaults.
+
+The effective values are written to `sweep_config.json`. Reusing the same
+preset for an existing batch is allowed when it matches those frozen values;
+attempting to switch protocols inside an existing batch fails before any MAST
+job is submitted.
 
 Repeat `--run` to evaluate multiple runs in one batch. Each run still receives
 an independent report; the base point is shared.
@@ -231,6 +278,10 @@ python examples/supo_browsecomp/mast/eval/eval_sweep.py status --batch-id "$BATC
 python examples/supo_browsecomp/mast/eval/eval_sweep.py orchestrate \
   --batch-id "$BATCH"
 ```
+
+Do not treat MAST `RUNNING` as a successful startup: confirm in the live job
+logs that generation has started and that its rollout/sample or batch progress
+advances across at least two checks before declaring the eval job healthy.
 
 Only one controller command may access a batch at a time. A second controller
 fails immediately on `.controller.lock`, preventing stale in-memory state from

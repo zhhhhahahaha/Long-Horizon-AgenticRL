@@ -89,6 +89,16 @@ if [[ -v BC_RUN_NAME ]]; then
   [[ "${BC_RUN_NAME}" =~ ^[A-Za-z0-9._-]+$ && "${BC_RUN_NAME}" != "." && "${BC_RUN_NAME}" != ".." ]] || \
     fail "invalid BC_RUN_NAME: ${BC_RUN_NAME}"
 fi
+if [[ -v BC_TRAIN_DATA ]]; then
+  [[ -n "${BC_TRAIN_DATA}" ]] || fail "BC_TRAIN_DATA must not be empty"
+  [[ "${BC_TRAIN_DATA}" == /* ]] || fail "BC_TRAIN_DATA must be an absolute container path: ${BC_TRAIN_DATA}"
+fi
+if [[ -n "${BCPLUS_FIXED_SEARCH_TOPK:-}" ]]; then
+  require_positive_integer BCPLUS_FIXED_SEARCH_TOPK
+fi
+if [[ -n "${BCPLUS_DOC_WORDS_FULL:-}" ]]; then
+  require_positive_integer BCPLUS_DOC_WORDS_FULL
+fi
 [[ "${MAST_JOB_NAME}" =~ ^[A-Za-z0-9._-]+$ ]] || fail "invalid MAST_JOB_NAME: ${MAST_JOB_NAME}"
 
 MAST_RL_CLI="${MAST_RL_CLI:-/data/users/hhzhang01/fbsource/genai/msl/rl/cli.sh}"
@@ -134,6 +144,7 @@ fi
 TRAIN_ENV_VARS=(
   BC_EXPECTED_NUM_NODES
   BC_RUN_NAME
+  BC_TRAIN_DATA
   BC_MODEL_SIZE BC_NUM_ROLLOUT BC_ROLLOUT_BATCH_SIZE BC_N_SAMPLES
   BC_GLOBAL_BATCH_SIZE BC_MAX_RESPONSE_LEN BC_MAX_CONTEXT_LEN
   BC_TP BC_CP BC_SGLANG_TP BC_MAX_TOKENS_PER_GPU
@@ -141,7 +152,8 @@ TRAIN_ENV_VARS=(
   BC_SAVE_INTERVAL BC_SLIM_INTERMEDIATE_CHECKPOINTS BC_OVERRIDE_OPT_PARAM_SCHEDULER
   BC_DUMP_ROLLOUT BC_WANDB_PROJECT
   BCPLUS_MAX_TURNS BCPLUS_COMPRESS_THRESH BCPLUS_MAX_SUB_TRAJS
-  BCPLUS_COMPRESS_PENALTY BCPLUS_DUMP_TRAIN_OLD
+  BCPLUS_COMPRESS_PENALTY BCPLUS_FIXED_SEARCH_TOPK BCPLUS_DOC_WORDS_FULL
+  BCPLUS_DUMP_TRAIN_OLD
   BCPLUS_JUDGE_MODEL BCPLUS_JUDGE_BASE_URL
   BCPLUS_JUDGE_CONCURRENCY BCPLUS_SEARCH_CONCURRENCY
   BCPLUS_DYNAMIC_SAMPLING
@@ -212,6 +224,7 @@ run_dryrun() {
   mkdir -p "${MAST_DRYRUN_ROOT}"
   response_file="${MAST_DRYRUN_ROOT}/${MAST_JOB_NAME}-${timestamp}-$$.json"
   echo "[mast-experiment] validating ${MAST_JOB_NAME}: nodes=${MAST_NUM_NODES} ranks=${EXPECTED_ASSIGNED_RANKS}"
+  echo "[mast-experiment] tool protocol: search_topk=${BCPLUS_FIXED_SEARCH_TOPK:-model} open_words=${BCPLUS_DOC_WORDS_FULL:-4096}"
   if ! "${MAST_COMMAND[@]}" --dryrun > "${response_file}"; then
     fail "MAST dry-run command failed; partial output: ${response_file}"
   fi

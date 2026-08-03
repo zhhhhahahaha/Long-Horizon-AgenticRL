@@ -394,11 +394,12 @@ def test_generate_does_not_open_sibling_with_empty_handover():
 
 
 @pytest.mark.unit
-def test_summary_content_length_metric_uses_only_extracted_summaries(monkeypatch):
+def test_bcplus_wandb_sections_and_summary_content_length(monkeypatch):
+    defined = []
     logged = []
     fake_wandb = ModuleType("wandb")
     fake_wandb.run = object()
-    fake_wandb.define_metric = lambda *args, **kwargs: None
+    fake_wandb.define_metric = lambda *args, **kwargs: defined.append((args, kwargs))
     fake_wandb.log = logged.append
     monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
 
@@ -425,8 +426,35 @@ def test_summary_content_length_metric_uses_only_extracted_summaries(monkeypatch
 
     _load_log_bcplus()(42, SimpleNamespace(), samples, {}, 0.0)
 
-    assert logged[-1]["bcplus/summary_extracted_count"] == 2
-    assert logged[-1]["bcplus/summary_content_len_tokens_mean"] == 5.0
+    assert logged[-1]["bcplus_compression/summary_extracted_count"] == 2
+    assert logged[-1]["bcplus_compression/summary_content_len_tokens_mean"] == 5.0
+    bcplus_sections = {key.split("/", 1)[0] for key in logged[-1] if key.startswith("bcplus")}
+    assert bcplus_sections == {
+        "bcplus_compression",
+        "bcplus_evidence",
+        "bcplus_health",
+        "bcplus_reward",
+        "bcplus_sub_traj",
+        "bcplus_trajectory",
+    }
+    assert {section: sum(key.startswith(f"{section}/") for key in logged[-1]) for section in bcplus_sections} == {
+        "bcplus_compression": 9,
+        "bcplus_evidence": 8,
+        "bcplus_health": 4,
+        "bcplus_reward": 5,
+        "bcplus_sub_traj": 8,
+        "bcplus_trajectory": 11,
+    }
+    assert not any(key.startswith("bcplus/") for key in logged[-1])
+    assert defined == [
+        (("bcplus_health/*",), {"step_metric": "rollout/step"}),
+        (("bcplus_sub_traj/*",), {"step_metric": "rollout/step"}),
+        (("bcplus_trajectory/*",), {"step_metric": "rollout/step"}),
+        (("bcplus_reward/*",), {"step_metric": "rollout/step"}),
+        (("bcplus_compression/*",), {"step_metric": "rollout/step"}),
+        (("bcplus_evidence/*",), {"step_metric": "rollout/step"}),
+        (("dynamic_sampling/*",), {"step_metric": "rollout/step"}),
+    ]
 
 
 @pytest.mark.unit

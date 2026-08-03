@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "evaluation": {
+    "fixed_search_topk": 5,
+    "doc_words_full": 10000
+  }
+}

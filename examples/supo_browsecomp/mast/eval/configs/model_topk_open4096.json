@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "evaluation": {
+    "fixed_search_topk": null,
+    "doc_words_full": 4096
+  }
+}

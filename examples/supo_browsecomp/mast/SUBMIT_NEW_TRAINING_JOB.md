@@ -78,7 +78,11 @@ find /home/hhzhang01/.local/state/mast-wandb \
 # This file is sourced by submit_experiment.sh.
 # shellcheck disable=SC2034
 
-MAST_JOB_NAME=supo_9b_n8_16n_40iter_dynamic_example
+MAST_JOB_NAME=supo_9b_n8_16n_40iter_dynamic_fixedtopk5_open10000w
+MAST_TENANT=rhea_assistant_avocado_iterations
+MAST_REGION=eag
+MAST_HOST=grandteton_80g_roce
+MAST_JOB_PRIORITY=HIGH
 MAST_NUM_NODES=16
 MAST_GPUS_PER_NODE=8
 MAST_DATA_PARALLEL_SIZE=16
@@ -102,6 +106,8 @@ BC_LOG_PROBS_CHUNK_SIZE=4096
 BC_SGLANG_MEM_FRACTION_STATIC=0.8
 
 BCPLUS_DYNAMIC_SAMPLING=1
+BCPLUS_FIXED_SEARCH_TOPK=5
+BCPLUS_DOC_WORDS_FULL=10000
 BCPLUS_SEARCH_CONCURRENCY=512
 BCPLUS_JUDGE_CONCURRENCY=128
 BC_SAVE_INTERVAL=5
@@ -110,6 +116,32 @@ BC_DUMP_ROLLOUT=0
 MAST_WANDB_SNAPSHOT_INTERVAL_SEC=60
 WANDB_X_FLUSH_INTERVAL_SECONDS=30
 ```
+
+每个新 config 都必须显式设置 `MAST_REGION` 和 `MAST_HOST`，不能依赖
+`submit_experiment.sh` 的默认 `nha` / `zionex_80g`。硬件选择会直接改变 GPU
+代际、网络和 tenant capacity。例如：
+
+| Intended hardware | Config | Dry-run capability |
+|---|---|---|
+| EAG Grand Teton H100 RoCE | `MAST_REGION=eag`, `MAST_HOST=grandteton_80g_roce` | `LogicalServerSubType.T20_GRAND_TETON_HBM3_ROCE` |
+| NHA ZionEX A100 80GB | `MAST_REGION=nha`, `MAST_HOST=zionex_80g` | `LogicalServerSubType.T20_ZION_EX_A100_80GB` |
+
+对于 tenant reservation，还要用 `mast get-capacity` 核对 capability 对应的实际
+machine type。例如 `rhea_assistant_avocado_iterations` 的 EAG Grand Teton H100
+capacity 是 `MACHINE_TYPE_T20_GRAND_TETON_HBM3_ROCE_GENAI`。只看到 8 GPUs/task
+不足以证明硬件正确。
+
+新训练默认使用
+`/mnt/wsfuse/hhzhang01/supo-data/BC+/bc_train_exclude_stable91_20260730.parquet`
+（589 条，排除了三个 model point 均 8/8 成功的 91 条）。需要覆盖时，在 config
+中设置容器内绝对路径，例如恢复使用原始 680 条数据：
+
+```bash
+BC_TRAIN_DATA=/mnt/wsfuse/hhzhang01/supo-data/BC+/bc_train.parquet
+```
+
+Resume 旧 run 时必须沿用该 run 原先的数据集；如果旧 run 使用原始 680 条数据，需显式
+设置上面的 `BC_TRAIN_DATA`，不要依赖新默认值。
 
 检查以下不变量：
 
@@ -128,6 +160,9 @@ WANDB_X_FLUSH_INTERVAL_SECONDS=30
 6. 9B 当前验证过的训练拓扑是 TP=4/CP=2。SGLang TP 应按用户要求显式设置；
    TP=2 在 128 GPU 上产生 64 个 engines，TP=4 则产生 32 个 engines 并提供更多
    单 engine 显存余量。
+7. 新的 fixed-budget 协议使用 `BCPLUS_FIXED_SEARCH_TOPK=5` 和
+   `BCPLUS_DOC_WORDS_FULL=10000`。fixed top-k 沿用 SUPO 加权预算，已访问结果仍按
+   `0.25` 计数。Resume 已有 logical run 时必须保持原值，不能在中途切换工具 schema。
 
 如果用户要求的是 runner 尚不支持的新 `BC_*` 参数，需要同时：
 
@@ -491,16 +526,25 @@ jq -r '[
   ([.spec.hpc_job_definition.hpcTaskGroups[] |
     select(.name=="trainer_0") | .taskCount][0]),
   ([.spec.app_def.roles[] |
-    select(.name=="trainer_0") | .env.ROLE_ASSIGNMENT_MAP][0])
+    select(.name=="trainer_0") | .env.ROLE_ASSIGNMENT_MAP][0]),
+  ([.spec.app_def.roles[] |
+    select(.name=="trainer_0") | .env.MAST_REGION][0]),
+  ([.spec.app_def.roles[] |
+    select(.name=="trainer_0") | .resource.tags["torchx/named_resources.name"]][0]),
+  ([.spec.app_def.roles[] |
+    select(.name=="trainer_0") | .resource.capabilities.server_sub_types[0]][0])
 ] | @tsv' "${dryrun_file}"
 ```
+
+输出除了 task count/rank map 外，还必须与 config 的 region、host 和预期 server
+subtype 完全一致。若请求 H100 却看到 `ZION_EX_A100`，立即停止，不得真实提交。
 
 再检查最终 entrypoint 中的实验参数和归档名：
 
 ```bash
 jq -r '.spec.app_def.roles[] |
   select(.name=="trainer_0") | .entrypoint' "${dryrun_file}" | \
-  rg 'BC_RUN_NAME|BC_MODEL_SIZE|BC_TP|BC_CP|BC_SGLANG_TP|BC_MAX_TOKENS_PER_GPU|BC_LOG_PROBS_CHUNK_SIZE|BC_SGLANG_MEM_FRACTION_STATIC|BC_OVERRIDE_OPT_PARAM_SCHEDULER|BC_SLIM_INTERMEDIATE_CHECKPOINTS|MAST_CODE_ARCHIVE|slime-code-'
+  rg 'BC_RUN_NAME|BC_MODEL_SIZE|BC_TP|BC_CP|BC_SGLANG_TP|BC_MAX_TOKENS_PER_GPU|BC_LOG_PROBS_CHUNK_SIZE|BC_SGLANG_MEM_FRACTION_STATIC|BCPLUS_FIXED_SEARCH_TOPK|BCPLUS_DOC_WORDS_FULL|BC_OVERRIDE_OPT_PARAM_SCHEDULER|BC_SLIM_INTERMEDIATE_CHECKPOINTS|MAST_CODE_ARCHIVE|slime-code-'
 ```
 
 只有 JSON 为 `status=ok`、`dryrun=true`，task count/rank map 正确，且所有用户指定参数

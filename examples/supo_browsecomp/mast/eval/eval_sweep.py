@@ -38,6 +38,88 @@ CLI = Path("/data/users/hhzhang01/fbsource/genai/msl/rl/cli.sh")
 IMAGE = "588845226011.dkr.ecr.us-east-2.amazonaws.com/msl_infra/slime:hhz-20260629a"
 WSF_SRC = "ws://ws.ai.eag0genai/genai_fair_llm"
 SAFE_NAME = re.compile(r"[A-Za-z0-9._-]+")
+EVALUATION_DEFAULTS = {
+    "expected_questions": 150,
+    "samples_per_question": 4,
+    "rollout_seed": 42,
+    "fixed_search_topk": 5,
+    "doc_words_full": 10000,
+    "search_concurrency": 64,
+    "judge_concurrency": 16,
+}
+LEGACY_TOOL_PROTOCOL = {
+    "fixed_search_topk": None,
+    "doc_words_full": 4096,
+}
+EVALUATION_CLI_ATTRS = {
+    "expected_questions": "expected_questions",
+    "samples_per_question": "eval_n",
+    "rollout_seed": "eval_seed",
+    "fixed_search_topk": "fixed_search_topk",
+    "doc_words_full": "doc_words_full",
+    "search_concurrency": "search_concurrency",
+    "judge_concurrency": "judge_concurrency",
+}
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
+def load_evaluation_config(path: str | Path) -> dict[str, int | None]:
+    config_path = Path(path).expanduser()
+    try:
+        raw = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"failed to read eval config {config_path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"eval config must be a JSON object: {config_path}")
+
+    if "evaluation" in raw:
+        unknown_top_level = set(raw) - {"version", "evaluation"}
+        if unknown_top_level:
+            raise RuntimeError(f"unknown eval config fields: {sorted(unknown_top_level)}")
+        if raw.get("version", 1) != 1:
+            raise RuntimeError(f"unsupported eval config version: {raw.get('version')!r}")
+        evaluation = raw["evaluation"]
+    else:
+        evaluation = raw
+    if not isinstance(evaluation, dict):
+        raise RuntimeError(f"eval config evaluation field must be an object: {config_path}")
+
+    unknown = set(evaluation) - set(EVALUATION_DEFAULTS)
+    if unknown:
+        raise RuntimeError(f"unknown evaluation settings: {sorted(unknown)}")
+    for name, value in evaluation.items():
+        if name == "fixed_search_topk":
+            if value is None:
+                continue
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise RuntimeError(f"fixed_search_topk must be a positive integer or null, got {value!r}")
+        elif name == "rollout_seed":
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise RuntimeError(f"rollout_seed must be an integer, got {value!r}")
+        elif not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise RuntimeError(f"{name} must be a positive integer, got {value!r}")
+    return evaluation
+
+
+def apply_evaluation_config(args: argparse.Namespace) -> None:
+    explicit_settings = {
+        name for name, attr in EVALUATION_CLI_ATTRS.items() if hasattr(args, attr)
+    }
+    settings = dict(EVALUATION_DEFAULTS)
+    if getattr(args, "eval_config", None):
+        settings.update(load_evaluation_config(args.eval_config))
+    for name, attr in EVALUATION_CLI_ATTRS.items():
+        if hasattr(args, attr):
+            settings[name] = getattr(args, attr)
+    for name, attr in EVALUATION_CLI_ATTRS.items():
+        setattr(args, attr, settings[name])
+    args._explicit_evaluation_settings = explicit_settings
 
 
 def validate_safe_name(value: str, label: str) -> str:
@@ -68,6 +150,8 @@ class SweepConfig:
     expected_questions: int = 150
     samples_per_question: int = 4
     rollout_seed: int = 42
+    fixed_search_topk: int | None = 5
+    doc_words_full: int = 10000
     search_concurrency: int = 64
     judge_concurrency: int = 16
     local_report_root: str = "/home/hhzhang01/bcplus-eval-reports"
@@ -84,6 +168,8 @@ class SweepConfig:
             expected_questions=int(evaluation.get("expected_questions", 150)),
             samples_per_question=int(evaluation.get("samples_per_question", 4)),
             rollout_seed=int(evaluation.get("rollout_seed", 42)),
+            fixed_search_topk=evaluation.get("fixed_search_topk"),
+            doc_words_full=int(evaluation.get("doc_words_full", 4096)),
             search_concurrency=int(evaluation.get("search_concurrency", 64)),
             judge_concurrency=int(evaluation.get("judge_concurrency", 16)),
             local_report_root=str(value.get("local_report_root", "/home/hhzhang01/bcplus-eval-reports")),
@@ -91,7 +177,7 @@ class SweepConfig:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "version": 4,
+            "version": 5,
             "runs": [run.to_dict() for run in self.runs],
             "model": {"size": self.model_size, "name": self.model_name},
             "base": {
@@ -105,6 +191,8 @@ class SweepConfig:
                 "sampling_seeds": list(
                     range(self.rollout_seed, self.rollout_seed + self.samples_per_question)
                 ),
+                "fixed_search_topk": self.fixed_search_topk,
+                "doc_words_full": self.doc_words_full,
                 "search_concurrency": self.search_concurrency,
                 "judge_concurrency": self.judge_concurrency,
             },
@@ -176,6 +264,13 @@ def manifest_model_name(manifest: dict[str, Any]) -> str | None:
     return None
 
 
+def manifest_sampling(manifest: dict[str, Any]) -> dict[str, Any]:
+    sampling = dict(manifest.get("sampling") or {})
+    for name, value in LEGACY_TOOL_PROTOCOL.items():
+        sampling.setdefault(name, value)
+    return sampling
+
+
 def validate_base_source(config: SweepConfig, batch_root: Path) -> None:
     if config.base_source_batch is None:
         return
@@ -213,8 +308,10 @@ def validate_base_source(config: SweepConfig, batch_root: Path) -> None:
         "rollout_seed": config.rollout_seed,
         "sampling_seeds": list(range(config.rollout_seed, config.rollout_seed + config.samples_per_question)),
         "deterministic": True,
+        "fixed_search_topk": config.fixed_search_topk,
+        "doc_words_full": config.doc_words_full,
     }
-    sampling = manifest.get("sampling", {})
+    sampling = manifest_sampling(manifest)
     sampling_mismatches = {
         key: {"expected": expected, "actual": sampling.get(key)}
         for key, expected in expected_sampling.items()
@@ -234,12 +331,16 @@ def validate_base_against_point(
         return
     base_manifest = _read_json(base_output_dir(config, batch_root) / "manifest.json", {})
     point_manifest = _read_json(output_dir(batch_root, point) / "manifest.json", {})
-    fields = ("dataset_sha256", "judge_model", "sampling")
+    fields = ("dataset_sha256", "judge_model")
     mismatches = {
         field: {"base": base_manifest.get(field), "checkpoint": point_manifest.get(field)}
         for field in fields
         if base_manifest.get(field) != point_manifest.get(field)
     }
+    base_sampling = manifest_sampling(base_manifest)
+    point_sampling = manifest_sampling(point_manifest)
+    if base_sampling != point_sampling:
+        mismatches["sampling"] = {"base": base_sampling, "checkpoint": point_sampling}
     base_model = manifest_model_name(base_manifest)
     point_model = manifest_model_name(point_manifest)
     if base_model != point_model:
@@ -394,6 +495,8 @@ def _make_config(
         expected_questions=args.expected_questions,
         samples_per_question=args.eval_n,
         rollout_seed=args.eval_seed,
+        fixed_search_topk=args.fixed_search_topk,
+        doc_words_full=args.doc_words_full,
         search_concurrency=args.search_concurrency,
         judge_concurrency=args.judge_concurrency,
         local_report_root=args.local_report_root,
@@ -403,11 +506,14 @@ def _make_config(
     for name, value in (
         ("expected_questions", config.expected_questions),
         ("samples_per_question", config.samples_per_question),
+        ("doc_words_full", config.doc_words_full),
         ("search_concurrency", config.search_concurrency),
         ("judge_concurrency", config.judge_concurrency),
     ):
         if value <= 0:
             raise RuntimeError(f"{name} must be positive, got {value}")
+    if config.fixed_search_topk is not None and config.fixed_search_topk <= 0:
+        raise RuntimeError(f"fixed_search_topk must be positive or null, got {config.fixed_search_topk}")
     validate_checkpoints(config)
     return config
 
@@ -437,6 +543,20 @@ def load_or_create_config(
     path = batch_root / "sweep_config.json"
     if path.is_file():
         config = SweepConfig.from_dict(json.loads(path.read_text()))
+        requested_settings = (
+            set(EVALUATION_DEFAULTS)
+            if getattr(args, "eval_config", None)
+            else getattr(args, "_explicit_evaluation_settings", set())
+        )
+        if requested_settings:
+            mismatches = {
+                name: {"configured": getattr(config, name), "requested": getattr(args, attr)}
+                for name, attr in EVALUATION_CLI_ATTRS.items()
+                if name in requested_settings
+                if getattr(config, name) != getattr(args, attr)
+            }
+            if mismatches:
+                raise RuntimeError(f"batch evaluation settings are already frozen: {mismatches}")
         requested_runs = tuple(args.run_names or ())
         configured_runs = tuple(run.name for run in config.runs)
         if requested_runs and requested_runs != configured_runs:
@@ -546,6 +666,11 @@ def build_mast_command(
                         ("EVAL_SEED", config.rollout_seed),
                         ("EVAL_EXPECTED_QUESTIONS", config.expected_questions),
                         ("BC_MODEL_SIZE", config.model_size),
+                        (
+                            "BCPLUS_FIXED_SEARCH_TOPK",
+                            "" if config.fixed_search_topk is None else config.fixed_search_topk,
+                        ),
+                        ("BCPLUS_DOC_WORDS_FULL", config.doc_words_full),
                         ("BCPLUS_SEARCH_CONCURRENCY", config.search_concurrency),
                         ("BCPLUS_JUDGE_CONCURRENCY", config.judge_concurrency),
                         ("TORCH_NCCL_DUMP_ON_TIMEOUT", 0),
@@ -909,15 +1034,40 @@ def main() -> None:
         "--reuse-base-from",
         help="reuse the validated base artifacts from this earlier eval batch",
     )
-    parser.add_argument("--expected-questions", type=int, default=150)
-    parser.add_argument("--eval-n", type=int, default=4, help="deterministic samples per question")
-    parser.add_argument("--eval-seed", type=int, default=42, help="first deterministic sampling seed")
-    parser.add_argument("--search-concurrency", type=int, default=64)
-    parser.add_argument("--judge-concurrency", type=int, default=16)
+    parser.add_argument(
+        "--eval-config",
+        type=Path,
+        help="JSON evaluation settings preset; explicit CLI settings override it",
+    )
+    parser.add_argument("--expected-questions", type=positive_int, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--eval-n",
+        type=positive_int,
+        default=argparse.SUPPRESS,
+        help="deterministic samples per question",
+    )
+    parser.add_argument(
+        "--eval-seed",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="first deterministic sampling seed",
+    )
+    parser.add_argument("--fixed-search-topk", type=positive_int, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--model-controlled-topk",
+        action="store_const",
+        const=None,
+        dest="fixed_search_topk",
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument("--doc-words-full", type=positive_int, default=argparse.SUPPRESS)
+    parser.add_argument("--search-concurrency", type=positive_int, default=argparse.SUPPRESS)
+    parser.add_argument("--judge-concurrency", type=positive_int, default=argparse.SUPPRESS)
     parser.add_argument("--local-report-root", default="/home/hhzhang01/bcplus-eval-reports")
     parser.add_argument("--repo-root", default=str(Path(__file__).parents[4]))
     parser.add_argument("--poll-seconds", type=int, default=120)
     args = parser.parse_args()
+    apply_evaluation_config(args)
     if args.extend_checkpoints and (args.command != "orchestrate" or not args.batch_id):
         parser.error("--extend-checkpoints requires orchestrate with --batch-id")
     if args.command in {"dry-run", "orchestrate"} and not args.batch_id and not args.run_names:

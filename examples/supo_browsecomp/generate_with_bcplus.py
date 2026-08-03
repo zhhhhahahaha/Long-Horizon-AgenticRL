@@ -46,7 +46,7 @@ model fails to emit a real ``<summary>...</summary>`` block (we salvage raw
 text via a fallback path), every model-generated token in that compression
 turn receives advantage ``-BCPLUS_COMPRESS_PENALTY``. The summary request is
 not trainable, and earlier research tokens retain the rollout's answer-based
-advantage. Track ``bcplus/compress_success_rate`` on wandb to see this improve
+advantage. Track ``bcplus_compression/compress_success_rate`` on wandb to see this improve
 over training. Metric ``summary_source`` (per sub-traj) is one of
 ``"extracted"`` (good), ``"fallback"`` (salvage from raw text, negative
 summary-turn advantage), or ``"empty"`` (no usable handover was generated).
@@ -153,9 +153,9 @@ TOOLS = build_tools(BCPLUS_CONFIGS["fixed_search_topk"])
 _SEARCH_SEM = asyncio.Semaphore(BCPLUS_CONFIGS["search_concurrency"])
 _JUDGE_SEM = asyncio.Semaphore(BCPLUS_CONFIGS["judge_concurrency"])
 
-# One-time flag so we register the bcplus/* -> rollout/step binding once per
-# process. Guarded here (not in module import) because wandb.run only exists
-# after slime's init_tracking has run inside this Ray actor.
+# One-time flag so we register the bcplus metric sections -> rollout/step
+# bindings once per process. Guarded here (not in module import) because
+# wandb.run only exists after slime's init_tracking has run inside this Ray actor.
 _BCPLUS_METRIC_DEFINED = False
 
 # module-level singleton created lazily on first rollout (needs an event loop)
@@ -1091,7 +1091,7 @@ async def _run_one_sub_trajectory(
                 # KeyError / TypeError from malformed 200 responses, JSON
                 # decode errors, client bugs, etc. Print so the traceback
                 # is grep-able in train.log; increment the counter so wandb
-                # (bcplus/n_search_server_error_sub_traj_mean) shows the health.
+                # (bcplus_health/n_search_server_error_sub_traj_mean) shows the health.
                 print(
                     f"[BCPLUS search-server error] turn={_turn} fn_calls={fn_calls!r} "
                     f"err={type(e).__name__}: {e}",
@@ -1617,7 +1617,15 @@ def log_bcplus(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
 
     global _BCPLUS_METRIC_DEFINED
     if not _BCPLUS_METRIC_DEFINED:
-        wandb.define_metric("bcplus/*", step_metric="rollout/step")
+        for section in (
+            "bcplus_health",
+            "bcplus_sub_traj",
+            "bcplus_trajectory",
+            "bcplus_reward",
+            "bcplus_compression",
+            "bcplus_evidence",
+        ):
+            wandb.define_metric(f"{section}/*", step_metric="rollout/step")
         wandb.define_metric("dynamic_sampling/*", step_metric="rollout/step")
         _BCPLUS_METRIC_DEFINED = True
 
@@ -1625,96 +1633,91 @@ def log_bcplus(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
     # Sub-traj-level diagnostics (each sub-traj counts equally).
     if diag_count > 0:
         for k in count_diag_keys:
-            log[f"bcplus/{k}_sub_traj_mean"] = sub_traj_count_sums[k] / diag_count
-        log["bcplus/finished_sub_traj_rate"] = finished_sub_traj_sum / diag_count
-        log["bcplus/judge_failed_sub_traj_rate"] = judge_failed_sub_traj_sum / diag_count
-        log["bcplus/sglang_length_stop_sub_traj_rate"] = sglang_length_stop_sum / diag_count
-    log["bcplus/n_sub_trajs_total"] = len(flat_samples)
+            if k == "n_search_server_error":
+                continue
+            log[f"bcplus_sub_traj/{k}_sub_traj_mean"] = sub_traj_count_sums[k] / diag_count
+        log["bcplus_sub_traj/finished_sub_traj_rate"] = finished_sub_traj_sum / diag_count
+        log["bcplus_sub_traj/sglang_length_stop_sub_traj_rate"] = sglang_length_stop_sum / diag_count
+        log["bcplus_health/n_search_server_error_sub_traj_mean"] = (
+            sub_traj_count_sums["n_search_server_error"] / diag_count
+        )
+        log["bcplus_health/judge_failed_sub_traj_rate"] = judge_failed_sub_traj_sum / diag_count
+    log["bcplus_sub_traj/n_sub_trajs_total"] = len(flat_samples)
 
     # Complete-trajectory-level diagnostics (each parent rollout counts once).
     if n_rollouts > 0:
         for k in count_diag_keys:
-            log[f"bcplus/{k}_trajectory_mean"] = trajectory_count_sums[k] / n_rollouts
-        log["bcplus/finished_trajectory_rate"] = finished_trajectory_count / n_rollouts
-        log["bcplus/judge_failed_trajectory_rate"] = judge_failed_trajectory_count / n_rollouts
-        log["bcplus/sglang_length_stop_trajectory_rate"] = (
-            sglang_length_stop_trajectory_count / n_rollouts
+            if k == "n_search_server_error":
+                continue
+            log[f"bcplus_trajectory/{k}_trajectory_mean"] = trajectory_count_sums[k] / n_rollouts
+        log["bcplus_trajectory/finished_trajectory_rate"] = finished_trajectory_count / n_rollouts
+        log["bcplus_trajectory/sglang_length_stop_trajectory_rate"] = sglang_length_stop_trajectory_count / n_rollouts
+        log["bcplus_health/n_search_server_error_trajectory_mean"] = (
+            trajectory_count_sums["n_search_server_error"] / n_rollouts
         )
+        log["bcplus_health/judge_failed_trajectory_rate"] = judge_failed_trajectory_count / n_rollouts
 
     # Other rollout-level diagnostics.
-    log["bcplus/score_mean"] = sum(scores_per_rollout) / n_rollouts if n_rollouts else 0.0
-    log["bcplus/score_max"] = max(scores_per_rollout) if scores_per_rollout else 0.0
-    log["bcplus/score_hits"] = sum(1 for x in scores_per_rollout if x > 0)
-    log["bcplus/n_rollouts"] = n_rollouts
-    log["bcplus/n_sub_trajs_mean"] = sum(sub_traj_counts) / n_rollouts if n_rollouts else 0.0
-    log["bcplus/n_sub_trajs_max"] = max(sub_traj_counts) if sub_traj_counts else 0
-    log["bcplus/compression_rate"] = sum(compression_fired) / n_rollouts if n_rollouts else 0.0
-    log["bcplus/compression_failed_rate"] = sum(compression_failed) / n_rollouts if n_rollouts else 0.0
-    log["bcplus/compression_capped_rate"] = sum(capped) / n_rollouts if n_rollouts else 0.0
-    log["bcplus/final_response_len_mean"] = (
-        sum(final_response_lens) / n_rollouts if n_rollouts else 0.0
-    )
+    log["bcplus_reward/score_mean"] = sum(scores_per_rollout) / n_rollouts if n_rollouts else 0.0
+    log["bcplus_reward/score_max"] = max(scores_per_rollout) if scores_per_rollout else 0.0
+    log["bcplus_reward/score_hits"] = sum(1 for x in scores_per_rollout if x > 0)
+    log["bcplus_trajectory/n_rollouts"] = n_rollouts
+    log["bcplus_trajectory/n_sub_trajs_mean"] = sum(sub_traj_counts) / n_rollouts if n_rollouts else 0.0
+    log["bcplus_trajectory/n_sub_trajs_max"] = max(sub_traj_counts) if sub_traj_counts else 0
+    log["bcplus_compression/compression_rate"] = sum(compression_fired) / n_rollouts if n_rollouts else 0.0
+    log["bcplus_compression/compression_failed_rate"] = sum(compression_failed) / n_rollouts if n_rollouts else 0.0
+    log["bcplus_compression/compression_capped_rate"] = sum(capped) / n_rollouts if n_rollouts else 0.0
+    log["bcplus_trajectory/final_response_len_mean"] = sum(final_response_lens) / n_rollouts if n_rollouts else 0.0
     # Gold-evidence metrics use one contribution per complete trajectory.
     # Trajectories without evidence_docs are excluded and reported separately
     # rather than being silently counted as retrieval failures.
-    log["bcplus/evidence_trajectory_count"] = evidence_trajectory_count
+    log["bcplus_evidence/evidence_trajectory_count"] = evidence_trajectory_count
     if evidence_trajectory_count:
-        log["bcplus/retrieved_gold_trajectory_rate"] = (
-            retrieved_gold_hit_count / evidence_trajectory_count
-        )
-        log["bcplus/opened_gold_trajectory_rate"] = (
-            opened_gold_hit_count / evidence_trajectory_count
-        )
-        log["bcplus/retrieved_gold_doc_recall_mean"] = (
-            retrieved_gold_recall_sum / evidence_trajectory_count
-        )
-        log["bcplus/opened_gold_doc_recall_mean"] = (
-            opened_gold_recall_sum / evidence_trajectory_count
-        )
+        log["bcplus_evidence/retrieved_gold_trajectory_rate"] = retrieved_gold_hit_count / evidence_trajectory_count
+        log["bcplus_evidence/opened_gold_trajectory_rate"] = opened_gold_hit_count / evidence_trajectory_count
+        log["bcplus_evidence/retrieved_gold_doc_recall_mean"] = retrieved_gold_recall_sum / evidence_trajectory_count
+        log["bcplus_evidence/opened_gold_doc_recall_mean"] = opened_gold_recall_sum / evidence_trajectory_count
     else:
-        log["bcplus/retrieved_gold_trajectory_rate"] = 0.0
-        log["bcplus/opened_gold_trajectory_rate"] = 0.0
-        log["bcplus/retrieved_gold_doc_recall_mean"] = 0.0
-        log["bcplus/opened_gold_doc_recall_mean"] = 0.0
-    log["bcplus/opened_gold_given_retrieved_rate"] = (
-        opened_gold_given_retrieved_count / retrieved_gold_hit_count
-        if retrieved_gold_hit_count else 0.0
+        log["bcplus_evidence/retrieved_gold_trajectory_rate"] = 0.0
+        log["bcplus_evidence/opened_gold_trajectory_rate"] = 0.0
+        log["bcplus_evidence/retrieved_gold_doc_recall_mean"] = 0.0
+        log["bcplus_evidence/opened_gold_doc_recall_mean"] = 0.0
+    log["bcplus_evidence/opened_gold_given_retrieved_rate"] = (
+        opened_gold_given_retrieved_count / retrieved_gold_hit_count if retrieved_gold_hit_count else 0.0
     )
-    log["bcplus/answer_correct_given_opened_gold_rate"] = (
-        opened_gold_correct_count / opened_gold_answer_count
-        if opened_gold_answer_count else 0.0
+    log["bcplus_evidence/answer_correct_given_opened_gold_rate"] = (
+        opened_gold_correct_count / opened_gold_answer_count if opened_gold_answer_count else 0.0
     )
-    log["bcplus/answer_correct_given_not_opened_gold_rate"] = (
-        not_opened_gold_correct_count / not_opened_gold_answer_count
-        if not_opened_gold_answer_count else 0.0
+    log["bcplus_evidence/answer_correct_given_not_opened_gold_rate"] = (
+        not_opened_gold_correct_count / not_opened_gold_answer_count if not_opened_gold_answer_count else 0.0
     )
     # Prompt groups whose rollout-id-deduped final rewards have zero variance
     # at the two terminal reward values. Always emit both keys so W&B records
     # a real zero instead of leaving a gap when no group matches.
-    log["bcplus/zero_std_trajectory_count_1.0"] = sum(
+    log["bcplus_reward/zero_std_trajectory_count_1.0"] = sum(
         1 for scores in group_final_scores.values() if scores and all(score == 1.0 for score in scores)
     )
-    log["bcplus/zero_std_trajectory_count_0.0"] = sum(
+    log["bcplus_reward/zero_std_trajectory_count_0.0"] = sum(
         1 for scores in group_final_scores.values() if scores and all(score == 0.0 for score in scores)
     )
     # Compression-quality metrics.
-    log["bcplus/summary_extracted_count"] = summary_extracted_count
-    log["bcplus/summary_fallback_count"] = summary_fallback_count
-    log["bcplus/summary_empty_count"] = summary_empty_count
-    log["bcplus/summary_content_len_tokens_mean"] = (
+    log["bcplus_compression/summary_extracted_count"] = summary_extracted_count
+    log["bcplus_compression/summary_fallback_count"] = summary_fallback_count
+    log["bcplus_compression/summary_empty_count"] = summary_empty_count
+    log["bcplus_compression/summary_content_len_tokens_mean"] = (
         sum(summary_content_token_lengths) / len(summary_content_token_lengths)
-        if summary_content_token_lengths else 0.0
+        if summary_content_token_lengths
+        else 0.0
     )
-    log["bcplus/compress_success_rate"] = (
-        summary_extracted_count / attempted_compression_count
-        if attempted_compression_count else 0.0
+    log["bcplus_compression/compress_success_rate"] = (
+        summary_extracted_count / attempted_compression_count if attempted_compression_count else 0.0
     )
-    log["bcplus/summary_fallback_advantage_override_mean"] = (
+    log["bcplus_compression/summary_fallback_advantage_override_mean"] = (
         summary_fallback_advantage_sum / len(flat_samples) if flat_samples else 0.0
     )
     # pass@k on raw scores (see computation above). Average across prompts.
     for k in sorted(pass_at_k.keys()):
-        log[f"bcplus/pass@{k}_raw"] = sum(pass_at_k[k]) / len(pass_at_k[k])
+        log[f"bcplus_reward/pass@{k}_raw"] = sum(pass_at_k[k]) / len(pass_at_k[k])
     log["rollout/step"] = rollout_id
     wandb.log(log)
     return False
