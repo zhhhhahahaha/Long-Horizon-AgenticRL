@@ -41,6 +41,8 @@ def test_smoke_uses_environment_auth_and_real_slime_tracking_contract(tmp_path, 
 
     calls = []
     fake_wandb = ModuleType("wandb")
+    fake_wandb.__version__ = "test-version"
+    fake_wandb.login = lambda host: calls.append(("login", host)) or True
     fake_wandb.run = SimpleNamespace(id="run-123", url="https://meta.wandb.io/test/run-123")
     fake_logging = ModuleType("slime.utils.logging_utils")
 
@@ -67,7 +69,8 @@ def test_smoke_uses_environment_auth_and_real_slime_tracking_contract(tmp_path, 
 
     payload = smoke.run_smoke()
 
-    init_call = calls[0]
+    assert calls[0] == ("login", "https://meta.wandb.io")
+    init_call = calls[1]
     assert init_call[0] == "init"
     args = init_call[1]
     assert init_call[2:] == (False, "actor")

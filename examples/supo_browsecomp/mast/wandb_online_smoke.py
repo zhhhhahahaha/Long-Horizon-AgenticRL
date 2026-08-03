@@ -86,6 +86,11 @@ def run_smoke() -> dict[str, object]:
     import wandb
     from slime.utils.logging_utils import finish_tracking, init_tracking, log
 
+    logged_in = wandb.login(host=config["base_url"])
+    print(
+        f"[wandb-online-smoke] SDK={getattr(wandb, '__version__', 'unknown')} "
+        f"module={getattr(wandb, '__file__', 'unknown')} login={logged_in}"
+    )
     try:
         init_tracking(args, primary=False, role="actor")
         if wandb.run is None:
