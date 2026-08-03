@@ -60,6 +60,10 @@
 #   BCPLUS_CHECKPOINT_ROOT      default /genai/fsx-llm/interns/hhzhang01/checkpoints.
 #                               Override with the old FSx root when resuming a
 #                               run stored under /genai/fsx-project.
+#   BC_SLIM_INTERMEDIATE_CHECKPOINTS
+#                               default 1. Keep only the latest checkpoint full
+#                               for resume; replace older saves with weights-only
+#                               copies. Set to 0/false to retain every full save.
 #   BCPLUS_JUDGE_MODEL          default "gpt-5-4-genai-dss4" (MetaGen judge id)
 #   BCPLUS_JUDGE_BASE_URL       default "https://api.llama.com/compat/v1/"
 #   BCPLUS_JUDGE_CONCURRENCY    default 64  (judge call semaphore)
@@ -291,6 +295,7 @@ if [[ "${SLIME_INNER:-0}" != "1" ]]; then
                 --env BCPLUS_DUMP_TRAIN_OLD='${BCPLUS_DUMP_TRAIN_OLD:-}' \
                 --env BCPLUS_RAW_ROLLOUT_DIR='${BCPLUS_RAW_ROLLOUT_DIR:-}' \
                 --env BCPLUS_CHECKPOINT_ROOT='${BCPLUS_CHECKPOINT_ROOT}' \
+                --env BC_SLIM_INTERMEDIATE_CHECKPOINTS='${BC_SLIM_INTERMEDIATE_CHECKPOINTS:-1}' \
                 --env BCPLUS_JUDGE_MODEL='${BCPLUS_JUDGE_MODEL:-}' \
                 --env BCPLUS_JUDGE_BASE_URL='${BCPLUS_JUDGE_BASE_URL:-}' \
                 --env BCPLUS_JUDGE_CONCURRENCY='${BCPLUS_JUDGE_CONCURRENCY:-}' \
@@ -421,6 +426,19 @@ CKPT_ARGS=(
    --save "${CKPT_SAVE_DIR}"
    --save-interval 5
 )
+case "$(printf '%s' "${BC_SLIM_INTERMEDIATE_CHECKPOINTS:-1}" | tr '[:upper:]' '[:lower:]')" in
+    1|true)
+        CKPT_ARGS+=(--slim-intermediate-checkpoints)
+        echo "[head] rolling checkpoint slimming enabled"
+        ;;
+    0|false)
+        echo "[head] rolling checkpoint slimming disabled"
+        ;;
+    *)
+        echo "BC_SLIM_INTERMEDIATE_CHECKPOINTS must be one of: 1, true, 0, false" >&2
+        exit 2
+        ;;
+esac
 
 # Conditional --load for resume. First run: no latest_checkpointed_iteration.txt
 # exists, so we cold-init from --hf-checkpoint. Resume: file exists, add --load

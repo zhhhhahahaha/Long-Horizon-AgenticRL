@@ -44,6 +44,14 @@ BCPLUS_CHECKPOINT_ROOT=/genai/fsx-project/hhzhang01/checkpoints
 Logs, rollout dumps, and coordination files remain under
 `/genai/fsx-project/hhzhang01`; this setting changes checkpoint storage only.
 
+New 4B runs enable rolling checkpoint slimming by default. After each
+successful save, the newest checkpoint remains full so training can resume
+with optimizer, scheduler, and RNG state; the preceding checkpoint is
+atomically replaced by a weights-only copy. Set
+`BC_SLIM_INTERMEDIATE_CHECKPOINTS=0` only when every historical checkpoint
+must remain resumable. Changing this setting does not affect an already
+running launcher process.
+
 ## Rootfs rules for single-node and multi-node runs
 
 | Run mode | Required behavior |
