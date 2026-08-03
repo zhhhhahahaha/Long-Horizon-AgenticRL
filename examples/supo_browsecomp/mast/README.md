@@ -13,6 +13,7 @@ parent directory.
 | Search service | `search/run_search_server.sh` | [`search/README.md`](search/README.md) |
 | Checkpoint slimming | `checkpoint_slim/checkpoint_slim.py` | [`checkpoint_slim/README.md`](checkpoint_slim/README.md) |
 | W&B synchronization | `submit_with_wandb.sh`, `wandb_sync.sh` | Training runbook and script headers |
+| W&B online smoke | `submit_wandb_online_smoke.sh` | This README |
 
 ## Directory ownership
 
@@ -89,3 +90,34 @@ Checkpoint evaluation uses separate JSON presets under `eval/configs/` because
 it is a different immutable workflow. Pass one to `eval_sweep.py` with the
 `--eval-config` option; the effective settings are frozen into the batch's
 `sweep_config.json`.
+
+## Experimental W&B online smoke
+
+`submit_wandb_online_smoke.sh` verifies that a MAST compute container can reach
+and authenticate to `https://meta.wandb.io`. It calls slime's real secondary
+tracking path, logs three metrics, finishes the run, and tears down the W&B
+service. It does not use the offline snapshot or devserver sync workflow.
+
+The worktree must be clean because the submitter builds its code archive from
+`HEAD`. Run a dry-run first, then submit once:
+
+```bash
+WANDB_KEY_FILE="${HOME}/.wandb-key" \
+  bash examples/supo_browsecomp/mast/submit_wandb_online_smoke.sh --dry-run
+
+WANDB_KEY_FILE="${HOME}/.wandb-key" \
+  bash examples/supo_browsecomp/mast/submit_wandb_online_smoke.sh
+```
+
+The key is staged in a mode-`0600` OILFS file and expanded only inside the
+compute container. It is not included in the MAST command, dry-run JSON, or W&B
+run config. A successful job writes its non-secret result to the corresponding
+devserver path under:
+
+```text
+/data/users/hhzhang01/wsfuse_mnt/hhzhang01/supo-slime/wandb-online-smoke-results/
+```
+
+This smoke only validates one compute node. Keep the current offline training
+path until a separate Ray training smoke verifies online logging from all actor
+roles.
