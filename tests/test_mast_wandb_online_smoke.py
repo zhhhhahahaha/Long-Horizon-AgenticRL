@@ -149,6 +149,7 @@ def test_submitter_keeps_key_out_of_mast_spec_and_bypasses_sync_wrapper(tmp_path
     assert all(b"WANDB_API_KEY=$(tr" in command for command in custom_commands)
     assert all(b"WANDB_BASE_URL=https://meta.wandb.io" in command for command in custom_commands)
     assert all(b"wandb_online_smoke.py" in command for command in custom_commands)
+    assert all(b"PYTHONPATH=/slime-src:${PYTHONPATH:-}" in command for command in custom_commands)
     assert b"--docker_host_cmd=" not in raw_args
     assert raw_args.split(b"\0").count(b"--retries=0") == 2
     staged_key = Path(env["MAST_WANDB_KEY_HOST_PATH"])
