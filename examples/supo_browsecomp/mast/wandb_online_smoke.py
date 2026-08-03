@@ -19,7 +19,12 @@ def _required_env(name: str) -> str:
 
 def _configure_environment() -> dict[str, str]:
     base_url = os.environ.get("WANDB_BASE_URL", "https://meta.wandb.io").rstrip("/")
-    proxy_url = os.environ.get("MAST_WANDB_HTTPS_PROXY", "http://127.0.0.1:9080")
+    proxy_url = (
+        os.environ.get("MAST_WANDB_HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+        or os.environ.get("HTTPS_PROXY")
+        or "http://fwdproxy:8080"
+    )
     entity = _required_env("WANDB_ENTITY")
     project = _required_env("WANDB_PROJECT")
     group = _required_env("WANDB_RUN_GROUP")
@@ -57,7 +62,10 @@ def _write_result(result_path: str, payload: dict[str, object]) -> None:
 def run_smoke() -> dict[str, object]:
     config = _configure_environment()
     endpoint_status = _check_endpoint(config["base_url"], config["proxy_url"])
-    print(f"[wandb-online-smoke] endpoint reachable: status={endpoint_status} url={config['base_url']}")
+    print(
+        f"[wandb-online-smoke] endpoint reachable: status={endpoint_status} "
+        f"url={config['base_url']} proxy={config['proxy_url']}"
+    )
 
     # Authenticate through WANDB_API_KEY in the environment. Passing the key in
     # args.wandb_key would copy it into slime's W&B config dictionary.
@@ -114,4 +122,17 @@ def run_smoke() -> dict[str, object]:
 
 
 if __name__ == "__main__":
-    run_smoke()
+    try:
+        run_smoke()
+    except Exception as error:
+        result_path = os.environ.get("MAST_WANDB_RESULT_PATH")
+        if result_path:
+            _write_result(
+                result_path,
+                {
+                    "status": "error",
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                },
+            )
+        raise

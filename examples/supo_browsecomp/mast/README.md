@@ -94,9 +94,10 @@ it is a different immutable workflow. Pass one to `eval_sweep.py` with the
 ## Experimental W&B online smoke
 
 `submit_wandb_online_smoke.sh` verifies that a MAST compute container can reach
-and authenticate to `https://meta.wandb.io`. It calls slime's real secondary
-tracking path, logs three metrics, finishes the run, and tears down the W&B
-service. It does not use the offline snapshot or devserver sync workflow.
+and authenticate to `https://meta.wandb.io` through the fwdproxy configured by
+MAST TTLS. It calls slime's real secondary tracking path, logs three metrics,
+finishes the run, and tears down the W&B service. It does not use the offline
+snapshot or devserver sync workflow.
 
 The worktree must be clean because the submitter builds its code archive from
 `HEAD`. Run a dry-run first, then submit once:

@@ -35,6 +35,7 @@ def test_smoke_uses_environment_auth_and_real_slime_tracking_contract(tmp_path, 
     monkeypatch.setenv("WANDB_ENTITY", "test-entity")
     monkeypatch.setenv("WANDB_PROJECT", "test-project")
     monkeypatch.setenv("WANDB_RUN_GROUP", "test-group")
+    monkeypatch.setenv("https_proxy", "http://fwdproxy:8080")
     monkeypatch.setenv("MAST_WANDB_RESULT_PATH", str(tmp_path / "result.json"))
     monkeypatch.setattr(smoke, "_check_endpoint", lambda base_url, proxy_url: 200)
 
@@ -74,6 +75,7 @@ def test_smoke_uses_environment_auth_and_real_slime_tracking_contract(tmp_path, 
     assert args.wandb_key is None
     assert args.wandb_host == "https://meta.wandb.io"
     assert args.wandb_explicit_teardown is True
+    assert os.environ["HTTPS_PROXY"] == "http://fwdproxy:8080"
     assert [call[2]["train/step"] for call in calls if call[0] == "log"] == [0, 1, 2]
     assert calls[-1][0] == "finish"
     assert payload["run_id"] == "run-123"
@@ -144,6 +146,8 @@ def test_submitter_keeps_key_out_of_mast_spec_and_bypasses_sync_wrapper(tmp_path
     assert all(b"WANDB_API_KEY=$(tr" in command for command in custom_commands)
     assert all(b"WANDB_BASE_URL=https://meta.wandb.io" in command for command in custom_commands)
     assert all(b"wandb_online_smoke.py" in command for command in custom_commands)
+    assert b"--docker_host_cmd=" not in raw_args
+    assert raw_args.split(b"\0").count(b"--retries=0") == 2
     staged_key = Path(env["MAST_WANDB_KEY_HOST_PATH"])
     assert staged_key.read_text() == "fake-wandb-api-key"
     assert staged_key.stat().st_mode & 0o777 == 0o600
