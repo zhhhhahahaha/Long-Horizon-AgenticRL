@@ -1194,9 +1194,21 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Directory to store wandb logs. Default is ./wandb in current directory.",
             )
             parser.add_argument("--wandb-key", type=str, default=None)
+            parser.add_argument(
+                "--wandb-key-file",
+                type=str,
+                default=None,
+                help="Read the W&B API key from this file without placing the key in process arguments.",
+            )
             parser.add_argument("--wandb-host", type=str, default=None)
             parser.add_argument("--wandb-team", type=str, default=None)
             parser.add_argument("--wandb-group", type=str, default=None)
+            parser.add_argument(
+                "--wandb-online-fallback-offline",
+                action="store_true",
+                default=False,
+                help="Fall back to a local offline run when online W&B initialization fails.",
+            )
             reset_arg(parser, "--wandb-project", type=str, default=None)
             parser.add_argument(
                 "--disable-wandb-random-suffix",

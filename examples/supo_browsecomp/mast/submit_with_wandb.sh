@@ -1,5 +1,5 @@
 #!/bin/bash
-# Submit a MAST job from the devserver and attach its W&B sync watcher.
+# Submit a MAST job and configure its offline or online W&B transport.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -7,6 +7,8 @@ SYNC_SCRIPT="${MAST_WANDB_SYNC_SCRIPT:-${SCRIPT_DIR}/wandb_sync.sh}"
 JQ_BIN="${JQ_BIN:-jq}"
 TMUX_BIN="${TMUX_BIN:-tmux}"
 WANDB_KEY_FILE="${WANDB_KEY_FILE:-${HOME}/.wandb-key}"
+SUBMISSION_WANDB_MODE="${MAST_WANDB_MODE:-offline}"
+MAST_WANDB_KEY_HOST_PATH="${MAST_WANDB_KEY_HOST_PATH:-/data/users/hhzhang01/wsfuse_mnt/hhzhang01/supo-slime/.wandb-online-key}"
 WANDB_BIN="${WANDB_BIN:-/data/users/hhzhang01/slime-sanity/hfvenv/bin/wandb}"
 WITH_PROXY_BIN="${WITH_PROXY_BIN:-with-proxy}"
 MAST_BIN="${MAST_BIN:-mast}"
@@ -21,11 +23,11 @@ Usage:
   submit_with_wandb.sh -- <rl/cli.sh mast --json ...>
   submit_with_wandb.sh watch-only <full-mast-job-name>
 
-The submit form requires structured `rl/cli.sh mast --json` output. It submits
-the command unchanged, extracts `.job.job_name`, and starts the devserver-side
-W&B sync watcher in tmux. `watch-only` restores a missing watcher without
-submitting another job. Set MAST_WANDB_RUN_NAME when snapshots are stored under
-a logical run name different from the newly submitted MAST job name.
+The submit form requires structured `rl/cli.sh mast --json` output. In offline
+mode it starts the devserver-side W&B sync watcher. In online mode it stages the
+W&B key to OILFS before submission and does not start a watcher; compute nodes
+upload live while retaining recovery snapshots. `watch-only` restores an
+offline watcher's missing tmux session without submitting another job.
 EOF
 }
 
@@ -48,6 +50,30 @@ validate_job_name() {
   [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || fail "invalid MAST job name: $1"
 }
 
+validate_key() {
+  [[ -r "${WANDB_KEY_FILE}" ]] || fail "Meta W&B key is not readable: ${WANDB_KEY_FILE}"
+  [[ -n "$(tr -d ' \t\r\n' < "${WANDB_KEY_FILE}")" ]] || fail "Meta W&B key is empty: ${WANDB_KEY_FILE}"
+}
+
+stage_online_key() {
+  local key_tmp
+  mkdir -p "$(dirname "${MAST_WANDB_KEY_HOST_PATH}")"
+  key_tmp="${MAST_WANDB_KEY_HOST_PATH}.tmp-$$"
+  trap 'rm -f "${key_tmp}" 2>/dev/null || true' RETURN
+  (umask 077; tr -d ' \t\r\n' < "${WANDB_KEY_FILE}" > "${key_tmp}")
+  chmod 600 "${key_tmp}"
+  mv -f "${key_tmp}" "${MAST_WANDB_KEY_HOST_PATH}"
+  trap - RETURN
+  log "online key staged: ${MAST_WANDB_KEY_HOST_PATH}"
+}
+
+preflight_online() {
+  require_command "${JQ_BIN}"
+  validate_key
+  mkdir -p "${WATCHER_ROOT}"
+  stage_online_key
+}
+
 preflight_watcher() {
   require_command "${JQ_BIN}"
   require_command "${TMUX_BIN}"
@@ -55,8 +81,7 @@ preflight_watcher() {
   require_command "${MAST_BIN}"
   [[ -r "${SYNC_SCRIPT}" ]] || fail "W&B sync script is not readable: ${SYNC_SCRIPT}"
   [[ -x "${WANDB_BIN}" ]] || fail "W&B CLI is not executable: ${WANDB_BIN}"
-  [[ -r "${WANDB_KEY_FILE}" ]] || fail "Meta W&B key is not readable: ${WANDB_KEY_FILE}"
-  [[ -n "$(tr -d ' \t\r\n' < "${WANDB_KEY_FILE}")" ]] || fail "Meta W&B key is empty: ${WANDB_KEY_FILE}"
+  validate_key
   if [[ ! -d "${MAST_WANDB_ROOT}" && ! -d "${MAST_WANDB_SNAPSHOT_ROOT}" ]]; then
     fail "neither OILFS W&B root is mounted: ${MAST_WANDB_ROOT}, ${MAST_WANDB_SNAPSHOT_ROOT}"
   fi
@@ -199,6 +224,11 @@ submit_and_watch() {
   [[ -z "${mast_url}" ]] || log "MAST URL: ${mast_url}"
   log "submission response: ${response_file}"
 
+  if [[ "${SUBMISSION_WANDB_MODE}" == "online" ]]; then
+    log "W&B mode=online; live upload enabled and no devserver sync watcher started"
+    return 0
+  fi
+
   if ! start_watcher "${job_name}"; then
     echo "submit_with_wandb.sh: MAST job ${job_name} is already submitted, but its watcher did not start" >&2
     echo "submit_with_wandb.sh: recover without resubmitting:" >&2
@@ -215,7 +245,11 @@ case "${1:-}" in
     ;;
   --)
     shift
-    preflight_watcher
+    case "${SUBMISSION_WANDB_MODE}" in
+      online) preflight_online ;;
+      offline) preflight_watcher ;;
+      *) fail "MAST_WANDB_MODE must be online or offline, got: ${SUBMISSION_WANDB_MODE}" ;;
+    esac
     submit_and_watch "$@"
     ;;
   -h|--help)

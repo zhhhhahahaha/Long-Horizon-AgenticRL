@@ -17,6 +17,7 @@ NUM_GPUS = 0
 ROOT = Path(__file__).parents[1]
 SMOKE = ROOT / "examples/supo_browsecomp/mast/wandb_online_smoke.py"
 SUBMIT = ROOT / "examples/supo_browsecomp/mast/submit_wandb_online_smoke.sh"
+WANDB_UTILS = ROOT / "slime/utils/wandb_utils.py"
 
 
 def _load_smoke_module():
@@ -26,6 +27,82 @@ def _load_smoke_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_wandb_utils(monkeypatch, fake_wandb):
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+    spec = importlib.util.spec_from_file_location("test_mast_wandb_utils_module", WANDB_UTILS)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _tracking_args(key_file: Path, fallback: bool = False):
+    return SimpleNamespace(
+        use_wandb=True,
+        wandb_mode="online",
+        wandb_key=None,
+        wandb_key_file=str(key_file),
+        wandb_host="https://meta.wandb.io",
+        wandb_team="test-entity",
+        wandb_project="test-project",
+        wandb_group="test-group",
+        wandb_dir=None,
+        wandb_online_fallback_offline=fallback,
+    )
+
+
+@pytest.mark.unit
+def test_slime_online_tracking_uses_key_file_proxy_and_redacts_key(tmp_path, monkeypatch):
+    key_file = tmp_path / "wandb-key"
+    key_file.write_text("secret-from-file\n")
+    monkeypatch.setenv("WANDB_HTTPS_PROXY", "http://fwdproxy:8080")
+    calls = []
+    fake_wandb = ModuleType("wandb")
+    fake_wandb.Settings = lambda **kwargs: {"settings": kwargs}
+    fake_wandb.login = lambda **kwargs: calls.append(("login", kwargs)) or True
+    fake_wandb.init = lambda **kwargs: calls.append(("init", kwargs))
+    fake_wandb.define_metric = lambda *args, **kwargs: None
+    fake_wandb.teardown = lambda: calls.append(("teardown", {}))
+    wandb_utils = _load_wandb_utils(monkeypatch, fake_wandb)
+
+    wandb_utils.init_wandb_secondary(_tracking_args(key_file), role="actor")
+
+    assert calls[0] == (
+        "login",
+        {"key": "secret-from-file", "host": "https://meta.wandb.io"},
+    )
+    init_kwargs = calls[1][1]
+    assert init_kwargs["settings"] == {"settings": {"mode": "online", "https_proxy": "http://fwdproxy:8080"}}
+    assert "wandb_key" not in init_kwargs["config"]
+    assert "secret-from-file" not in repr(init_kwargs["config"])
+
+
+@pytest.mark.unit
+def test_slime_online_tracking_falls_back_to_offline(tmp_path, monkeypatch):
+    key_file = tmp_path / "wandb-key"
+    key_file.write_text("secret-from-file\n")
+    calls = []
+    fake_wandb = ModuleType("wandb")
+    fake_wandb.Settings = lambda **kwargs: kwargs
+    fake_wandb.login = lambda **kwargs: True
+
+    def init(**kwargs):
+        calls.append(("init", kwargs["settings"]["mode"]))
+        if kwargs["settings"]["mode"] == "online":
+            raise RuntimeError("network unavailable")
+
+    fake_wandb.init = init
+    fake_wandb.define_metric = lambda *args, **kwargs: None
+    fake_wandb.teardown = lambda: calls.append(("teardown", None))
+    wandb_utils = _load_wandb_utils(monkeypatch, fake_wandb)
+
+    wandb_utils.init_wandb_secondary(_tracking_args(key_file, fallback=True), role="actor")
+
+    assert calls == [("init", "online"), ("teardown", None), ("init", "offline")]
+    assert os.environ["WANDB_MODE"] == "offline"
 
 
 @pytest.mark.unit
@@ -163,9 +240,7 @@ def test_submitter_rejects_missing_key_before_calling_mast(tmp_path):
     env = _submit_env(tmp_path)
     env["WANDB_KEY_FILE"] = str(tmp_path / "missing-key")
 
-    result = subprocess.run(
-        ["bash", str(SUBMIT), "--dry-run"], capture_output=True, text=True, env=env, check=False
-    )
+    result = subprocess.run(["bash", str(SUBMIT), "--dry-run"], capture_output=True, text=True, env=env, check=False)
 
     assert result.returncode != 0
     assert "W&B API key is missing or empty" in result.stderr

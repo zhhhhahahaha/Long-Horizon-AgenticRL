@@ -89,6 +89,8 @@ run_wrapper() {
     MAST_BIN="${TMP_DIR}/bin/mast" \
     WANDB_BIN="${TMP_DIR}/bin/wandb" \
     WANDB_KEY_FILE="${TMP_DIR}/wandb-key" \
+    MAST_WANDB_MODE="${MAST_WANDB_MODE:-offline}" \
+    MAST_WANDB_KEY_HOST_PATH="${MAST_WANDB_KEY_HOST_PATH:-${TMP_DIR}/staged-wandb-key}" \
     MAST_WANDB_ROOT="${TMP_DIR}/wandb" \
     MAST_WANDB_SNAPSHOT_ROOT="${TMP_DIR}/snapshots" \
     MAST_WANDB_WATCHER_ROOT="${TMP_DIR}/state" \
@@ -170,5 +172,22 @@ unset FAKE_TMUX_DROP_SESSION
 output="$(run_wrapper watch-only avocado-test-watcherfail)"
 grep -Fq 'watcher started: job=avocado-test-watcherfail' <<< "${output}" || \
   fail "watch-only did not recover the missing watcher"
+
+export MAST_WANDB_MODE=online
+export MAST_WANDB_KEY_HOST_PATH="${TMP_DIR}/online-wandb-key"
+export FAKE_JOB_NAME=avocado-test-online
+before="$(grep -c '^new-session' "${FAKE_TMUX_LOG}")"
+output="$(run_wrapper -- "${TMP_DIR}/bin/submit" --json program test)"
+grep -Fq 'W&B mode=online; live upload enabled and no devserver sync watcher started' <<< "${output}" || \
+  fail "online submission did not report that the sync watcher was skipped"
+[[ "$(grep -c '^new-session' "${FAKE_TMUX_LOG}")" -eq "${before}" ]] || \
+  fail "online submission unexpectedly started a watcher"
+[[ "$(cat "${MAST_WANDB_KEY_HOST_PATH}")" == "local-wandb_v1_test" ]] || \
+  fail "online submission did not stage the expected W&B key"
+[[ "$(( $(stat -c '%a' "${MAST_WANDB_KEY_HOST_PATH}") ))" -eq 600 ]] || \
+  fail "staged online W&B key does not have mode 0600"
+! grep -Fq 'local-wandb_v1_test' "${FAKE_SUBMIT_LOG}" || \
+  fail "online submission leaked the W&B key into MAST arguments"
+unset MAST_WANDB_MODE MAST_WANDB_KEY_HOST_PATH
 
 echo "test_mast_submit_with_wandb.sh: PASS"

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Upload one MAST job's offline W&B runs from completed OILFS snapshots.
+# Upload offline runs or recover online runs from completed OILFS snapshots.
 # Keep this process outside MAST: it owns the Meta W&B key and fwdproxy access.
 set -euo pipefail
 
@@ -8,13 +8,16 @@ usage() {
 Usage:
   wandb_sync.sh once  <full-mast-job-name>
   wandb_sync.sh watch <full-mast-job-name>
+  wandb_sync.sh recover-online <full-mast-job-name>
 
 "once" performs one incremental sync. "watch" syncs every 5 minutes while
 MAST reports PENDING/RUNNING/SHUTTING_DOWN, then performs a final sync at
 COMPLETE/FAILED/DEAD. Snapshots are extracted to devserver-local disk before
 W&B reads them. Set MAST_WANDB_RUN_NAME when snapshot storage uses a different
 logical run name, as it does when resuming an existing checkpoint namespace.
-Run watch in tmux so it survives disconnects.
+Run watch in tmux so it survives disconnects. "recover-online" is a manual,
+one-shot recovery for online or online-to-offline-fallback runs; it includes
+already-synced online run IDs and appends records from the latest snapshots.
 EOF
 }
 
@@ -37,7 +40,7 @@ fi
 MODE="$1"
 MAST_JOB_NAME="$2"
 case "${MODE}" in
-  once|watch) ;;
+  once|watch|recover-online) ;;
   *) usage; exit 2 ;;
 esac
 if [[ ! "${MAST_JOB_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -82,6 +85,9 @@ PRECREATE_RUNS="${MAST_WANDB_PRECREATE:-1}"
 PRECREATE_SCRIPT="${MAST_WANDB_PRECREATE_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/wandb_precreate.py}"
 WANDB_ENTITY="${MAST_WANDB_ENTITY:-hhzhang01}"
 WANDB_PROJECT="${MAST_WANDB_PROJECT:-supo-bcplus-mast}"
+if [[ "${MODE}" == "recover-online" ]]; then
+  PRECREATE_RUNS=0
+fi
 
 require_command "${WITH_PROXY_BIN}"
 require_command flock
@@ -136,17 +142,25 @@ sync_once() {
   local publisher_dir publisher_key latest_snapshot
   local cache_parent cache_current cache_previous cache_tmp
   local found_run snapshot_error=0
-  local index
+  local index pattern
+  local run_patterns=("offline-run-*")
+  local sync_args=(sync --append --no-sync-tensorboard)
+  if [[ "${MODE}" == "recover-online" ]]; then
+    run_patterns+=("run-*")
+    sync_args+=(--include-online --include-synced)
+  fi
 
   shopt -s nullglob
-  for path in "${RUN_ROOT}"/offline-run-*; do
-    [[ -d "${path}" ]] || continue
-    run_id="${path##*-}"
-    if [[ -n "${EXCLUDED_RUN_ID_SET[${run_id}]:-}" ]]; then
-      log "skipping excluded offline run ${run_id}: ${path}"
-      continue
-    fi
-    candidates+=("${path}")
+  for pattern in "${run_patterns[@]}"; do
+    for path in "${RUN_ROOT}"/${pattern}; do
+      [[ -d "${path}" ]] || continue
+      run_id="${path##*-}"
+      if [[ -n "${EXCLUDED_RUN_ID_SET[${run_id}]:-}" ]]; then
+        log "skipping excluded run ${run_id}: ${path}"
+        continue
+      fi
+      candidates+=("${path}")
+    done
   done
   shopt -u nullglob
 
@@ -186,27 +200,33 @@ sync_once() {
       while IFS= read -r -d '' path; do
         run_id="${path##*-}"
         if [[ -n "${EXCLUDED_RUN_ID_SET[${run_id}]:-}" ]]; then
-          log "skipping excluded offline run ${run_id}: ${path}"
+          log "skipping excluded run ${run_id}: ${path}"
           continue
         fi
         candidates+=("${path}")
         found_run=1
-      done < <(find "${cache_current}" -type d -name 'offline-run-*' -print0)
+      done < <(
+        if [[ "${MODE}" == "recover-online" ]]; then
+          find "${cache_current}" -type d \( -name 'offline-run-*' -o -name 'run-*' \) -print0
+        else
+          find "${cache_current}" -type d -name 'offline-run-*' -print0
+        fi
+      )
       if [[ "${found_run}" == "1" ]]; then
         pending_keys+=("${publisher_key}")
         pending_snapshots+=("${latest_snapshot}")
       else
-        log "snapshot has no offline runs yet: ${latest_snapshot}"
+        log "snapshot has no recoverable runs yet: ${latest_snapshot}"
       fi
     done < <(find "${SNAPSHOT_RUN_ROOT}" -mindepth 1 -maxdepth 1 -type d -print0)
   fi
 
   if [[ ${#candidates[@]} -eq 0 ]]; then
-    log "no new offline runs under ${RUN_ROOT} or ${SNAPSHOT_RUN_ROOT}"
+    log "no new recoverable runs under ${RUN_ROOT} or ${SNAPSHOT_RUN_ROOT}"
     return "${snapshot_error}"
   fi
 
-  log "syncing ${#candidates[@]} offline run(s) to ${WANDB_BASE_URL}"
+  log "syncing ${#candidates[@]} run(s) to ${WANDB_BASE_URL} mode=${MODE}"
   if [[ "${PRECREATE_RUNS}" == "1" ]]; then
     if ! "${WITH_PROXY_BIN}" "${WANDB_PYTHON_BIN}" "${PRECREATE_SCRIPT}" \
       --entity "${WANDB_ENTITY}" --project "${WANDB_PROJECT}" \
@@ -215,7 +235,7 @@ sync_once() {
       return 1
     fi
   fi
-  if ! "${WITH_PROXY_BIN}" "${WANDB_BIN}" sync --append --no-sync-tensorboard "${candidates[@]}"; then
+  if ! "${WITH_PROXY_BIN}" "${WANDB_BIN}" "${sync_args[@]}" "${candidates[@]}"; then
     return 1
   fi
   for ((index = 0; index < ${#pending_keys[@]}; index++)); do
@@ -251,7 +271,7 @@ final_sync() {
   return 1
 }
 
-if [[ "${MODE}" == "once" ]]; then
+if [[ "${MODE}" == "once" || "${MODE}" == "recover-online" ]]; then
   sync_once
   exit $?
 fi

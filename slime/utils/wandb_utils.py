@@ -61,9 +61,36 @@ def _prefix_config_keys(config, prefix):
 
 def _compute_secondary_config_for_logging(args, role=None):
     config = _args_to_config_dict(args)
+    # Never serialize an API key into the remote run config. Prefer
+    # --wandb-key-file or WANDB_API_KEY over --wandb-key for transport too.
+    config.pop("wandb_key", None)
     if role == "critic":
         return _prefix_config_keys(config, "critic")
     return config
+
+
+def _read_wandb_key(args):
+    if args.wandb_key is not None:
+        return args.wandb_key
+
+    key_file = getattr(args, "wandb_key_file", None)
+    if key_file is None:
+        return None
+    try:
+        with open(key_file) as file:
+            key = file.read().strip()
+    except OSError as error:
+        raise RuntimeError(f"cannot read W&B API key file {key_file!r}: {error}") from error
+    if not key:
+        raise RuntimeError(f"W&B API key file is empty: {key_file!r}")
+    return key
+
+
+def _wandb_settings(mode):
+    settings_kwargs = {"mode": mode}
+    if https_proxy := os.environ.get("WANDB_HTTPS_PROXY"):
+        settings_kwargs["https_proxy"] = https_proxy
+    return wandb.Settings(**settings_kwargs)
 
 
 # Map slime's role string -> wandb job_type (shown in the group view).
@@ -95,11 +122,6 @@ def init_wandb_secondary(args, role=None):
 
     offline = _is_offline_mode(args)
 
-    if (not offline) and args.wandb_key is not None:
-        wandb.login(key=args.wandb_key, host=args.wandb_host)
-
-    settings_kwargs = dict(mode="offline") if offline else dict(mode="online")
-
     job_type = _ROLE_TO_JOB_TYPE.get(role, role or "rollout")
     run_name = f"{args.wandb_group}-{job_type}"
 
@@ -110,7 +132,7 @@ def init_wandb_secondary(args, role=None):
         "job_type": job_type,
         "name": run_name,
         "config": _compute_secondary_config_for_logging(args, role=role),
-        "settings": wandb.Settings(**settings_kwargs),
+        "settings": _wandb_settings("offline" if offline else "online"),
     }
 
     # Add custom directory if specified
@@ -118,7 +140,24 @@ def init_wandb_secondary(args, role=None):
         os.makedirs(args.wandb_dir, exist_ok=True)
         init_kwargs["dir"] = args.wandb_dir
 
-    wandb.init(**init_kwargs)
+    if offline:
+        wandb.init(**init_kwargs)
+    else:
+        try:
+            if (key := _read_wandb_key(args)) is not None:
+                wandb.login(key=key, host=args.wandb_host)
+            wandb.init(**init_kwargs)
+        except Exception:
+            if not getattr(args, "wandb_online_fallback_offline", False):
+                raise
+            logger.exception("Online W&B initialization failed; falling back to an offline run")
+            try:
+                wandb.teardown()
+            except (Exception, SystemExit):
+                logger.exception("Failed to tear down W&B before offline fallback")
+            os.environ["WANDB_MODE"] = "offline"
+            init_kwargs["settings"] = _wandb_settings("offline")
+            wandb.init(**init_kwargs)
 
     _init_wandb_common()
 

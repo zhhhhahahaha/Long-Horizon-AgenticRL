@@ -1,0 +1,38 @@
+#!/bin/bash
+# One-node formal training smoke for online W&B plus OILFS recovery snapshots.
+# shellcheck disable=SC2034  # Variables are consumed by submit_experiment.sh after sourcing.
+
+MAST_JOB_NAME=supo-4b-wandb-online-training-smoke
+MAST_NUM_NODES=1
+MAST_GPUS_PER_NODE=8
+MAST_DATA_PARALLEL_SIZE=1
+MAST_CONTEXT_PARALLEL_SIZE=8
+MAST_CODE_ARCHIVE=/mnt/wsfuse/hhzhang01/supo-slime/slime-code-wandb-online-training-smoke.tgz
+
+BC_MODEL_SIZE=4B
+BC_NUM_ROLLOUT=1
+BC_ROLLOUT_BATCH_SIZE=1
+BC_N_SAMPLES=1
+BC_GLOBAL_BATCH_SIZE=1
+BC_MAX_RESPONSE_LEN=1024
+BC_MAX_CONTEXT_LEN=4096
+BC_TP=4
+BC_CP=2
+BC_SGLANG_TP=2
+BC_SAVE_INTERVAL=0
+BC_DUMP_ROLLOUT=0
+
+BC_WANDB_MODE=online
+BC_WANDB_ENTITY=hhzhang01
+BC_WANDB_PROJECT=supo-bcplus-mast
+BC_WANDB_HOST=https://meta.wandb.io
+MAST_WANDB_HTTPS_PROXY=http://fwdproxy:8080
+MAST_WANDB_SNAPSHOT_INTERVAL_SEC=30
+MAST_PERSIST_RAY_LOGS=0
+WANDB_X_FLUSH_INTERVAL_SECONDS=5
+
+BCPLUS_MAX_TURNS=4
+BCPLUS_JUDGE_CONCURRENCY=1
+BCPLUS_SEARCH_CONCURRENCY=8
+unset BCPLUS_FIXED_SEARCH_TOPK
+unset BCPLUS_DOC_WORDS_FULL

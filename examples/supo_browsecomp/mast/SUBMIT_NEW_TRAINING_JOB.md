@@ -23,11 +23,15 @@ checkpoint 核对、配置、归档、dry-run、真实提交和状态核对。�
 - `configs/*.sh`：单个实验的配置，只放实验和资源参数。
 - `submit_experiment.sh`：读取 config，先做 MAST dry-run，校验 task count 和 rank
   map，再调用真实提交器。
-- `submit_with_wandb.sh`：执行真实提交、保存结构化响应，并启动 W&B watcher。
+- `submit_with_wandb.sh`：执行真实提交并保存结构化响应；offline 模式启动 W&B
+  watcher，online 模式安全暂存 key 且跳过持续 sync。
 - `run_trainer.sh`：在 MAST 容器中运行，选择模型、组装 slime 参数并启动 Ray 训练。
 - `search/README.md`：提交、替换和验证独立 search server；训练提交前必须确认其真实
   `/search` 请求可用。
-- `wandb_sync.sh`：在 devserver 的 tmux 中追踪 MAST 状态并同步离线 W&B 数据。
+- `wandb_sync.sh`：同步离线 W&B 数据，也可在任务结束后从 snapshot 恢复 online run。
+
+W&B online 模式的配置、代理、snapshot 和恢复语义见
+[`WANDB_ONLINE.md`](WANDB_ONLINE.md)。
 
 正常情况下不要绕过 `submit_experiment.sh` 手写长 MAST 命令。
 
@@ -600,6 +604,10 @@ jq -r '{
 `MAST_JOB_NAME`。
 
 ## 8. 核对 MAST 和 W&B watcher
+
+以下 watcher 检查只适用于 `BC_WANDB_MODE=offline`。Online 模式不会启动持续
+sync watcher，应改为检查 Meta W&B live run 和 OILFS recovery snapshots；详见
+[`WANDB_ONLINE.md`](WANDB_ONLINE.md)。
 
 提交器应自动创建 tmux watcher：
 

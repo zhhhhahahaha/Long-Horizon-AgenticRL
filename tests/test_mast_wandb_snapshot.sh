@@ -26,6 +26,8 @@ find "${PUBLISHER_DIR}" -maxdepth 1 -name '*.tmp' | grep -q . && \
   fail "temporary OILFS file remained visible"
 tar -xOf "${snapshots[0]}" ./wandb/offline-run-test/run-test.wandb | \
   grep -Fqx 'record-1' || fail "snapshot did not contain the local transaction log"
+[[ "$(stat -c '%a' "${snapshots[0]}")" == "644" ]] || \
+  fail "published snapshot must be readable by the devserver"
 
 printf 'record-2\n' >> "${RUN_DIR}/run-test.wandb"
 MAST_WANDB_SNAPSHOT_KEEP=1 bash "${SNAPSHOT_SCRIPT}" once \

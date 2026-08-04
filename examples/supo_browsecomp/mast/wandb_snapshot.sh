@@ -43,6 +43,7 @@ publish_once() {
   tar -C "${local_root}" -cf "${local_archive}" .
   mkdir -p "${publisher_dir}"
   cp "${local_archive}" "${remote_tmp}"
+  chmod 0644 "${remote_tmp}"
   mv "${remote_tmp}" "${remote_final}"
   log "published ${remote_final}"
 

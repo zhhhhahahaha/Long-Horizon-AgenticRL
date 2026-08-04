@@ -12,8 +12,8 @@ parent directory.
 | Checkpoint evaluation | `eval/eval_sweep.py` | [`eval/README.md`](eval/README.md) |
 | Search service | `search/run_search_server.sh` | [`search/README.md`](search/README.md) |
 | Checkpoint slimming | `checkpoint_slim/checkpoint_slim.py` | [`checkpoint_slim/README.md`](checkpoint_slim/README.md) |
-| W&B synchronization | `submit_with_wandb.sh`, `wandb_sync.sh` | Training runbook and script headers |
-| W&B online smoke | `submit_wandb_online_smoke.sh` | This README |
+| W&B online/offline logging | `submit_with_wandb.sh`, `wandb_sync.sh` | [`WANDB_ONLINE.md`](WANDB_ONLINE.md) |
+| W&B online smoke | `submit_wandb_online_smoke.sh` | [`WANDB_ONLINE.md`](WANDB_ONLINE.md) |
 
 ## Directory ownership
 
@@ -119,6 +119,6 @@ devserver path under:
 /data/users/hhzhang01/wsfuse_mnt/hhzhang01/supo-slime/wandb-online-smoke-results/
 ```
 
-This smoke only validates one compute node. Keep the current offline training
-path until a separate Ray training smoke verifies online logging from all actor
-roles.
+The formal training path can enable online logging while retaining OILFS
+recovery snapshots. See [`WANDB_ONLINE.md`](WANDB_ONLINE.md) for mode selection,
+secret handling, failure behavior, and recovery commands.

@@ -10,7 +10,7 @@
 #     host-side CONNECT relay auto-started by --docker_host_cmd on 127.0.0.1:9080)
 #   * search discovery: read the search server's [ipv6]:port from OILFS, wait /health
 #   * LLAMA_API_KEY from an OILFS file (see note on secret hygiene)
-#   * wandb OFFLINE → node-local disk → atomic OILFS snapshots for live sync
+#   * wandb ONLINE or OFFLINE → node-local disk → atomic OILFS snapshots
 #   * Ray head/worker election from MAST_HPC_TASK_GROUP_HOSTNAMES (multi-node)
 #
 # Defaults are a 1-node (8 GPU) 4B SMOKE: TP=4, CP=2 → DP=1, tiny batch,
@@ -179,10 +179,49 @@ export GLOO_SOCKET_IFNAME="${NCCL_OOB_IFNAME}"
 echo "[trainer] NCCL/GLOO OOB iface -> ${NCCL_OOB_IFNAME} (frontend; TW_TASK_ASSIGNED_IFNAMES='${TW_TASK_ASSIGNED_IFNAMES:-<unset>}'); data plane stays on mlx5 RoCE"
 
 # W&B's transaction log cannot be written safely to OILFS (wandb-core can fail
-# close(2) with EOVERFLOW and leave an empty run). Every Ray actor writes to the
-# same path on its own host-local /tmp. Each task publishes immutable tar
-# snapshots into a task-specific OILFS directory; the devserver watcher extracts
-# those snapshots to local disk before running `wandb sync`.
+# close(2) with EOVERFLOW and leave an empty run). Online mode still writes a
+# local transaction log, so both modes publish immutable recovery snapshots to
+# OILFS. The online path uploads live and keeps snapshots for disaster recovery;
+# the offline path is uploaded by the devserver watcher.
+BC_WANDB_MODE="${BC_WANDB_MODE:-offline}"
+case "${BC_WANDB_MODE}" in
+  online|offline) ;;
+  *)
+    echo "ERROR: BC_WANDB_MODE must be online or offline, got ${BC_WANDB_MODE}" >&2
+    exit 2
+    ;;
+esac
+WANDB_BASE_URL="${BC_WANDB_HOST:-https://meta.wandb.io}"
+WANDB_HTTPS_PROXY="${MAST_WANDB_HTTPS_PROXY:-http://fwdproxy:8080}"
+export WANDB_BASE_URL WANDB_HTTPS_PROXY
+
+WANDB_LOCAL_KEY_FILE=""
+if [[ "${BC_WANDB_MODE}" == "online" ]]; then
+  WANDB_SHARED_KEY_FILE="${MAST_WANDB_KEY_FILE:-${STAGE}/.wandb-online-key}"
+  WANDB_LOCAL_KEY_FILE="/tmp/slime-wandb-key-${RUN_NAME}"
+  wandb_key=""
+  for attempt in $(seq 1 6); do
+    if [[ -r "${WANDB_SHARED_KEY_FILE}" ]]; then
+      wandb_key="$(tr -d ' \t\r\n' < "${WANDB_SHARED_KEY_FILE}")"
+      [[ -n "${wandb_key}" ]] && break
+    fi
+    echo "[trainer] waiting for W&B key on OILFS (${attempt}/6): ${WANDB_SHARED_KEY_FILE}" >&2
+    sleep 5
+  done
+  if [[ -z "${wandb_key}" ]]; then
+    echo "ERROR: W&B online mode could not read a non-empty key from ${WANDB_SHARED_KEY_FILE}" >&2
+    exit 1
+  fi
+  key_tmp="${WANDB_LOCAL_KEY_FILE}.tmp-$$"
+  (umask 077; printf '%s\n' "${wandb_key}" > "${key_tmp}")
+  chmod 600 "${key_tmp}"
+  mv -f "${key_tmp}" "${WANDB_LOCAL_KEY_FILE}"
+  unset wandb_key key_tmp
+  echo "[trainer] W&B mode=online host=${WANDB_BASE_URL} proxy=${WANDB_HTTPS_PROXY} key=node-local"
+else
+  echo "[trainer] W&B mode=offline"
+fi
+
 WANDB_ATTEMPT_ID="${TRAINER_ATTEMPT_ID}"
 WANDB_DIR="${MAST_WANDB_LOCAL_DIR:-/tmp/slime-wandb/${RUN_NAME}/attempt-${WANDB_ATTEMPT_ID}}"
 WANDB_PUBLISHER_DIR="${STAGE}/wandb-snapshots/${RUN_NAME}/attempt-${WANDB_ATTEMPT_ID}-task-${TW_TASK_ID:-0}"
@@ -192,7 +231,7 @@ mkdir -p "${WANDB_DIR}"
 bash "${WANDB_SNAPSHOT_SCRIPT}" watch "${WANDB_DIR}" "${WANDB_PUBLISHER_DIR}" \
   "${MAST_WANDB_SNAPSHOT_INTERVAL_SEC:-60}" &
 WANDB_SNAPSHOT_PID=$!
-echo "[trainer] W&B local=${WANDB_DIR} snapshots=${WANDB_PUBLISHER_DIR}"
+echo "[trainer] W&B local=${WANDB_DIR} snapshots=${WANDB_PUBLISHER_DIR} mode=${BC_WANDB_MODE}"
 
 RAY_LOG_COPY_TIMEOUT_SEC="${MAST_RAY_LOG_COPY_TIMEOUT_SEC:-120}"
 if ! [[ "${RAY_LOG_COPY_TIMEOUT_SEC}" =~ ^[1-9][0-9]*$ ]]; then
@@ -214,6 +253,7 @@ on_trainer_exit() {
   if ! bash "${WANDB_SNAPSHOT_SCRIPT}" once "${WANDB_DIR}" "${WANDB_PUBLISHER_DIR}"; then
     echo "[trainer] WARN: final W&B snapshot failed" >&2
   fi
+  [[ -z "${WANDB_LOCAL_KEY_FILE}" ]] || rm -f "${WANDB_LOCAL_KEY_FILE}"
 
   if [[ "${IS_HEAD}" = "1" && "${MAST_PERSIST_RAY_LOGS:-1}" != "0" ]]; then
     echo "[head] persisting Ray logs (timeout=${RAY_LOG_COPY_TIMEOUT_SEC}s)"
@@ -483,11 +523,19 @@ else
 fi
 
 WANDB_ARGS=(
-   --use-wandb --wandb-mode offline
+   --use-wandb --wandb-mode "${BC_WANDB_MODE}"
    --wandb-explicit-teardown
    --wandb-project "${BC_WANDB_PROJECT:-supo-bcplus-mast}"
    --wandb-group "${RUN_NAME}" --wandb-dir "${WANDB_DIR}"
 )
+if [[ "${BC_WANDB_MODE}" == "online" ]]; then
+   WANDB_ARGS+=(
+      --wandb-host "${WANDB_BASE_URL}"
+      --wandb-team "${BC_WANDB_ENTITY:-hhzhang01}"
+      --wandb-key-file "${WANDB_LOCAL_KEY_FILE}"
+      --wandb-online-fallback-offline
+   )
+fi
 
 COLOCATE_ARGS=( --colocate )
 
@@ -520,6 +568,9 @@ RUNTIME_ENV_JSON="{
     \"HF_HUB_OFFLINE\": \"1\",
     \"TRANSFORMERS_OFFLINE\": \"1\",
     \"WANDB_X_FLUSH_INTERVAL_SECONDS\": \"${WANDB_X_FLUSH_INTERVAL_SECONDS}\",
+    \"WANDB_MODE\": \"${BC_WANDB_MODE}\",
+    \"WANDB_BASE_URL\": \"${WANDB_BASE_URL}\",
+    \"WANDB_HTTPS_PROXY\": \"${WANDB_HTTPS_PROXY}\",
     \"LOCAL_SEARCH_URL\": \"${LOCAL_SEARCH_URL}\",
     \"LLAMA_API_KEY\": \"${LLAMA_API_KEY}\",
     \"http_proxy\": \"\",

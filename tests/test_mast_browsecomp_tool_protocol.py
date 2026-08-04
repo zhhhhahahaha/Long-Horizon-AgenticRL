@@ -27,6 +27,8 @@ BC_NUM_ROLLOUT=1
 BC_ROLLOUT_BATCH_SIZE=1
 BC_N_SAMPLES=1
 BC_GLOBAL_BATCH_SIZE=1
+BC_WANDB_MODE=online
+BC_WANDB_ENTITY=test-entity
 BCPLUS_FIXED_SEARCH_TOPK=5
 BCPLUS_DOC_WORDS_FULL=10000
 """
@@ -70,6 +72,10 @@ JSON
     custom_command = next(arg for arg in cli_args if arg.startswith(b"--docker_custom_cmd="))
     assert b"BCPLUS_FIXED_SEARCH_TOPK=5" in custom_command
     assert b"BCPLUS_DOC_WORDS_FULL=10000" in custom_command
+    assert b"BC_WANDB_MODE=online" in custom_command
+    assert b"BC_WANDB_ENTITY=test-entity" in custom_command
+    assert b"MAST_WANDB_KEY_FILE=/mnt/wsfuse/hhzhang01/supo-slime/.wandb-online-key" in custom_command
+    assert b"WANDB_API_KEY" not in custom_command
     assert "search_topk=5 open_words=10000" in result.stdout
 
 
@@ -103,3 +109,9 @@ def test_mast_trainer_passes_tool_protocol_to_ray_actors():
 
     assert '\\"BCPLUS_FIXED_SEARCH_TOPK\\": \\"${BCPLUS_FIXED_SEARCH_TOPK}\\"' in trainer
     assert '\\"BCPLUS_DOC_WORDS_FULL\\": \\"${BCPLUS_DOC_WORDS_FULL}\\"' in trainer
+    assert '--wandb-key-file "${WANDB_LOCAL_KEY_FILE}"' in trainer
+    assert '\\"WANDB_HTTPS_PROXY\\": \\"${WANDB_HTTPS_PROXY}\\"' in trainer
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))
