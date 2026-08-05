@@ -82,6 +82,7 @@ def load_selected_rows(dump_dir: Path, iter_id: int, rollout_ids: Sequence[int])
             parquet_path,
             columns=list(REQUIRED_COLUMNS),
             filters=[("rollout_id", "in", list(requested))],
+            use_threads=False,
         )
         for row in table.to_pylist():
             row["source_file"] = parquet_path.name
@@ -281,7 +282,8 @@ def build_view_data(
             loss_mask = [int(value) for value in row["loss_mask"]]
             if len(loss_mask) != len(response_ids):
                 raise ValueError(
-                    f"rollout {rollout_id} sub-trajectory {row['sub_traj_index']} has loss_mask length {len(loss_mask)} != response length {len(response_ids)}"
+                    f"rollout {rollout_id} sub-trajectory {row['sub_traj_index']} has "
+                    f"loss_mask length {len(loss_mask)} != response length {len(response_ids)}"
                 )
 
             prompt_text = decoder.decode(prompt_ids)
@@ -440,6 +442,12 @@ HTML_TEMPLATE = r"""<!doctype html>
       color: #6f4d00;
       padding: 10px 12px;
     }
+    .comparison-intro {
+      padding: 18px clamp(16px, 4vw, 48px) 0;
+      max-width: 1180px;
+      white-space: pre-wrap;
+      font-size: 15px;
+    }
     .toolbar {
       position: sticky;
       top: 0;
@@ -569,6 +577,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     <div id="metrics" class="metrics"></div>
   </header>
   <div id="dataWarning" class="data-warning" hidden></div>
+  <div id="comparisonIntro" class="comparison-intro" hidden></div>
   <div class="toolbar">
     <input id="search" type="search" placeholder="Search trajectories">
     <select id="groupFilter" aria-label="Filter by group"></select>
@@ -707,6 +716,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         badge(`${trajectory.response_tokens.toLocaleString()} response tokens`),
         badge(`${trajectory.trainable_tokens.toLocaleString()} trainable`)
       );
+      if (trajectory.selection_label) badges.appendChild(badge(trajectory.selection_label));
       if (trajectory.empty_summary_count) {
         badges.appendChild(badge(`${trajectory.empty_summary_count} empty summaries`, 'warn'));
       }
@@ -742,8 +752,9 @@ HTML_TEMPLATE = r"""<!doctype html>
         const section = el('section', 'group');
         section.dataset.group = String(group.group_index);
         const heading = el('div', 'group-heading');
-        heading.append(el('h2', '', `Group ${group.group_index}`), el('span', '', `${group.trajectories.length} selected rollouts`));
-        section.append(heading, el('p', 'question', group.question));
+        heading.append(el('h2', '', group.label || `Group ${group.group_index}`), el('span', '', `${group.trajectories.length} selected rollouts`));
+        section.appendChild(heading);
+        if (group.question) section.appendChild(el('p', 'question', group.question));
         const grid = el('div', 'trajectory-grid');
         for (const trajectory of group.trajectories) {
           grid.appendChild(renderTrajectory(group, trajectory));
@@ -788,16 +799,22 @@ HTML_TEMPLATE = r"""<!doctype html>
       select.appendChild(option);
     }
 
-    document.getElementById('title').textContent = `Iter ${data.iter_id} rollout review`;
+    document.getElementById('title').textContent = data.title || `Iter ${data.iter_id} rollout review`;
     document.getElementById('subtitle').textContent = data.run_name;
-    document.getElementById('metrics').append(
-      metric(data.rollout_count, 'selected rollouts'),
-      metric(data.group_count, 'prompt groups'),
-      metric(data.pass_count, 'score 1'),
-      metric(data.rollout_count - data.pass_count, 'score 0'),
-      metric(data.sub_trajectory_count, 'sub-trajectories'),
-      metric(data.empty_summary_count, 'empty summaries')
-    );
+    const metrics = data.metrics || [
+      [data.rollout_count, 'selected rollouts'],
+      [data.group_count, 'prompt groups'],
+      [data.pass_count, 'score 1'],
+      [data.rollout_count - data.pass_count, 'score 0'],
+      [data.sub_trajectory_count, 'sub-trajectories'],
+      [data.empty_summary_count, 'empty summaries']
+    ];
+    document.getElementById('metrics').append(...metrics.map(item => metric(item[0], item[1])));
+    if (data.description) {
+      const intro = document.getElementById('comparisonIntro');
+      intro.textContent = data.description;
+      intro.hidden = false;
+    }
     if (data.empty_summary_count) {
       const warning = document.getElementById('dataWarning');
       warning.textContent = `Data warning: ${data.empty_summary_count} <summary> blocks are empty even though the dump metadata labels them extracted. Their handover text cannot be reconstructed from this dump.`;
@@ -805,8 +822,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
     document.getElementById('footer').textContent = `Generated ${data.generated_at}. Full model output is embedded in this internal report.`;
 
-    addOption(groupFilter, 'all', 'All groups');
-    for (const group of data.groups) addOption(groupFilter, String(group.group_index), `Group ${group.group_index}`);
+    addOption(groupFilter, 'all', data.group_filter_label || 'All groups');
+    for (const group of data.groups) addOption(groupFilter, String(group.group_index), group.label || `Group ${group.group_index}`);
     const outcomes = [...new Set(data.groups.flatMap(group => group.trajectories.map(trajectory => trajectory.outcome)))].sort();
     addOption(outcomeFilter, 'all', 'All outcomes');
     for (const outcome of outcomes) addOption(outcomeFilter, outcome, outcome);
@@ -857,7 +874,8 @@ def main() -> None:
     output.write_text(render_html(data), encoding="utf-8")
     print(f"html: {output}")
     print(
-        f"groups: {data['group_count']} rollouts: {data['rollout_count']} sub-trajectories: {data['sub_trajectory_count']}"
+        f"groups: {data['group_count']} rollouts: {data['rollout_count']} "
+        f"sub-trajectories: {data['sub_trajectory_count']}"
     )
 
 

@@ -116,6 +116,23 @@ analyzed with the same helpers used by
 auditing is required. Set `BCPLUS_DUMP_DIR=""` as above when the native `.pt`
 trajectory is sufficient and the extra parquet is not needed.
 
+To compare one query's representative success/failure trajectories across
+complete training iterations, build a self-contained HTML report:
+
+```bash
+python tools/bcplus_experiment_viewer.py /path/to/parquet-dump \
+  --tokenizer-json /path/to/tokenizer.json \
+  --expected-dp-shards 16 \
+  --output /path/to/query-comparison.html
+```
+
+Pass `--query-id` to select a specific query. Otherwise the tool chooses a query
+with mixed success/failure outcomes across the most iterations. It ignores an
+incomplete tail iteration, caches only final-row metadata beside the HTML output,
+and reads full token arrays only for the selected rollouts. Use
+`tools/bcplus_rollout_viewer.py` when inspecting explicit rollout IDs from one
+iteration instead.
+
 ## Prerequisites
 
 ### 1. Search server (biggest external dep)
