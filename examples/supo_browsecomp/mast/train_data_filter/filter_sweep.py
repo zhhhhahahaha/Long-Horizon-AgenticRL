@@ -92,14 +92,22 @@ def mast_path(path: Path) -> str:
     return str(MAST_STAGE / path.relative_to(DEV_STAGE))
 
 
-def points(base_only: bool = False) -> list[dict[str, Any]]:
-    configured = [{"name": "base", "step": "base"}]
+def points(
+    steps: tuple[int, ...] = STEPS,
+    *,
+    base_only: bool = False,
+    checkpoint_only: bool = False,
+) -> list[dict[str, Any]]:
+    if base_only and checkpoint_only:
+        raise RuntimeError("base_only and checkpoint_only are mutually exclusive")
+    configured = [] if checkpoint_only else [{"name": "base", "step": "base"}]
     if not base_only:
-        configured.extend({"name": f"iter{step:02d}", "step": step} for step in STEPS)
+        configured.extend({"name": f"iter{step:02d}", "step": step} for step in steps)
     return configured
 
 
 def frozen_config(batch_id: str, args: argparse.Namespace) -> dict[str, Any]:
+    run_name = validate_safe_name(args.run_name, "run name")
     tenant_path = args.tenant_path or (
         "gen_ai/msl/tbd_research/rhea/msl_tbd_rhea_friends_data/"
         f"rhea_assistant/{args.tenant}"
@@ -118,8 +126,12 @@ def frozen_config(batch_id: str, args: argparse.Namespace) -> dict[str, Any]:
     return {
         "version": 1,
         "batch_id": batch_id,
-        "run_name": RUN_NAME,
-        "points": points(args.base_only),
+        "run_name": run_name,
+        "points": points(
+            tuple(args.steps),
+            base_only=args.base_only,
+            checkpoint_only=args.checkpoint_only,
+        ),
         "dataset": {
             "name": "bcplus_train",
             "dev_path": "/data/users/hhzhang01/wsfuse_mnt/hhzhang01/supo-data/BC+/bc_train.parquet",
@@ -149,7 +161,8 @@ def frozen_config(batch_id: str, args: argparse.Namespace) -> dict[str, Any]:
             "nodes_per_point": 1,
             "gpus_per_node": 8,
             "hardware": "T20_GRAND_TETON_HBM3_ROCE (8x H100 80GB)",
-            "search_server_tenant": "rhea_assistant_interns",
+            "search_server_tenant": args.search_server_tenant,
+            "search_addr_file": args.search_addr_file,
         },
         "comparison": comparison,
     }
@@ -249,6 +262,10 @@ def build_mast_command(
         ("FILTER_N", evaluation["samples_per_question"]),
         ("FILTER_SEED", evaluation["rollout_seed"]),
         ("FILTER_EXPECTED_QUESTIONS", evaluation["expected_questions"]),
+        (
+            "SEARCH_ADDR_FILE",
+            config["mast"].get("search_addr_file", f"{MAST_STAGE}/search-server.addr"),
+        ),
         ("BCPLUS_DOC_WORDS_FULL", evaluation.get("doc_words_full", DOC_WORDS_FULL)),
         ("BCPLUS_SGLANG_SERVER_CONCURRENCY", evaluation["sglang_server_concurrency_per_engine"]),
         ("BCPLUS_SEARCH_CONCURRENCY", evaluation["search_concurrency"]),
@@ -313,6 +330,7 @@ def validate_dry_run(
     expected_sglang_concurrency: int,
     expected_fixed_search_topk: int | None,
     expected_doc_words_full: int,
+    expected_search_addr_file: str,
     expected_tenant: str,
     expected_priority: str,
 ) -> None:
@@ -341,6 +359,7 @@ def validate_dry_run(
         "run_filter_eval.sh",
         "FILTER_N=8",
         f"BCPLUS_DOC_WORDS_FULL={expected_doc_words_full}",
+        f"SEARCH_ADDR_FILE={expected_search_addr_file}",
         f"BCPLUS_SGLANG_SERVER_CONCURRENCY={expected_sglang_concurrency}",
     ):
         if expected not in entrypoint:
@@ -351,8 +370,15 @@ def validate_dry_run(
             raise RuntimeError(f"dry-run entrypoint is missing {expected}")
 
 
-def search_stats() -> dict[str, Any]:
-    address = (DEV_STAGE / "search-server.addr").read_text().strip()
+def search_stats(config: dict[str, Any]) -> dict[str, Any]:
+    configured_path = Path(
+        config["mast"].get("search_addr_file", f"{MAST_STAGE}/search-server.addr")
+    )
+    try:
+        address_path = DEV_STAGE / configured_path.relative_to(MAST_STAGE)
+    except ValueError:
+        address_path = configured_path
+    address = address_path.read_text().strip()
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(f"http://{address}/stats", timeout=5) as response:
         return json.load(response)
@@ -378,11 +404,14 @@ def prepare(args: argparse.Namespace) -> tuple[Path, Path, dict[str, Any], dict[
         config = read_json(config_path)
         if config.get("batch_id") != batch_id:
             raise RuntimeError(f"frozen config has the wrong batch id: {config_path}")
-        if config.get("run_name") != RUN_NAME or config.get("points") not in (
-            points(base_only=True),
-            points(base_only=False),
-        ):
+        configured_points = config.get("points")
+        if not isinstance(configured_points, list) or not configured_points:
             raise RuntimeError(f"frozen config targets unexpected model points: {config_path}")
+        for point in configured_points:
+            step = point.get("step")
+            expected_name = "base" if step == "base" else f"iter{int(step):02d}"
+            if point.get("name") != expected_name:
+                raise RuntimeError(f"frozen config has invalid point: {point}")
         if config.get("dataset", {}).get("sha256") != TRAIN_DATA_SHA256:
             raise RuntimeError(f"frozen config targets an unexpected dataset: {config_path}")
     else:
@@ -414,6 +443,7 @@ def dry_run_command(args: argparse.Namespace) -> None:
         config["evaluation"]["sglang_server_concurrency_per_engine"],
         config["evaluation"].get("fixed_search_topk"),
         config["evaluation"].get("doc_words_full", DOC_WORDS_FULL),
+        config["mast"].get("search_addr_file", f"{MAST_STAGE}/search-server.addr"),
         config["mast"]["tenant"],
         config["mast"].get("priority", "HIGH"),
     )
@@ -436,7 +466,7 @@ def dry_run_command(args: argparse.Namespace) -> None:
 def submit_command(args: argparse.Namespace) -> None:
     _, batch_root, config, state, archive, digest = prepare(args)
     state_path = batch_root / "state.json"
-    stats = search_stats()
+    stats = search_stats(config)
     if stats.get("status") not in (None, "healthy") or int(stats.get("pending", 0)) > 1500:
         raise RuntimeError(f"search server is not ready: {stats}")
 
@@ -451,6 +481,7 @@ def submit_command(args: argparse.Namespace) -> None:
             config["evaluation"]["sglang_server_concurrency_per_engine"],
             config["evaluation"].get("fixed_search_topk"),
             config["evaluation"].get("doc_words_full", DOC_WORDS_FULL),
+            config["mast"].get("search_addr_file", f"{MAST_STAGE}/search-server.addr"),
             config["mast"]["tenant"],
             config["mast"].get("priority", "HIGH"),
         )
@@ -493,7 +524,12 @@ def status_command(args: argparse.Namespace) -> None:
             record["state"] = mast_status(record["job_name"])
         record["last_checked_at"] = time.time()
     write_json(batch_root / "state.json", state)
-    print(json.dumps({"batch_root": str(batch_root), "jobs": state["jobs"], "search": search_stats()}, indent=2))
+    print(
+        json.dumps(
+            {"batch_root": str(batch_root), "jobs": state["jobs"], "search": search_stats(config)},
+            indent=2,
+        )
+    )
 
 
 def finalize_command(args: argparse.Namespace) -> None:
@@ -541,12 +577,22 @@ def main() -> None:
     parser.add_argument("command", choices=("dry-run", "submit", "status", "finalize"))
     parser.add_argument("--batch-id", required=True)
     parser.add_argument("--repo-root", default=str(Path(__file__).parents[4]))
-    parser.add_argument("--base-only", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--base-only", action="store_true")
+    mode.add_argument("--checkpoint-only", action="store_true")
+    parser.add_argument("--run-name", default=RUN_NAME)
+    parser.add_argument("--steps", type=positive_int, nargs="+", default=list(STEPS))
     parser.add_argument("--fixed-search-topk", type=positive_int)
     parser.add_argument("--doc-words-full", type=positive_int, default=DOC_WORDS_FULL)
     parser.add_argument("--tenant", default=TENANT)
     parser.add_argument("--tenant-path")
     parser.add_argument("--priority", type=str.upper, default=PRIORITY)
+    parser.add_argument(
+        "--search-addr-file",
+        default=f"{MAST_STAGE}/search-server.addr",
+        help="MAST-container path to the search server address file",
+    )
+    parser.add_argument("--search-server-tenant", default="rhea_assistant_interns")
     parser.add_argument("--compare-query-ids")
     parser.add_argument("--comparison-name", default="reference")
     args = parser.parse_args()

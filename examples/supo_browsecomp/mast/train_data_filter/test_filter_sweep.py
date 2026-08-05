@@ -12,11 +12,16 @@ class FilterSweepConfigTest(unittest.TestCase):
     def test_base_only_fixed_tool_protocol_is_frozen_and_forwarded(self) -> None:
         args = argparse.Namespace(
             base_only=True,
+            checkpoint_only=False,
+            run_name="supo_4b_n8_8n_40iter_dump_groupfix-mj1d0qw1",
+            steps=[4, 9],
             fixed_search_topk=5,
             doc_words_full=10000,
             tenant="rhea_assistant_avocado_iterations",
             tenant_path=None,
             priority="HIGH",
+            search_addr_file="/mnt/wsfuse/hhzhang01/supo-slime/search-server.addr",
+            search_server_tenant="rhea_assistant_interns",
             compare_query_ids=None,
             comparison_name="reference",
         )
