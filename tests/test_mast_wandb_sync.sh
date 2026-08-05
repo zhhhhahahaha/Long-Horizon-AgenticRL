@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SYNC_SCRIPT="${REPO_ROOT}/examples/supo_browsecomp/mast/wandb_sync.sh"
+SYNC_SCRIPT="${REPO_ROOT}/examples/supo_browsecomp/mast/wandb/wandb_sync.sh"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "${TMP_DIR}"' EXIT
 
@@ -125,6 +125,21 @@ run_sync env WANDB_SYNC_EXCLUDE_RUN_IDS=snapshot bash \
   "${SYNC_SCRIPT}" once "${SNAPSHOT_JOB}"
 [[ ! -s "${FAKE_WANDB_LOG}" ]] || \
   fail "excluded snapshot W&B run was unexpectedly synced: $(cat "${FAKE_WANDB_LOG}")"
+
+reset_fakes
+ONLINE_JOB=avocado-online-snapshot-1234
+ONLINE_SOURCE="${TMP_DIR}/online-snapshot-source"
+ONLINE_PUBLISHER="${TMP_DIR}/snapshots/${ONLINE_JOB}/attempt-0-task-0"
+mkdir -p "${ONLINE_SOURCE}/wandb/run-20260803_120000-online123" "${ONLINE_PUBLISHER}"
+printf 'online-transaction-log\n' > \
+  "${ONLINE_SOURCE}/wandb/run-20260803_120000-online123/run-online123.wandb"
+tar -C "${ONLINE_SOURCE}" -cf \
+  "${ONLINE_PUBLISHER}/snapshot-0000000001.tar" .
+run_sync bash "${SYNC_SCRIPT}" recover-online "${ONLINE_JOB}"
+expected_online_dir="${TMP_DIR}/cache/${ONLINE_JOB}/attempt-0-task-0/current/wandb/run-20260803_120000-online123"
+grep -Fqx "$(printf 'wandb\tsync\t--append\t--no-sync-tensorboard\t--include-online\t--include-synced\t%s' "${expected_online_dir}")" \
+  "${FAKE_WANDB_LOG}" || \
+  fail "online recovery did not include the latest online snapshot: $(cat "${FAKE_WANDB_LOG}")"
 
 if env \
   MAST_WANDB_ROOT="${TMP_DIR}/missing-oilfs-mount" \

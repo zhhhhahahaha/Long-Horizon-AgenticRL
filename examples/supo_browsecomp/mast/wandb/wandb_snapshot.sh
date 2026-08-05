@@ -20,7 +20,7 @@ log() {
 publish_once() {
   local local_root="$1"
   local publisher_dir="$2"
-  local keep="${MAST_WANDB_SNAPSHOT_KEEP:-2}"
+  local keep="${MAST_WANDB_SNAPSHOT_KEEP:-3}"
   local stamp local_archive remote_tmp remote_final
   local snapshots=()
   local remove_count index
@@ -43,6 +43,7 @@ publish_once() {
   tar -C "${local_root}" -cf "${local_archive}" .
   mkdir -p "${publisher_dir}"
   cp "${local_archive}" "${remote_tmp}"
+  chmod 0644 "${remote_tmp}"
   mv "${remote_tmp}" "${remote_final}"
   log "published ${remote_final}"
 

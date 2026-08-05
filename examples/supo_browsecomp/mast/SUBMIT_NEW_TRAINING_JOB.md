@@ -23,11 +23,11 @@ checkpoint 核对、配置、归档、dry-run、真实提交和状态核对。�
 - `configs/*.sh`：单个实验的配置，只放实验和资源参数。
 - `submit_experiment.sh`：读取 config，先做 MAST dry-run，校验 task count 和 rank
   map，再调用真实提交器。
-- `submit_with_wandb.sh`：执行真实提交、保存结构化响应，并启动 W&B watcher。
+- `wandb/submit_with_wandb.sh`：执行真实提交、保存结构化响应，并启动 W&B watcher。
 - `run_trainer.sh`：在 MAST 容器中运行，选择模型、组装 slime 参数并启动 Ray 训练。
 - `search/README.md`：提交、替换和验证独立 search server；训练提交前必须确认其真实
   `/search` 请求可用。
-- `wandb_sync.sh`：在 devserver 的 tmux 中追踪 MAST 状态并同步离线 W&B 数据。
+- `wandb/wandb_sync.sh`：在 devserver 的 tmux 中追踪 MAST 状态并同步离线 W&B 数据。
 
 正常情况下不要绕过 `submit_experiment.sh` 手写长 MAST 命令。
 
@@ -624,7 +624,7 @@ with-proxy mast --output json get-status "${full_job_name}"
 如果 MAST 已提交成功但 watcher 没有启动，绝不能重新提交 job。只恢复 watcher：
 
 ```bash
-examples/supo_browsecomp/mast/submit_with_wandb.sh \
+examples/supo_browsecomp/mast/wandb/submit_with_wandb.sh \
   watch-only "${full_job_name}"
 ```
 

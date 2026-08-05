@@ -9,7 +9,14 @@ import pytest
 
 
 def _load_precreate_module():
-    module_path = Path(__file__).resolve().parents[1] / "examples" / "supo_browsecomp" / "mast" / "wandb_precreate.py"
+    module_path = (
+        Path(__file__).resolve().parents[1]
+        / "examples"
+        / "supo_browsecomp"
+        / "mast"
+        / "wandb"
+        / "wandb_precreate.py"
+    )
     module_name = "test_mast_wandb_precreate_module"
     sys.modules.pop(module_name, None)
     spec = importlib.util.spec_from_file_location(module_name, module_path)

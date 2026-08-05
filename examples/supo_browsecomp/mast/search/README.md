@@ -12,7 +12,7 @@
   job，确认它不会重排，再提交新 job。
 - 真实提交命令只能执行一次。MAST job 可能在 CLI 暂时没有返回、列表暂时查不到时
   已经开始创建；先等待原进程并继续查询，绝不能据此重复提交。
-- 不要使用 `submit_with_wandb.sh`。Search server 不产生需要同步的 W&B run，直接
+- 不要使用 `wandb/submit_with_wandb.sh`。Search server 不产生需要同步的 W&B run，直接
   使用结构化的 `rl/cli.sh mast --json` 命令即可。
 - 地址文件更新不等于服务已经可用。必须等 `/health` 和一条真实 `/search` 都成功，
   才能启动训练或评测。

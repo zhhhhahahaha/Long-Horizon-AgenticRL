@@ -178,6 +178,13 @@ settings.json
 .pypirc
 
 wandb/
+!examples/supo_browsecomp/mast/wandb/
+!examples/supo_browsecomp/mast/wandb/README.md
+!examples/supo_browsecomp/mast/wandb/*.sh
+!examples/supo_browsecomp/mast/wandb/*.py
+!examples/supo_browsecomp/mast/wandb/smoke/
+!examples/supo_browsecomp/mast/wandb/smoke/*.sh
+!examples/supo_browsecomp/mast/wandb/smoke/*.py
 outputs/
 local/
 **/rollout_data/

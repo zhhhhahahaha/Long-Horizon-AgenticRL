@@ -258,7 +258,7 @@ watcher atomically from the user's point of view:
 
 ```bash
 cd /home/hhzhang01/Long-Horizon-AgenticRL
-examples/supo_browsecomp/mast/submit_with_wandb.sh -- \
+examples/supo_browsecomp/mast/wandb/submit_with_wandb.sh -- \
   /home/hhzhang01/local/fbsource/genai/msl/rl/cli.sh mast --json \
   ...the existing MAST arguments...
 ```
@@ -270,7 +270,7 @@ It saves the response and watcher log under
 session, restore only the watcher without submitting another training job:
 
 ```bash
-examples/supo_browsecomp/mast/submit_with_wandb.sh \
+examples/supo_browsecomp/mast/wandb/submit_with_wandb.sh \
   watch-only avocado_rev1_rl_debug_80m-xxxxxxxx
 ```
 
@@ -279,7 +279,7 @@ watcher fails to start, it reports the already-submitted job and exits with
 status 3; use `watch-only` to recover rather than rerunning the submission.
 
 The watcher extracts only completed snapshots to devserver-local cache, then
-uploads to `https://meta.wandb.io` every five minutes with `wandb sync
+uploads to `https://meta-3.wandb.io` every five minutes with `wandb sync
 --append`. It survives MAST preemption/rescheduling and performs a final sync
 after MAST reaches `COMPLETE`, `FAILED`, or `DEAD`. For an on-demand upload,
 replace `watch` with `once`. The Meta W&B key remains in `~/.wandb-key` on the
