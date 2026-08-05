@@ -34,7 +34,15 @@ export SGLANG_NUMA_BIND_V2=0
 D=/mnt/wsfuse/hhzhang01/supo-data
 SLIME=/slime-src
 PORT="${SEARCH_PORT:-8000}"
-ADDR_FILE="${SEARCH_ADDR_FILE:-/mnt/wsfuse/hhzhang01/supo-slime/search-server.addr}"
+if [[ -z "${SEARCH_ADDR_FILE:-}" ]]; then
+  echo "ERROR: SEARCH_ADDR_FILE must uniquely identify this search server." >&2
+  exit 2
+fi
+if [[ "${SEARCH_ADDR_FILE}" != /* ]]; then
+  echo "ERROR: SEARCH_ADDR_FILE must be an absolute container path: ${SEARCH_ADDR_FILE}" >&2
+  exit 2
+fi
+ADDR_FILE="${SEARCH_ADDR_FILE}"
 
 # Routable fb IPv6 (first non-loopback, non-link-local). Capturing this INSIDE
 # a staged script (not the inline docker_custom_cmd) avoids the quoting mangle

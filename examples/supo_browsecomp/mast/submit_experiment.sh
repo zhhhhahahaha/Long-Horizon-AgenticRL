@@ -61,6 +61,7 @@ require_variable BC_NUM_ROLLOUT
 require_variable BC_ROLLOUT_BATCH_SIZE
 require_variable BC_N_SAMPLES
 require_variable BC_GLOBAL_BATCH_SIZE
+require_variable SEARCH_ADDR_FILE
 require_positive_integer MAST_NUM_NODES
 require_positive_integer BC_NUM_ROLLOUT
 require_positive_integer BC_ROLLOUT_BATCH_SIZE
@@ -98,6 +99,8 @@ if [[ -v BC_TRAIN_DATA ]]; then
   [[ -n "${BC_TRAIN_DATA}" ]] || fail "BC_TRAIN_DATA must not be empty"
   [[ "${BC_TRAIN_DATA}" == /* ]] || fail "BC_TRAIN_DATA must be an absolute container path: ${BC_TRAIN_DATA}"
 fi
+[[ "${SEARCH_ADDR_FILE}" == /* ]] || \
+  fail "SEARCH_ADDR_FILE must be an absolute container path: ${SEARCH_ADDR_FILE}"
 if [[ -n "${BCPLUS_FIXED_SEARCH_TOPK:-}" ]]; then
   require_positive_integer BCPLUS_FIXED_SEARCH_TOPK
 fi
@@ -156,6 +159,7 @@ TRAIN_ENV_VARS=(
   BC_EXPECTED_NUM_NODES
   BC_RUN_NAME
   BC_TRAIN_DATA
+  SEARCH_ADDR_FILE
   BC_MODEL_SIZE BC_NUM_ROLLOUT BC_ROLLOUT_BATCH_SIZE BC_N_SAMPLES
   BC_GLOBAL_BATCH_SIZE BC_MAX_RESPONSE_LEN BC_MAX_CONTEXT_LEN
   BC_TP BC_CP BC_SGLANG_TP BC_MAX_TOKENS_PER_GPU
@@ -238,6 +242,7 @@ run_dryrun() {
   response_file="${MAST_DRYRUN_ROOT}/${MAST_JOB_NAME}-${timestamp}-$$.json"
   echo "[mast-experiment] validating ${MAST_JOB_NAME}: nodes=${MAST_NUM_NODES} ranks=${EXPECTED_ASSIGNED_RANKS}"
   echo "[mast-experiment] tool protocol: search_topk=${BCPLUS_FIXED_SEARCH_TOPK:-model} open_words=${BCPLUS_DOC_WORDS_FULL:-4096}"
+  echo "[mast-experiment] search discovery: ${SEARCH_ADDR_FILE}"
   if ! "${MAST_COMMAND[@]}" --dryrun > "${response_file}"; then
     fail "MAST dry-run command failed; partial output: ${response_file}"
   fi

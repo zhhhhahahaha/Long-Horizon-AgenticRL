@@ -92,7 +92,15 @@ if [[ -z "${LLAMA_API_KEY:-}" ]]; then
 fi
 
 # --------------------------- search server discovery ------------------------
-ADDR_FILE="${SEARCH_ADDR_FILE:-${STAGE}/search-server.addr}"
+if [[ -z "${SEARCH_ADDR_FILE:-}" ]]; then
+  echo "ERROR: SEARCH_ADDR_FILE must name the discovery file for this training run." >&2
+  exit 2
+fi
+if [[ "${SEARCH_ADDR_FILE}" != /* ]]; then
+  echo "ERROR: SEARCH_ADDR_FILE must be an absolute container path: ${SEARCH_ADDR_FILE}" >&2
+  exit 2
+fi
+ADDR_FILE="${SEARCH_ADDR_FILE}"
 if [[ -z "${LOCAL_SEARCH_URL:-}" ]]; then
   if [[ ! -f "${ADDR_FILE}" ]]; then
     echo "ERROR: ${ADDR_FILE} missing — start the search server job first." >&2
@@ -101,7 +109,7 @@ if [[ -z "${LOCAL_SEARCH_URL:-}" ]]; then
   SEARCH_TARGET="$(tr -d ' \t\r\n' < "${ADDR_FILE}")"      # e.g. [2401:db00:..]:8000
   export LOCAL_SEARCH_URL="http://${SEARCH_TARGET}"
 fi
-echo "[trainer] LOCAL_SEARCH_URL=${LOCAL_SEARCH_URL}"
+echo "[trainer] search discovery=${ADDR_FILE} resolved_url=${LOCAL_SEARCH_URL}"
 echo "[trainer] waiting for search /health (up to 12 min)..."
 ok=0
 for i in $(seq 1 72); do

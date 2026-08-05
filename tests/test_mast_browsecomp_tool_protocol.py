@@ -27,6 +27,7 @@ BC_NUM_ROLLOUT=1
 BC_ROLLOUT_BATCH_SIZE=1
 BC_N_SAMPLES=1
 BC_GLOBAL_BATCH_SIZE=1
+SEARCH_ADDR_FILE=/mnt/wsfuse/hhzhang01/supo-slime/search-servers/test-search.addr
 BC_WANDB_MODE=online
 BC_WANDB_ENTITY=test-entity
 BCPLUS_FIXED_SEARCH_TOPK=5
@@ -72,11 +73,13 @@ JSON
     custom_command = next(arg for arg in cli_args if arg.startswith(b"--docker_custom_cmd="))
     assert b"BCPLUS_FIXED_SEARCH_TOPK=5" in custom_command
     assert b"BCPLUS_DOC_WORDS_FULL=10000" in custom_command
+    assert b"SEARCH_ADDR_FILE=/mnt/wsfuse/hhzhang01/supo-slime/search-servers/test-search.addr" in custom_command
     assert b"BC_WANDB_MODE=online" in custom_command
     assert b"BC_WANDB_ENTITY=test-entity" in custom_command
     assert b"MAST_WANDB_KEY_FILE=/mnt/wsfuse/hhzhang01/supo-slime/.wandb-online-key" in custom_command
     assert b"WANDB_API_KEY" not in custom_command
     assert "search_topk=5 open_words=10000" in result.stdout
+    assert "search discovery: /mnt/wsfuse/hhzhang01/supo-slime/search-servers/test-search.addr" in result.stdout
 
 
 @pytest.mark.unit
@@ -111,6 +114,43 @@ def test_mast_trainer_passes_tool_protocol_to_ray_actors():
     assert '\\"BCPLUS_DOC_WORDS_FULL\\": \\"${BCPLUS_DOC_WORDS_FULL}\\"' in trainer
     assert '--wandb-key-file "${WANDB_LOCAL_KEY_FILE}"' in trainer
     assert '\\"WANDB_HTTPS_PROXY\\": \\"${WANDB_HTTPS_PROXY}\\"' in trainer
+
+
+@pytest.mark.unit
+def test_mast_training_rejects_relative_search_addr_file(tmp_path):
+    config = tmp_path / "config.sh"
+    config.write_text(_config().replace(
+        "SEARCH_ADDR_FILE=/mnt/wsfuse/hhzhang01/supo-slime/search-servers/test-search.addr",
+        "SEARCH_ADDR_FILE=search-server.addr",
+    ))
+
+    result = subprocess.run(
+        ["bash", str(SUBMIT), "--dry-run", str(config)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "SEARCH_ADDR_FILE must be an absolute container path" in result.stderr
+
+
+@pytest.mark.unit
+def test_mast_training_requires_search_addr_file(tmp_path):
+    config = tmp_path / "config.sh"
+    config.write_text("\n".join(
+        line for line in _config().splitlines() if not line.startswith("SEARCH_ADDR_FILE=")
+    ))
+
+    result = subprocess.run(
+        ["bash", str(SUBMIT), "--dry-run", str(config)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "experiment config must set SEARCH_ADDR_FILE" in result.stderr
 
 
 if __name__ == "__main__":
