@@ -11,6 +11,8 @@ checkpoint 核对、配置、归档、dry-run、真实提交和状态核对。�
 - 保留工作区内已有的用户改动；先运行 `git status --short`，不要 reset、checkout
   或覆盖无关文件。
 - 每个新实验新建一个 config，不要修改已经提交过的 config。
+- training config 写好并完成本地检查后，必须把 config 路径和关键参数交给用户确认；
+  未获得明确确认前不得提交，确认后若修改 config 则必须重新确认。
 - 每个实验使用独立、描述性的代码归档名，避免后续刷新共享 archive 影响 MAST
   retry 或其他正在运行的任务。
 - 真实提交只执行一次。CLI 暂时没有输出、JSON 文件暂时为 0 字节或工具调用提前
@@ -23,11 +25,15 @@ checkpoint 核对、配置、归档、dry-run、真实提交和状态核对。�
 - `configs/*.sh`：单个实验的配置，只放实验和资源参数。
 - `submit_experiment.sh`：读取 config，先做 MAST dry-run，校验 task count 和 rank
   map，再调用真实提交器。
-- `wandb/submit_with_wandb.sh`：执行真实提交、保存结构化响应，并启动 W&B watcher。
+- `wandb/submit_with_wandb.sh`：执行真实提交并保存结构化响应；offline 模式启动 W&B
+  watcher，online 模式安全暂存 key 且跳过持续 sync。
 - `run_trainer.sh`：在 MAST 容器中运行，选择模型、组装 slime 参数并启动 Ray 训练。
 - `search/README.md`：提交、替换和验证独立 search server；训练提交前必须确认其真实
   `/search` 请求可用。
-- `wandb/wandb_sync.sh`：在 devserver 的 tmux 中追踪 MAST 状态并同步离线 W&B 数据。
+- `wandb/wandb_sync.sh`：同步离线 W&B 数据，也可在任务结束后从 snapshot 恢复 online run。
+
+W&B online 模式的配置、代理、snapshot 和恢复语义见
+[`wandb/README.md`](wandb/README.md)。
 
 正常情况下不要绕过 `submit_experiment.sh` 手写长 MAST 命令。
 
@@ -91,12 +97,14 @@ MAST_CONDA_DOCKER_IMAGE=588845226011.dkr.ecr.us-east-2.amazonaws.com/msl_infra/s
 MAST_CODE_ARCHIVE=/mnt/wsfuse/hhzhang01/supo-slime/slime-code-9b-example.tgz
 
 BC_MODEL_SIZE=9B
+BC_TRAIN_DATA=/mnt/wsfuse/hhzhang01/supo-data/BC+/bc_train_exclude_stable130_fixed5_open10k_20260804.parquet
 BC_NUM_ROLLOUT=40
 BC_ROLLOUT_BATCH_SIZE=32
 BC_N_SAMPLES=8
 BC_GLOBAL_BATCH_SIZE=256
 BC_MAX_RESPONSE_LEN=32768
 BC_MAX_CONTEXT_LEN=65536
+SEARCH_ADDR_FILE=/mnt/wsfuse/hhzhang01/supo-slime/search-servers/<selected-search-service-id>.addr
 
 BC_TP=4
 BC_CP=2
@@ -126,22 +134,71 @@ WANDB_X_FLUSH_INTERVAL_SECONDS=30
 | EAG Grand Teton H100 RoCE | `MAST_REGION=eag`, `MAST_HOST=grandteton_80g_roce` | `LogicalServerSubType.T20_GRAND_TETON_HBM3_ROCE` |
 | NHA ZionEX A100 80GB | `MAST_REGION=nha`, `MAST_HOST=zionex_80g` | `LogicalServerSubType.T20_ZION_EX_A100_80GB` |
 
+每个 config 还必须显式选择对应 search server 的 discovery 文件。多个 search
+server 可以同时运行，但不能写同一个文件。地址使用服务 identity，而不是由训练
+region/host 隐式推导，例如
+`/mnt/wsfuse/hhzhang01/supo-slime/search-servers/<selected-search-service-id>.addr`。
+选择 search server 时优先使用与训练 `MAST_REGION` 相同区域的服务，以减少跨区网络
+依赖；若必须跨区，需先向用户说明并验证实际 `/health` 和 `/search` 连通性。
+`submit_experiment.sh` 不提供默认值，会把 config 中的 `SEARCH_ADDR_FILE` 透传到
+trainer；不要用固定 `LOCAL_SEARCH_URL` 代替，因为 search job restart 后 IP 可能变化。
+
+提交任何新训练前必须确认：
+
+```bash
+source <experiment-config.sh>
+test -n "${SEARCH_ADDR_FILE}"
+case "${SEARCH_ADDR_FILE}" in
+  /mnt/wsfuse/*) ;;
+  *) echo "SEARCH_ADDR_FILE must be an absolute container path" >&2; exit 2 ;;
+esac
+
+addr_file="/home/hhzhang01/eag-wsf/${SEARCH_ADDR_FILE#/mnt/wsfuse/}"
+test -s "${addr_file}"
+search_addr="$(tr -d ' \t\r\n' < "${addr_file}")"
+curl --noproxy '*' -g -fsS "http://${search_addr}/health" | jq .
+```
+
+dry-run 输出还必须打印同一个 `search discovery` 路径；实际启动日志必须打印
+`search discovery=<path> resolved_url=http://<selected-search-task-IP>:8000`。如果文件
+缺失、mtime 早于目标 search job，或者解析出的 IP 不属于所选 search job，不得提交训练。
+
+地址解析分两层：每个 MAST compute task 都会在 `run_trainer.sh` 启动时读取同一个
+`SEARCH_ADDR_FILE`，并独立调用一次 `/health`，用于验证所有节点到 search server 的
+连通性。随后只有 Ray head 执行 `ray job submit`；head 会把自己解析出的
+`LOCAL_SEARCH_URL` 写入 Ray `runtime_env`，所有 rollout actor 最终使用这个统一值。
+因此每节点读取用于 preflight，head 传播的值才是 actor 的权威配置。地址只在启动时
+解析一次；训练过程中即使文件被 search job restart 更新，已经运行的 actor 也不会
+自动切换。
+
 对于 tenant reservation，还要用 `mast get-capacity` 核对 capability 对应的实际
 machine type。例如 `rhea_assistant_avocado_iterations` 的 EAG Grand Teton H100
 capacity 是 `MACHINE_TYPE_T20_GRAND_TETON_HBM3_ROCE_GENAI`。只看到 8 GPUs/task
 不足以证明硬件正确。
 
-新训练默认使用
-`/mnt/wsfuse/hhzhang01/supo-data/BC+/bc_train_exclude_stable91_20260730.parquet`
-（589 条，排除了三个 model point 均 8/8 成功的 91 条）。需要覆盖时，在 config
-中设置容器内绝对路径，例如恢复使用原始 680 条数据：
+训练数据必须与用于筛选 easy samples 的 tool protocol 对齐：
+
+- model-controlled 旧协议使用
+  `/mnt/wsfuse/hhzhang01/supo-data/BC+/bc_train_exclude_stable91_20260730.parquet`
+  （589 条，排除旧协议下 base、checkpoint 4、checkpoint 9 均 8/8 的 91 条）；
+- fixed-budget 新协议（`topk=5`、`open_page=10000`）使用
+  `/mnt/wsfuse/hhzhang01/supo-data/BC+/bc_train_exclude_stable130_fixed5_open10k_20260804.parquet`
+  （550 条，排除新协议下三个 model point 均 8/8 的 130 条）。
+
+`run_trainer.sh` 的通用 fallback 仍是旧协议 589 条数据，因此新协议 config 必须显式设置：
+
+```bash
+BC_TRAIN_DATA=/mnt/wsfuse/hhzhang01/supo-data/BC+/bc_train_exclude_stable130_fixed5_open10k_20260804.parquet
+```
+
+需要恢复使用原始 680 条数据时，在 config 中设置：
 
 ```bash
 BC_TRAIN_DATA=/mnt/wsfuse/hhzhang01/supo-data/BC+/bc_train.parquet
 ```
 
 Resume 旧 run 时必须沿用该 run 原先的数据集；如果旧 run 使用原始 680 条数据，需显式
-设置上面的 `BC_TRAIN_DATA`，不要依赖新默认值。
+设置上面的 `BC_TRAIN_DATA`，不要依赖 fallback。
 
 检查以下不变量：
 
@@ -404,13 +461,15 @@ with-proxy mast --output json get-status "${full_job_name}" | \
 
 如果首个 rollout 中 search error 大量增加，即使 job 仍为 `RUNNING` 也不能视为成功；
 应立即检查 trainer 启动时记录的 `LOCAL_SEARCH_URL` 是否仍等于当前
-`search-server.addr`。
+config 所选 `SEARCH_ADDR_FILE` 中的地址。
 
 ### 3.9 正确理解 tracker 和实时训练进度
 
 `latest_checkpointed_iteration.txt` 只记录最后一个完整落盘的 checkpoint，不会在每个
-rollout 后更新。两次保存之间应通过 `perf <step>` 日志或 W&B rollout step 判断实时
-进度，不能因为 tracker 暂时不变就认定训练卡住或重复提交任务。
+rollout 后更新。两次保存之间应通过 `perf <step>` 日志判断实时进度，不能因为 tracker
+暂时不变就认定训练卡住或重复提交任务。Offline W&B 的远端 history 只在本次 MAST
+attempt 结束后 final sync；online meta-3 history 可以实时查看，但任务状态仍以本地日志和
+MAST 状态为准。
 
 例如 `BC_SAVE_INTERVAL=5`、resume tracker 为 39 时：
 
@@ -441,7 +500,9 @@ git diff --check
 
 ```bash
 test -s /home/hhzhang01/eag-wsf/hhzhang01/supo-slime/.llama_key
-test -s /home/hhzhang01/eag-wsf/hhzhang01/supo-slime/search-server.addr
+source <experiment-config.sh>
+search_addr_file="/home/hhzhang01/eag-wsf/${SEARCH_ADDR_FILE#/mnt/wsfuse/}"
+test -s "${search_addr_file}"
 ```
 
 如果需要新建或替换 search job，完整阅读并执行
@@ -601,6 +662,10 @@ jq -r '{
 
 ## 8. 核对 MAST 和 W&B watcher
 
+以下 watcher 检查只适用于 `BC_WANDB_MODE=offline`。Online 模式不会启动持续
+sync watcher，应改为检查 Meta W&B live run 和 OILFS recovery snapshots；详见
+[`wandb/README.md`](wandb/README.md)。
+
 提交器应自动创建 tmux watcher：
 
 ```bash
@@ -613,7 +678,18 @@ sed -n '1,160p' \
 ```
 
 job name 中如果含点，watcher 的 session name 会把点替换成下划线。watcher log 中出现
-`MAST state=PENDING` 是正常的，表示任务已提交、正在等待资源。
+`MAST state=PENDING` 或 `deferring W&B upload until MAST reaches a terminal state` 是正常的。
+
+Watcher 在 MAST 为 `PENDING/RUNNING/SHUTTING_DOWN` 时不上传远端 history；到
+`COMPLETE/FAILED/DEAD` 后，才把每个完整离线 run 通过 W&B `0.27.2` 一次性 final sync
+到一个从未上传过的 run ID。上传后必须同时确认
+`historyLineCount == _step count == lastHistoryStep + 1`、`_step.previousValue` 等于
+`lastHistoryStep`，并等待 `scan_history` 实际返回连续的 `_step=0..N`。
+
+这是 Meta W&B 后端兼容性约束，不是项目存储量限制。实测 `0.28.0` 首次上传会只更新
+summary/history 计数而不生成可查询 history；即使用 `0.27.2`，对一个已经结束的 run
+执行 CLI `--append` 或 SDK `resume`，也会让 metadata 前进而查询 history 停在追加前。
+因此不要对增长中的离线目录做实时 append，也不要把 metadata 相等当成同步成功。
 
 也可以直接查询：
 
@@ -628,6 +704,22 @@ examples/supo_browsecomp/mast/wandb/submit_with_wandb.sh \
   watch-only "${full_job_name}"
 ```
 
+如果 source ID 已经被上传过，或线上 history 有洞，旧线上 run 不能原地修复。保留旧
+run 只读，分别为受影响的 rollout/train source 生成从未使用过的 W&B ID，并在 final
+sync 前通过映射写到同 group 下的 `*-recovered-<source-id>` run：
+
+```bash
+WANDB_SYNC_TARGET_RUN_IDS='<old-rollout-id>=<new-rollout-id>,<old-train-id>=<new-train-id>' \
+  examples/supo_browsecomp/mast/wandb/submit_with_wandb.sh \
+  watch-only "${full_job_name}"
+```
+
+Resume submission 若使用了不同的 `BC_RUN_NAME`，恢复 watcher 时还必须同时设置
+`MAST_WANDB_RUN_NAME=<original-logical-run-name>`。映射必须一直保留到 job 和最终同步结束；
+否则 watcher 会尝试使用 source ID。最终在 watcher log 中确认出现
+`verified target=<new-id> _step=<N>`；`scan_history` 连续可见是成功的必要条件，不是
+可以省略的第二层检查。
+
 ## 9. 故障处理和防重复提交
 
 - dry-run JSON 为 0 字节且 dry-run 进程仍在：继续等待。
@@ -639,8 +731,8 @@ examples/supo_browsecomp/mast/wandb/submit_with_wandb.sh \
 - 容器报 archive 不存在：核对本地 EAG WSF mount 与 config 内 `/mnt/wsfuse` 路径的
   basename 是否完全一致。
 - trainer 报 search server 不健康：按 [`search/README.md`](search/README.md) 检查
-  `search-server.addr`、execution attempt、当前 task IP 和真实 `/search`，不要因此
-  重复提交 trainer。
+  config 所选 `SEARCH_ADDR_FILE`、execution attempt、当前 task IP 和真实 `/search`，
+  不要因此重复提交 trainer。
 - trainer 报模型或 torch-dist checkpoint 缺失：先修复 WSF 上的模型文件，再决定是否
   新建任务；不要修改或删除旧任务的数据。
 - trainer 报 `BC_RUN_NAME requests resume ... tracker does not exist`：检查是否漏写旧 run

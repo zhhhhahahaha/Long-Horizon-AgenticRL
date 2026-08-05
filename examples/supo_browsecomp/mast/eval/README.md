@@ -251,6 +251,13 @@ python examples/supo_browsecomp/mast/eval/eval_sweep.py orchestrate \
   --run "$RUN"
 ```
 
+For the 4B fixed-top5/open-10000 profile, a completed reusable base is in batch
+`bcplus-eval-wncngd6s-20260804`. Its cloud artifacts are under
+`/data/users/hhzhang01/wsfuse_mnt/hhzhang01/supo-slime/evals/bcplus-eval-wncngd6s-20260804/base`;
+the local report copy under `/home/hhzhang01/bcplus-eval-reports/` does not
+contain the raw base point. Pass the batch id, not either filesystem path, to
+`--reuse-base-from`.
+
 No base MAST job is submitted. The source batch is frozen in
 `sweep_config.json`. Before accepting it, the controller validates its artifact
 counts, deterministic seeds, and release-checkpoint evidence. After the new
