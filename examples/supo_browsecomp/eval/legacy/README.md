@@ -45,6 +45,7 @@ it to `rollouts.jsonl`, `questions.jsonl`, or the current raw dump contract and
 place the supported version in a new `eval/analysis/` directory.
 
 The summary-retention study has now been ported. Use the supported
-[`../analysis/summary_retention.py`](../analysis/README.md) pipeline instead of
+[`../analysis/deepdive.py`](../analysis/README.md) run-level pipeline (which
+invokes `summary_retention.py`) instead of
 `analysis/stage_summary_retention.py` and
 `analysis/stage_b_summret_workflow.js`.

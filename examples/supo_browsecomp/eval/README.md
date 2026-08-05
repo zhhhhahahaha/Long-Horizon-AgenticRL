@@ -17,11 +17,13 @@ current report pipeline.
 - `report` validates protocol compatibility and builds a per-run report from
   all completed points currently present on disk.
 
-The supported optional [`analysis/summary_retention.py`](analysis/README.md)
-pipeline stages failed rollouts whose earlier tool observations plausibly
-contained the answer, semantically judges whether the final handover retained
-it, and produces deterministic checkpoint-level retention metrics. It remains
-separate from accuracy because it is conditional, judge-based failure analysis.
+The supported optional [`analysis/deepdive.py`](analysis/README.md) pipeline
+orchestrates reproducible run-level semantic failure analysis across completed
+points and multiple judge models. Its current `summary_retention.py` module
+stages failures whose earlier tool observations plausibly contained the answer,
+semantically judges whether the final handover retained it, and produces
+deterministic checkpoint-level retention metrics. Deep-dive metrics remain
+separate from accuracy because they are conditional and judge based.
 
 The MAST point runner invokes `point` automatically after slime writes
 `rollout_data/eval_0.pt`. The MAST controller invokes `report` after all jobs
@@ -93,10 +95,12 @@ configuration.
 
 The CPU contract tests cover strict scoring, sibling reconstruction,
 checkpoint-load verification, report curves, sweep state, base reuse,
-checkpoint slimming, and the summary-retention candidate/judge/report contract:
+checkpoint slimming, and the deep-dive/summary-retention contracts:
 
 ```bash
-pytest -q tests/test_bcplus_eval_pipeline.py tests/test_bcplus_summary_retention.py
+pytest -q tests/test_bcplus_eval_pipeline.py \
+  tests/test_bcplus_summary_retention.py \
+  tests/test_bcplus_deepdive.py
 ```
 
 ## Legacy code

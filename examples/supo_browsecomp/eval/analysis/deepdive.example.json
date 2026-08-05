@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "run_name": "my-bcplus-run",
+  "output_dir": "/path/to/reports/my-bcplus-run/deepdive_v1",
+  "points": [
+    {
+      "name": "base",
+      "source_dir": "/path/to/evals/shared-base/base"
+    },
+    {
+      "name": "iter04",
+      "source_dir": "/path/to/evals/runs/my-bcplus-run/iter04"
+    },
+    {
+      "name": "iter24",
+      "source_dir": "/path/to/evals/runs/my-bcplus-run/iter24"
+    }
+  ],
+  "judges": [
+    {
+      "name": "gpt_5_4",
+      "display_name": "GPT-5.4",
+      "model": "gpt-5-4-genai-dss4",
+      "base_url": "https://api.llama.com/compat/v1/",
+      "api_key_env": "LLAMA_API_KEY",
+      "concurrency": 16,
+      "max_retries": 3,
+      "keep_raw_responses": false
+    },
+    {
+      "name": "claude_4_8_opus",
+      "display_name": "Claude-4.8-Opus",
+      "model": "claude-4-8-opus-vertex-genai",
+      "base_url": "https://api.llama.com/compat/v1/",
+      "api_key_env": "LLAMA_API_KEY",
+      "concurrency": 16,
+      "max_retries": 3,
+      "keep_raw_responses": false
+    }
+  ],
+  "comparisons": [
+    {
+      "name": "gpt_5_4_vs_claude_4_8_opus",
+      "model_a": "gpt_5_4",
+      "model_b": "claude_4_8_opus"
+    }
+  ]
+}

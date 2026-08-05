@@ -1,4 +1,103 @@
-# Summary-retention evaluation
+# BC+ deep-dive evaluation
+
+`deepdive.py` is the supported run-level entry point for reproducible semantic
+failure analysis. It owns point discovery from an explicit config, staging,
+multi-model judging, resume behavior, reports, comparisons, and completion
+markers. Individual analysis modules such as `summary_retention.py` continue to
+own candidate semantics, prompts, schemas, and metrics.
+
+Do not move the remaining legacy analysis scripts here as a group. They mix old
+`score >= 0.5`, maximum-sibling scoring, historical paths, and one-off agent
+workflows. Port an analysis only after defining its current input, output, and
+metric contract.
+
+## Run-level workflow
+
+Start from [`deepdive.example.json`](deepdive.example.json). A config fixes:
+
+- the run name and output directory,
+- the completed source directory for every base/checkpoint point,
+- judge names, exact model IDs, endpoint, API-key environment variable, and
+  operational concurrency/retry settings, and
+- the judge-model comparisons to generate.
+
+Secrets are never stored in the config or artifacts. Relative paths are resolved
+against the config file's directory and written as absolute paths in
+`deepdive_config.resolved.json`.
+
+The complete workflow is:
+
+```bash
+export LLAMA_API_KEY=...
+# Export HTTPS_PROXY here as well when the API endpoint requires a local relay.
+
+python examples/supo_browsecomp/eval/analysis/deepdive.py run \
+  --config /path/to/deepdive.json
+```
+
+The same operation can be split into auditable phases:
+
+```bash
+python examples/supo_browsecomp/eval/analysis/deepdive.py stage \
+  --config /path/to/deepdive.json
+
+python examples/supo_browsecomp/eval/analysis/deepdive.py judge \
+  --config /path/to/deepdive.json
+
+python examples/supo_browsecomp/eval/analysis/deepdive.py report \
+  --config /path/to/deepdive.json
+```
+
+For a judge canary, limit work per point and optionally select one configured
+judge. This intentionally leaves the run incomplete:
+
+```bash
+python examples/supo_browsecomp/eval/analysis/deepdive.py judge \
+  --config /path/to/deepdive.json \
+  --judge gpt_5_4 \
+  --max-new-candidates-per-point 2
+```
+
+Rerun without the limit to resume every missing pair and summary judgment. Use
+`status` at any time; it performs no API calls:
+
+```bash
+python examples/supo_browsecomp/eval/analysis/deepdive.py status \
+  --config /path/to/deepdive.json
+```
+
+### Artifact layout
+
+```text
+deepdive_v1/
+  deepdive_config.resolved.json
+  deepdive_manifest.json
+  stage/<point>/
+  judges/<judge>/<point>/
+  judges/<judge>/report/
+  comparisons/<comparison>/
+  _SUCCESS
+```
+
+Each point is staged once. Judge directories hard-link the immutable candidate,
+failure-retrieval, and stage-manifest files when the filesystem supports it;
+otherwise they copy them. Pair and summary checkpoints remain model-specific.
+This prevents two judge models from duplicating the large matching tool responses.
+
+`deepdive_manifest.json` stores the resolved point directories, analysis protocol
+versions, and exact judge models. It deliberately does not repeatedly hash raw
+rollout data or checkpoints: the source point's existing `_SUCCESS` and
+`load_verification.actual_step` contract is checked once while staging. Changing
+a source point, judge model, or semantic protocol requires a fresh output
+directory. Changing concurrency or retry count does not invalidate resumable
+results.
+
+The run-level `_SUCCESS` is written only after every configured point/model has
+`_JUDGED`, every model report validates, and every configured comparison report
+completes. Re-running an already complete `stage` or `judge` command is idempotent
+and does not invalidate `_SUCCESS` when no new work is needed.
+
+## Summary-retention analysis
 
 `summary_retention.py` is the supported version of the legacy
 `stage_summary_retention.py` plus `stage_b_summret_workflow.js` study. It asks a
