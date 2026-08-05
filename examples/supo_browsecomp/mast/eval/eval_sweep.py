@@ -734,6 +734,9 @@ def submit_point(
 ) -> dict[str, Any]:
     key = point["key"]
     destination = output_dir(batch_root, point)
+    # MAST runs as root. Create the output path on the devserver first so the
+    # per-run directory remains writable when the controller builds reports.
+    destination.mkdir(parents=True, exist_ok=True)
     if (destination / "_SUCCESS").is_file():
         state.setdefault("jobs", {})[key] = {"state": "COMPLETE", "output": str(destination), "skipped": True}
         _write_json(state_path, state)
@@ -830,6 +833,111 @@ def wait_for_keys(state: dict[str, Any], state_path: Path, keys: list[str], poll
         time.sleep(poll_seconds)
 
 
+def submit_unrecorded_points(
+    *,
+    config: SweepConfig,
+    state: dict[str, Any],
+    state_path: Path,
+    batch_id: str,
+    batch_root: Path,
+    archive: Path,
+    archive_sha256: str,
+) -> list[dict[str, Any]]:
+    points = sweep_points(config)
+    unrecorded = [point for point in points if point["key"] not in state.get("jobs", {})]
+    if any(not (output_dir(batch_root, point) / "_SUCCESS").is_file() for point in unrecorded):
+        health_gate(samples=1, interval=0)
+    for point in unrecorded:
+        submit_point(
+            config=config,
+            state=state,
+            state_path=state_path,
+            batch_id=batch_id,
+            batch_root=batch_root,
+            archive=archive,
+            archive_sha256=archive_sha256,
+            point=point,
+        )
+    return points
+
+
+def wait_for_live_points(
+    *,
+    repo_root: Path,
+    config: SweepConfig,
+    state: dict[str, Any],
+    state_path: Path,
+    batch_id: str,
+    batch_root: Path,
+    archive: Path,
+    archive_sha256: str,
+    points: list[dict[str, Any]],
+    poll_seconds: int,
+) -> tuple[SweepConfig, list[dict[str, Any]]]:
+    config_path = batch_root / "sweep_config.json"
+    reported_successes: frozenset[str] = frozenset()
+    while True:
+        try:
+            extended_config, additions = extend_config(config)
+        except RuntimeError as error:
+            if "but latest complete checkpoint is" not in str(error):
+                raise
+            print(f"[live-extend] checkpoint write is incomplete; retrying: {error}", flush=True)
+        else:
+            if additions:
+                config = extended_config
+                _write_json(config_path, config.to_dict())
+                validate_checkpoints(config)
+                print(f"[live-extend] added checkpoints: {additions}", flush=True)
+                points = submit_unrecorded_points(
+                    config=config,
+                    state=state,
+                    state_path=state_path,
+                    batch_id=batch_id,
+                    batch_root=batch_root,
+                    archive=archive,
+                    archive_sha256=archive_sha256,
+                )
+
+        counts = update_statuses(state, state_path)
+        stats = search_stats()
+        queue_sizes = stats.get("queue_sizes", {})
+        print(
+            f"[monitor] jobs={dict(counts)} pending={stats.get('pending')} queues={queue_sizes}",
+            flush=True,
+        )
+        selected = [state["jobs"][point["key"]] for point in points]
+        failed = [record for record in selected if record.get("state") in FAILED_STATES]
+        if failed:
+            raise RuntimeError(f"MAST eval jobs failed: {failed}")
+
+        successful = frozenset(
+            point["key"]
+            for point in points
+            if (output_dir(batch_root, point) / "_SUCCESS").is_file()
+        )
+        has_checkpoint_result = any(
+            point["point"] != "base" and point["key"] in successful for point in points
+        )
+        if (
+            successful != reported_successes
+            and has_checkpoint_result
+            and (base_output_dir(config, batch_root) / "_SUCCESS").is_file()
+        ):
+            create_reports(config, repo_root, batch_root, allow_partial=True)
+            reported_successes = successful
+
+        if all(record.get("state") == "COMPLETE" for record in selected):
+            missing = [record["output"] for record in selected if not (Path(record["output"]) / "_SUCCESS").is_file()]
+            if missing:
+                time.sleep(30)
+                missing = [path for path in missing if not (Path(path) / "_SUCCESS").is_file()]
+            if missing:
+                raise RuntimeError(f"jobs completed without validated _SUCCESS: {missing}")
+            return config, points
+        time.sleep(poll_seconds)
+
+
 def health_gate(samples: int = 3, interval: int = 30) -> None:
     pending_values = []
     for index in range(samples):
@@ -863,7 +971,13 @@ def sync_local_reports(config: SweepConfig, batch_root: Path) -> Path:
     return local_root
 
 
-def create_reports(config: SweepConfig, repo_root: Path, batch_root: Path) -> None:
+def create_reports(
+    config: SweepConfig,
+    repo_root: Path,
+    batch_root: Path,
+    *,
+    allow_partial: bool = False,
+) -> None:
     pipeline = repo_root / "examples/supo_browsecomp/eval/eval_pipeline.py"
     for run in config.runs:
         run_root = batch_root / "runs" / run.name
@@ -880,6 +994,8 @@ def create_reports(config: SweepConfig, repo_root: Path, batch_root: Path) -> No
             "--output-dir",
             str(run_root),
         ]
+        if allow_partial:
+            command.append("--allow-partial")
         result = _run(command)
         if result.returncode:
             raise RuntimeError(f"report failed for {run.name}: {result.stderr}")
@@ -910,12 +1026,18 @@ def orchestrate(args: argparse.Namespace) -> None:
     repo_root, batch_root, state, config, archive, archive_sha256 = prepare(args)
     state_path = batch_root / "sweep_state.json"
     batch_id = state["batch_id"]
-    points = sweep_points(config)
-    unrecorded = [point for point in points if point["key"] not in state.get("jobs", {})]
-    if any(not (output_dir(batch_root, point) / "_SUCCESS").is_file() for point in unrecorded):
-        health_gate(samples=1, interval=0)
-    for point in unrecorded:
-        submit_point(
+    points = submit_unrecorded_points(
+        config=config,
+        state=state,
+        state_path=state_path,
+        batch_id=batch_id,
+        batch_root=batch_root,
+        archive=archive,
+        archive_sha256=archive_sha256,
+    )
+    if getattr(args, "live_extend_checkpoints", False):
+        config, points = wait_for_live_points(
+            repo_root=repo_root,
             config=config,
             state=state,
             state_path=state_path,
@@ -923,10 +1045,11 @@ def orchestrate(args: argparse.Namespace) -> None:
             batch_root=batch_root,
             archive=archive,
             archive_sha256=archive_sha256,
-            point=point,
+            points=points,
+            poll_seconds=args.poll_seconds,
         )
-
-    wait_for_keys(state, state_path, [point["key"] for point in points], args.poll_seconds)
+    else:
+        wait_for_keys(state, state_path, [point["key"] for point in points], args.poll_seconds)
     first_checkpoint = next(point for point in points if point["point"] != "base")
     validate_base_against_point(config, batch_root, first_checkpoint)
     create_reports(config, repo_root, batch_root)
@@ -1029,6 +1152,11 @@ def main() -> None:
         action="store_true",
         help="append newly completed checkpoints to an existing batch",
     )
+    parser.add_argument(
+        "--live-extend-checkpoints",
+        action="store_true",
+        help="discover and submit new complete checkpoints while eval jobs are running",
+    )
     parser.add_argument("--key", help="point key for retry-point, e.g. RUN/iter39")
     parser.add_argument(
         "--reuse-base-from",
@@ -1070,6 +1198,8 @@ def main() -> None:
     apply_evaluation_config(args)
     if args.extend_checkpoints and (args.command != "orchestrate" or not args.batch_id):
         parser.error("--extend-checkpoints requires orchestrate with --batch-id")
+    if args.live_extend_checkpoints and args.command != "orchestrate":
+        parser.error("--live-extend-checkpoints requires orchestrate")
     if args.command in {"dry-run", "orchestrate"} and not args.batch_id and not args.run_names:
         parser.error(f"{args.command} requires at least one --run when starting a new batch")
     if args.command in {"retry-point", "status", "report"} and not args.batch_id:

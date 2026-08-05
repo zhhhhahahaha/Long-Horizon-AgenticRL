@@ -38,6 +38,14 @@ checkpoint discovery -> frozen sweep_config.json -> code archive
 | Fixed search budget / open-page words | 5 / 10000 | 5 / 10000 |
 | Search / judge concurrency | 64 / 16 | 64 / 16 |
 
+Eval jobs are submitted with `HIGH` priority in region `nha` under tenant
+`gen_ai/msl/tbd_research/rhea/msl_tbd_rhea_friends_data/rhea_assistant/rhea_assistant_interns`
+(the MAST CLI receives the leaf tenant `rhea_assistant_interns`). The
+controller reads the shared search endpoint from
+`/data/users/hhzhang01/wsfuse_mnt/hhzhang01/supo-slime/search-server.addr` and
+checks its `/stats` response before submitting jobs. Keep that file pointed at
+the search service served for this tenant and region.
+
 These defaults are frozen into the submitted code archive and
 `sweep_config.json`. Search protocol, open-page limit, search concurrency, judge
 concurrency, question count, sample count, and seed are controller options. The
@@ -184,6 +192,52 @@ beyond the latest complete metadata is rejected. A lagging tracker is allowed
 because every eval passes `--ckpt-step` explicitly, but the lag is logged.
 Running `orchestrate --batch-id "$BATCH"` without `--extend-checkpoints` only
 resumes the already frozen set and never discovers additional steps.
+
+## Watch a live training run
+
+`watch_eval.py` keeps one eval batch synchronized with one live MAST training
+run. It performs a MAST dry-run before initializing a new batch, invokes the
+existing controller for the current complete checkpoints, and then polls for
+new `iter_*/.metadata` files. While eval jobs are running, the controller
+rediscovers complete checkpoints on every eval poll and submits them
+immediately. This keeps checkpoint discovery concurrent with evaluation while
+retaining one controller lock and the existing retry rules. Reports are
+regenerated and synced whenever a newly completed point writes `_SUCCESS`;
+running points are excluded from that partial report. A final strict report is
+generated once every point discovered by that controller invocation is
+complete.
+
+Run it from a durable devserver session:
+
+```bash
+RUN=<checkpoint-directory-and-full-training-job-name>
+BATCH=<persistent-eval-batch-id>
+EVAL_CONFIG=examples/supo_browsecomp/mast/eval/configs/fixed_topk5_open10000.json
+
+python3 examples/supo_browsecomp/mast/eval/watch_eval.py \
+  --run "$RUN" \
+  --training-job "$RUN" \
+  --batch-id "$BATCH" \
+  --eval-config "$EVAL_CONFIG"
+```
+
+If the MAST job name and checkpoint directory differ, pass the full scheduler
+job name to `--training-job` and the checkpoint directory name to `--run`.
+Defaults are a five-minute checkpoint poll and the controller's two-minute eval
+job poll. When training reaches `COMPLETE`, `FAILED`, or `DEAD`, the watcher
+requires two stable checkpoint polls before exiting so a final OILFS write is
+not missed.
+
+Operational state is written atomically to
+`<eval-root>/<batch>/watch_state.json`. Controller state remains in
+`sweep_state.json`, reports remain under `runs/<run>/`, and stdout/stderr should
+be redirected to a durable log by the session launcher. Starting a second
+watcher for the same batch fails on `.watcher.lock`.
+
+An eval failure stops the watcher and records `status: FAILED`; it does not
+automatically retry or overwrite a raw dump. Audit the point using the failure
+rules below, repair or explicitly retry it, then restart the same watcher
+command. The frozen batch configuration makes restart idempotent.
 
 ## Reuse an existing base
 
@@ -339,6 +393,9 @@ contract.
   diagnosis, then move it aside before an explicit retry.
 - Always verify the point manifest's `load_verification.actual_step`; similar
   metrics across checkpoints are not evidence that loading was correct.
+- After each checkpoint evaluation completes, check `judge_failed_count` and
+  `search_error_rollout_count` in its metrics before interpreting pass rates;
+  report any nonzero value to the user as a judge or search failure.
 
 ## Report metrics
 

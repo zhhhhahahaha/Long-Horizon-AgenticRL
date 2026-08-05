@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -642,6 +643,136 @@ def test_orchestrate_submits_only_steps_missing_from_existing_state(tmp_path, mo
     sweep.orchestrate(SimpleNamespace(poll_seconds=1))
 
     assert submitted == ["run-1/iter14"]
+
+
+@pytest.mark.unit
+def test_live_wait_retries_incomplete_checkpoint_and_submits_new_point(tmp_path, monkeypatch):
+    config = sweep.SweepConfig(
+        runs=(sweep.RunConfig(name="run-1", alias="r01", steps=(4,)),),
+        base_source_batch="old-batch",
+    )
+    extended = sweep.SweepConfig(
+        runs=(sweep.RunConfig(name="run-1", alias="r01", steps=(4, 9)),),
+        base_source_batch="old-batch",
+    )
+    batch_root = tmp_path / "evals/new-batch"
+    base_root = batch_root.parent / "old-batch/base"
+    base_root.mkdir(parents=True)
+    (base_root / "_SUCCESS").write_text("{}")
+    state_path = batch_root / "sweep_state.json"
+    first_point = sweep.sweep_points(config)[0]
+    first_output = sweep.output_dir(batch_root, first_point)
+    state = {
+        "batch_id": "new-batch",
+        "jobs": {
+            first_point["key"]: {
+                "state": "RUNNING",
+                "output": str(first_output),
+            }
+        },
+    }
+    extend_calls = 0
+    status_calls = 0
+    submitted = []
+    reports = []
+
+    def fake_extend(current):
+        nonlocal extend_calls
+        extend_calls += 1
+        if extend_calls == 1:
+            raise RuntimeError("run-1 tracker=9, but latest complete checkpoint is 4")
+        if extend_calls == 2:
+            return extended, {"run-1": [9]}
+        return extended, {}
+
+    def fake_submit(**kwargs):
+        point = kwargs["point"]
+        submitted.append(point["key"])
+        state["jobs"][point["key"]] = {
+            "state": "RUNNING",
+            "output": str(sweep.output_dir(batch_root, point)),
+        }
+
+    def fake_statuses(current_state, _state_path):
+        nonlocal status_calls
+        status_calls += 1
+        if status_calls >= 3:
+            for record in current_state["jobs"].values():
+                record["state"] = "COMPLETE"
+                output = Path(record["output"])
+                output.mkdir(parents=True, exist_ok=True)
+                (output / "_SUCCESS").write_text("{}")
+            return {"COMPLETE": len(current_state["jobs"])}
+        return {"RUNNING": len(current_state["jobs"])}
+
+    monkeypatch.setattr(sweep, "extend_config", fake_extend)
+    monkeypatch.setattr(sweep, "validate_checkpoints", lambda current: None)
+    monkeypatch.setattr(sweep, "health_gate", lambda **kwargs: None)
+    monkeypatch.setattr(sweep, "submit_point", fake_submit)
+    monkeypatch.setattr(sweep, "update_statuses", fake_statuses)
+    monkeypatch.setattr(sweep, "search_stats", lambda: {"pending": 0, "queue_sizes": {}})
+    monkeypatch.setattr(
+        sweep,
+        "create_reports",
+        lambda current, repo_root, root, **kwargs: reports.append(
+            (current.runs[0].steps, kwargs)
+        ),
+    )
+    monkeypatch.setattr(sweep.time, "sleep", lambda seconds: None)
+
+    final_config, final_points = sweep.wait_for_live_points(
+        repo_root=tmp_path,
+        config=config,
+        state=state,
+        state_path=state_path,
+        batch_id="new-batch",
+        batch_root=batch_root,
+        archive=tmp_path / "code.tgz",
+        archive_sha256="hash",
+        points=sweep.sweep_points(config),
+        poll_seconds=1,
+    )
+
+    assert submitted == ["run-1/iter09"]
+    assert final_config.runs[0].steps == (4, 9)
+    assert [point["key"] for point in final_points] == ["run-1/iter04", "run-1/iter09"]
+    assert json.loads((batch_root / "sweep_config.json").read_text())["runs"][0]["steps"] == [4, 9]
+    assert reports == [((4, 9), {"allow_partial": True})]
+
+
+@pytest.mark.unit
+def test_submit_point_precreates_report_parent_as_controller_user(tmp_path, monkeypatch):
+    config = sweep.SweepConfig(runs=(sweep.RunConfig(name="run-1", alias="r01", steps=(4,)),))
+    batch_root = tmp_path / "evals/batch-1"
+    point = next(point for point in sweep.sweep_points(config) if point["point"] == "iter04")
+    destination = sweep.output_dir(batch_root, point)
+    state = {"jobs": {}}
+
+    monkeypatch.setattr(sweep, "build_mast_command", lambda **kwargs: ["submit"])
+
+    def fake_run(command):
+        assert destination.is_dir()
+        assert destination.parent.is_dir()
+        return SimpleNamespace(
+            returncode=0,
+            stdout='{"status":"ok","job":{"job_name":"eval-job"}}',
+            stderr="",
+        )
+
+    monkeypatch.setattr(sweep, "_run", fake_run)
+
+    record = sweep.submit_point(
+        config=config,
+        state=state,
+        state_path=batch_root / "sweep_state.json",
+        batch_id="batch-1",
+        batch_root=batch_root,
+        archive=tmp_path / "code.tgz",
+        archive_sha256="hash",
+        point=point,
+    )
+
+    assert record["job_name"] == "eval-job"
 
 
 if __name__ == "__main__":
