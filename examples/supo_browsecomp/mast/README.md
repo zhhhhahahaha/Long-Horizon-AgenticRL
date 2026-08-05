@@ -35,14 +35,24 @@ scheduler can reuse the same correctness and report contract.
 
 ## Training data
 
-New training runs default to
-`/mnt/wsfuse/hhzhang01/supo-data/BC+/bc_train_exclude_stable91_20260730.parquet`:
-589 questions after removing the 91 questions that scored 8/8 at base, checkpoint
-4, and checkpoint 9. The original 680-question `bc_train.parquet` is unchanged.
+Training data is paired with the tool protocol used to identify consistently
+easy questions:
 
-Set `BC_TRAIN_DATA` to an absolute container path in an experiment config to
-override the default. A resumed run must keep the dataset it originally used;
-for an older run trained on all 680 questions, set:
+| Tool protocol | Training parquet | Rows | Excluded criterion |
+|---|---|---:|---|
+| Model-controlled (SUPO baseline) | `/mnt/wsfuse/hhzhang01/supo-data/BC+/bc_train_exclude_stable91_20260730.parquet` | 589 | 91 questions scored 8/8 at base, checkpoint 4, and checkpoint 9 under the original protocol |
+| Fixed budget (`topk=5`, `open_page=10000`) | `/mnt/wsfuse/hhzhang01/supo-data/BC+/bc_train_exclude_stable130_fixed5_open10k_20260804.parquet` | 550 | 130 questions scored 8/8 at fixed-budget base, checkpoint 4, and checkpoint 9 |
+
+The original 680-question `bc_train.parquet` is unchanged. The generic trainer
+fallback remains the 589-row model-controlled dataset, so every new fixed-budget
+config must set `BC_TRAIN_DATA` explicitly:
+
+```bash
+BC_TRAIN_DATA=/mnt/wsfuse/hhzhang01/supo-data/BC+/bc_train_exclude_stable130_fixed5_open10k_20260804.parquet
+```
+
+A resumed run must keep the exact dataset it originally used. For an older run
+trained on all 680 questions, set:
 
 ```bash
 BC_TRAIN_DATA=/mnt/wsfuse/hhzhang01/supo-data/BC+/bc_train.parquet

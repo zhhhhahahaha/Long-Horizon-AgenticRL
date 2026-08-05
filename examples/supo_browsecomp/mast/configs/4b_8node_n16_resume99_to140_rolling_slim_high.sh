@@ -1,0 +1,42 @@
+#!/bin/bash
+# This file is sourced by submit_experiment.sh.
+# shellcheck disable=SC2034
+# Resume the 4B n16 8-node run from checkpoint 99 for 40 rollouts.
+
+MAST_JOB_NAME=supo_4b_n16_8n_resume99_to140_rolling_slim_high
+MAST_TENANT=rhea_assistant_interns
+MAST_REGION=nha
+MAST_HOST=zionex_80g
+MAST_JOB_PRIORITY=HIGH
+MAST_NUM_NODES=8
+MAST_GPUS_PER_NODE=8
+MAST_DATA_PARALLEL_SIZE=8
+MAST_CONTEXT_PARALLEL_SIZE=8
+MAST_CONDA_DOCKER_IMAGE=588845226011.dkr.ecr.us-east-2.amazonaws.com/msl_infra/slime:hhz-20260629a
+MAST_CODE_ARCHIVE=/mnt/wsfuse/hhzhang01/supo-slime/slime-code-4b-n16-8n-resume99-to140-high-20260803.tgz
+
+# Keep the original checkpoint, W&B, Ray-log, and 680-example data namespaces.
+BC_RUN_NAME=supo_4b_n16_8n_40iter-bt6g4q5g
+BC_TRAIN_DATA=/mnt/wsfuse/hhzhang01/supo-data/BC+/bc_train.parquet
+BC_MODEL_SIZE=4B
+# The tracker is 99; exclusive upper bound 140 runs rollouts 100-139.
+BC_NUM_ROLLOUT=140
+BC_ROLLOUT_BATCH_SIZE=32
+BC_N_SAMPLES=16
+BC_GLOBAL_BATCH_SIZE=512
+BC_MAX_RESPONSE_LEN=32768
+BC_MAX_CONTEXT_LEN=65536
+
+# Preserve the original 64-GPU topology: 64 / (TP 4 x CP 2) = train DP 8.
+BC_TP=4
+BC_CP=2
+BC_SGLANG_TP=2
+BC_MAX_TOKENS_PER_GPU=49152
+
+BC_SAVE_INTERVAL=5
+BC_SLIM_INTERMEDIATE_CHECKPOINTS=1
+# Extend the scheduler horizon from 100 to 140 while retaining its progress.
+BC_OVERRIDE_OPT_PARAM_SCHEDULER=1
+BC_DUMP_ROLLOUT=0
+MAST_WANDB_SNAPSHOT_INTERVAL_SEC=60
+WANDB_X_FLUSH_INTERVAL_SECONDS=30
