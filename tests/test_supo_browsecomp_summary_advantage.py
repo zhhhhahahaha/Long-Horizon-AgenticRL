@@ -6,6 +6,7 @@ import ast
 import asyncio
 import copy
 import math
+import os
 import re
 import sys
 from pathlib import Path
@@ -16,6 +17,10 @@ import _cp_dist_helpers  # noqa: F401
 import pytest
 import torch
 from megatron.core import mpu
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from examples.supo_browsecomp.dynamic_sampling import (
     _CandidateGroup,
@@ -29,7 +34,7 @@ from examples.supo_browsecomp.summary_advantage import compute_summary_aware_adv
 
 
 NUM_GPUS = 0
-GENERATE_PATH = Path(__file__).parents[1] / "examples/supo_browsecomp/generate_with_bcplus.py"
+GENERATE_PATH = REPO_ROOT / "examples/supo_browsecomp/generate_with_bcplus.py"
 
 
 def _rollout_data(*, base_reward=2.5, source="fallback", start=3, end=7, response_length=8):
@@ -186,6 +191,21 @@ def _load_generate(run_one_sub_trajectory, sample_type):
     }
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(GENERATE_PATH), "exec"), namespace)
     return namespace["generate"]
+
+
+def _load_dump_rollout_data_postprocess(dump_dir: Path):
+    tree = ast.parse(GENERATE_PATH.read_text())
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "dump_rollout_data_postprocess"
+    )
+    namespace = {
+        "BCPLUS_CONFIGS": {"dump_dir": str(dump_dir), "dump_train_old": False},
+        "os": os,
+    }
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(GENERATE_PATH), "exec"), namespace)
+    return namespace["dump_rollout_data_postprocess"]
 
 
 def _load_log_bcplus():
@@ -363,7 +383,7 @@ def test_tag_only_summary_cannot_be_used_as_handover():
 
 
 @pytest.mark.unit
-def test_generate_does_not_open_sibling_with_empty_handover():
+def test_generate_rejects_empty_handover_and_propagates_query_id():
     class Sample:
         class Status:
             TRUNCATED = "truncated"
@@ -383,7 +403,13 @@ def test_generate_does_not_open_sibling_with_empty_handover():
         return "compressed"
 
     generate = _load_generate(run_one_sub_trajectory, Sample)
-    sample = Sample(index=7, group_index=3, prompt=[{"role": "user", "content": "question"}], label="answer")
+    sample = Sample(
+        index=7,
+        group_index=3,
+        prompt=[{"role": "user", "content": "question"}],
+        label="answer",
+        metadata={"query_id": "query-7"},
+    )
 
     sub_trajs = asyncio.run(generate(SimpleNamespace(partial_rollout=False), sample, {}))
 
@@ -391,6 +417,48 @@ def test_generate_does_not_open_sibling_with_empty_handover():
     assert sample.status == Sample.Status.TRUNCATED
     assert sample.metadata["_bcplus"]["outcome"] == "compress_failed"
     assert sample.metadata["_bcplus"]["summary"] is None
+    assert sample.train_metadata["query_id"] == "query-7"
+
+
+@pytest.mark.unit
+def test_rollout_dump_persists_non_nullable_query_id(tmp_path, monkeypatch):
+    pq = pytest.importorskip("pyarrow.parquet")
+    from slime.backends.megatron_utils import cp_utils
+
+    monkeypatch.setattr(cp_utils, "all_gather_with_cp", lambda values, *_args: values)
+    cpu_device = torch.device("cpu")
+    monkeypatch.setattr(torch, "device", lambda *_args, **_kwargs: cpu_device)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+
+    dump = _load_dump_rollout_data_postprocess(tmp_path)
+    rollout_data = {
+        "tokens": [torch.tensor([10, 11, 20, 21])],
+        "response_lengths": [2],
+        "total_lengths": [4],
+        "loss_masks": [torch.tensor([1, 1])],
+        "rollout_log_probs": [torch.tensor([-0.1, -0.2])],
+        "advantages": [torch.tensor([0.5, 0.5])],
+        "rollout_ids": [7],
+        "metadata": [
+            {
+                "query_id": "query-7",
+                "group_index": 3,
+                "sub_traj_index": 0,
+                "total_sub_trajs": 1,
+                "is_final": True,
+            }
+        ],
+    }
+
+    dump(SimpleNamespace(), 4, rollout_data)
+
+    table = pq.read_table(tmp_path / "rollouts_iter_00004_dp0.parquet")
+    assert table.column("query_id").to_pylist() == ["query-7"]
+    assert table.schema.field("query_id").nullable is False
+
+    rollout_data["metadata"] = [{}]
+    with pytest.raises(ValueError, match="missing train_metadata.query_id"):
+        dump(SimpleNamespace(), 5, rollout_data)
 
 
 @pytest.mark.unit
@@ -636,3 +704,7 @@ def test_search_client_connection_pool_tracks_search_concurrency(monkeypatch):
         "base_url": "http://search",
         "limits": limits_sentinel,
     }
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

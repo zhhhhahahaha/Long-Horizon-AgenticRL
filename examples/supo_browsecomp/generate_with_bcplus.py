@@ -60,7 +60,8 @@ our primary is already stronger than SUPO's fallback.
 (non-empty), ``dump_rollout_data_postprocess`` — wired via slime's
 ``--rollout-data-postprocess-path`` — writes one parquet file per training
 iter with one row per sub-trajectory. Each row includes full
-``prompt_ids``/``response_ids``/``loss_mask`` for exact replay, plus dense
+``query_id`` provenance and full ``prompt_ids``/``response_ids``/``loss_mask``
+for exact replay, plus dense
 (``sum(loss_mask==1)``-length) ``rollout_logps`` + ``train_old_logps``
 arrays for TIS drift analysis. Default off — canonical training pays
 zero cost.
@@ -1284,7 +1285,11 @@ async def generate(args, sample: Sample, sampling_params) -> list[Sample]:
         # `train_metadata`, not `metadata`, is threaded through — see
         # slime/ray/rollout.py:793-794). Used by dump_rollout_data_postprocess.
         bc = s.metadata.get("_bcplus", {}) if isinstance(s.metadata, dict) else {}
+        raw_query_id = s.metadata.get("query_id")
+        if raw_query_id is None or not str(raw_query_id).strip():
+            raise ValueError("BC+ sample is missing metadata.query_id")
         s.train_metadata = {
+            "query_id": str(raw_query_id),
             "sub_traj_index": i,
             "total_sub_trajs": total,
             "is_final": (i == total - 1),
@@ -1985,6 +1990,7 @@ def dump_rollout_data_postprocess(args, rollout_id, rollout_data) -> None:
 
     rows: dict[str, list] = {
         "iter_id": [int(rollout_id)] * n,
+        "query_id": [None] * n,
         "group_index": [-1] * n,
         "rollout_id": [int(r) for r in rollout_ids],
         "sub_traj_index": [-1] * n,
@@ -2036,6 +2042,10 @@ def dump_rollout_data_postprocess(args, rollout_id, rollout_data) -> None:
                 adv_scalar = float(adv_vals[0])
 
         md = metadata_list[i] if i < len(metadata_list) and isinstance(metadata_list[i], dict) else {}
+        query_id = md.get("query_id")
+        if not isinstance(query_id, str) or not query_id.strip():
+            raise ValueError(f"sub-traj {i} is missing train_metadata.query_id")
+        rows["query_id"][i] = query_id
         rows["group_index"][i] = int(md.get("group_index", -1))
         rows["sub_traj_index"][i] = int(md.get("sub_traj_index", -1))
         rows["total_sub_trajs"][i] = int(md.get("total_sub_trajs", -1))
@@ -2061,6 +2071,7 @@ def dump_rollout_data_postprocess(args, rollout_id, rollout_data) -> None:
 
     schema = pa.schema([
         pa.field("iter_id", pa.int32()),
+        pa.field("query_id", pa.string(), nullable=False),
         pa.field("group_index", pa.int32()),
         pa.field("rollout_id", pa.int32()),
         pa.field("sub_traj_index", pa.int32()),

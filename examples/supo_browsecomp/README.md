@@ -96,9 +96,9 @@ overrides that generated name.
 ## Training trajectory artifacts
 
 The AWS launcher writes a per-DP-rank parquet dump by default. It contains the
-token IDs, loss masks, rollout log probabilities, rewards, and advantages used
-by training. For complete research trajectories in the same raw format as
-evaluation's `eval_0.pt`, also set `BCPLUS_RAW_ROLLOUT_DIR`:
+source `query_id`, token IDs, loss masks, rollout log probabilities, rewards,
+and advantages used by training. For complete research trajectories in the
+same raw format as evaluation's `eval_0.pt`, also set `BCPLUS_RAW_ROLLOUT_DIR`:
 
 ```bash
 RUN_NAME=supo-bcplus-fixedtopk5-open10000w-run \
