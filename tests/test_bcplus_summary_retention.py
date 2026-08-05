@@ -66,20 +66,59 @@ def _rollout_row(rollout_id: int, *, correct: bool = False, judge_failed: bool =
     }
 
 
-def _judge_response(
-    evidence_ids: list[str], *, evidence_verdict: str = "yes", summary_retention: str = "dropped"
-) -> dict:
+def _match_response(match_id: str, verdict: str = "yes") -> dict:
     return {
-        "evidence_assessments": [
-            {
-                "evidence_id": evidence_id,
-                "verdict": evidence_verdict,
-                "rationale": "The matched answer has the intended meaning in this context.",
-            }
-            for evidence_id in evidence_ids
-        ],
+        "match_id": match_id,
+        "verdict": verdict,
+        "rationale": "The occurrence has the intended semantic role.",
+    }
+
+
+def _summary_response(summary_retention: str = "dropped") -> dict:
+    return {
         "summary_retention": summary_retention,
         "summary_rationale": "The final handover does not preserve the answer.",
+    }
+
+
+def _staged_candidate(rollout_id: int = 0, *, content: str = "Alpha is the answer.") -> dict:
+    return {
+        "schema_version": retention.SCHEMA_VERSION,
+        "prefilter_version": retention.PREFILTER_VERSION,
+        "candidate_id": f"base:{rollout_id}",
+        "point": "base",
+        "rollout_id": rollout_id,
+        "query_id": f"q{rollout_id}",
+        "question": "Question",
+        "gold_answer": "Alpha",
+        "gold_parts": ["alpha"],
+        "gold_part_records": [{"gold_part_id": "part-001", "text": "alpha"}],
+        "final_answer": "Gamma",
+        "n_sub_trajs": 2,
+        "matching_tool_responses": [
+            {
+                "evidence_id": "evidence-001",
+                "tool": "search",
+                "docid": "1",
+                "matched_gold_parts": ["alpha"],
+                "content": content,
+                "occurrences": [{"sub_traj_index": 0, "tool_response_index": 0}],
+            }
+        ],
+        "semantic_match_tasks": [
+            {
+                "match_id": "match-0001",
+                "evidence_id": "evidence-001",
+                "gold_part_id": "part-001",
+                "gold_part": "alpha",
+            }
+        ],
+        "final_handover": {
+            "sub_traj_index": 0,
+            "outcome": "compressed",
+            "summary_source": "extracted",
+            "summary": "No answer yet.",
+        },
     }
 
 
@@ -127,15 +166,21 @@ def test_prefilter_uses_tool_observations_and_excludes_judge_failures():
         "n_failures_opened_evidence_doc": 0,
         "n_compressed_model_failures": 1,
         "n_prefilter_candidates": 1,
+        "n_semantic_match_tasks": 2,
     }
     assert len(candidates) == 1
     candidate = candidates[0]
     assert candidate["candidate_id"] == "iter04:0"
     assert candidate["gold_parts"] == ["alpha", "beta"]
+    assert candidate["gold_part_records"] == [
+        {"gold_part_id": "part-001", "text": "alpha"},
+        {"gold_part_id": "part-002", "text": "beta"},
+    ]
     assert candidate["final_handover"]["summary"] == "Continue with an unrelated lead."
     assert len(candidate["matching_tool_responses"]) == 1
     assert candidate["matching_tool_responses"][0]["evidence_id"] == "evidence-001"
     assert candidate["matching_tool_responses"][0]["matched_gold_parts"] == ["alpha", "beta"]
+    assert [task["gold_part"] for task in candidate["semantic_match_tasks"]] == ["alpha", "beta"]
 
 
 @pytest.mark.unit
@@ -177,7 +222,7 @@ def test_candidate_gives_judge_complete_matching_responses_only():
     assert evidence[0]["tool"] == "open_page"
     assert evidence[0]["content"] == "[Opened Page Content] docid: 42\nDemi Mabry is an Atlanta designer."
     assert evidence[0]["content_truncated"] is False
-    prompt = retention._candidate_prompt(candidate)
+    prompt = retention._match_prompt(candidate, candidate["semantic_match_tasks"][0], evidence[0])
     assert "UNTRUSTED PRIVATE REASONING" not in prompt
     assert "invitation designer" not in prompt
     assert "Demi Mabry" in prompt
@@ -239,17 +284,27 @@ url: https://example.test/alpha
 content: --- title: Alpha Source date: 2020-01-01 --- Alpha is the answer with fuller context.
 </tool_response>"""
     retitled_search_response = search_response.replace("Alpha Source", "Alternate Alpha Source")
-    response = search_call + search_response + search_call + retitled_search_response + open_call + open_response
+    response = (
+        search_call
+        + search_response
+        + search_call
+        + search_response
+        + search_call
+        + retitled_search_response
+        + open_call
+        + open_response
+    )
 
     records, covered = retention._matching_tool_response_records(response, ["alpha"], sub_traj_index=0)
     deduplicated = retention._deduplicate_evidence(records)
 
     assert covered == {"alpha"}
-    assert [record["tool"] for record in deduplicated] == ["search", "open_page"]
+    assert [record["tool"] for record in deduplicated] == ["search", "search", "open_page"]
     assert len(deduplicated[0]["occurrences"]) == 2
     assert deduplicated[0]["queries"] == ["alpha source"]
-    assert len(deduplicated[1]["occurrences"]) == 1
-    assert "fuller context" in deduplicated[1]["content"]
+    assert "Alternate Alpha Source" in deduplicated[1]["content"]
+    assert len(deduplicated[2]["occurrences"]) == 1
+    assert "fuller context" in deduplicated[2]["content"]
 
 
 @pytest.mark.unit
@@ -290,74 +345,88 @@ def test_failure_doc_coverage_uses_all_sub_trajectories_and_excludes_judge_failu
 
 
 @pytest.mark.unit
-def test_verdict_parser_validates_evidence_coverage_and_computes_aggregate():
-    response = _judge_response(["evidence-001", "evidence-002"], evidence_verdict="no")
-    response["evidence_assessments"][1]["verdict"] = "unclear"
-
-    verdict = retention.parse_verdict(f"```json\n{json.dumps(response)}\n```", ["evidence-001", "evidence-002"])
-
-    assert verdict["early_retrieval"] == "unclear"
-    assert verdict["summary_retention"] == "dropped"
-    with pytest.raises(ValueError, match="IDs do not match"):
-        retention.parse_verdict(json.dumps(response), ["evidence-001"])
-
-    inconsistent = {**verdict, "early_retrieval": "yes"}
-    with pytest.raises(ValueError, match="does not match evidence assessments"):
-        retention.parse_verdict(json.dumps(inconsistent), ["evidence-001", "evidence-002"])
+def test_separate_match_and_summary_parsers_enforce_exact_contracts():
+    match = retention.parse_match_verdict(
+        f"```json\n{json.dumps(_match_response('match-0001'))}\n```",
+        "match-0001",
+    )
+    assert match["verdict"] == "yes"
+    assert retention.parse_summary_verdict(json.dumps(_summary_response()))["summary_retention"] == "dropped"
+    with pytest.raises(ValueError, match="match_id mismatch"):
+        retention.parse_match_verdict(json.dumps(_match_response("match-0002")), "match-0001")
+    normalized = retention.parse_summary_verdict(json.dumps({**_summary_response(), "extra": True}))
+    assert set(normalized) == {"summary_retention", "summary_rationale"}
+    with pytest.raises(ValueError, match="missing required"):
+        retention.parse_summary_verdict(json.dumps({"summary_retention": "dropped"}))
 
 
 @pytest.mark.unit
-def test_early_retrieval_requires_every_gold_part_to_be_semantically_confirmed():
-    response = _judge_response(["evidence-001", "evidence-002"])
-    response["evidence_assessments"][1]["verdict"] = "no"
-    contract = {
-        "evidence_gold_parts": {"evidence-001": ["alpha"], "evidence-002": ["beta"]},
-        "required_gold_parts": ["alpha", "beta"],
+def test_one_response_is_judged_independently_for_each_gold_part():
+    samples = [
+        _sample(
+            0,
+            0,
+            2,
+            response="<tool_response>Alpha and Beta occur here.</tool_response>",
+            summary="No answer.",
+        ),
+        _sample(0, 1, 2),
+    ]
+    candidate = retention.build_candidates(samples, [_rollout_row(0)], point="base")[0][0]
+    match_judgments = {
+        task["match_id"]: {
+            "verdict": _match_response(task["match_id"], "yes" if task["gold_part"] == "alpha" else "no")
+        }
+        for task in candidate["semantic_match_tasks"]
     }
 
-    verdict = retention.parse_verdict(json.dumps(response), ["evidence-001", "evidence-002"], **contract)
+    verdict = retention.aggregate_candidate_verdict(
+        candidate,
+        match_judgments=match_judgments,
+        summary_judgment=None,
+    )
+
     assert verdict["early_retrieval"] == "no"
+    assert verdict["summary_retention"] == retention.SUMMARY_NOT_JUDGED
+    beta_task = next(task for task in candidate["semantic_match_tasks"] if task["gold_part"] == "beta")
+    match_judgments[beta_task["match_id"]]["verdict"] = _match_response(beta_task["match_id"], "unclear")
+    assert retention.aggregate_candidate_verdict(
+        candidate, match_judgments=match_judgments, summary_judgment=None
+    )["early_retrieval"] == "unclear"
 
-    response["evidence_assessments"][1]["verdict"] = "unclear"
-    verdict = retention.parse_verdict(json.dumps(response), ["evidence-001", "evidence-002"], **contract)
-    assert verdict["early_retrieval"] == "unclear"
 
-    response["evidence_assessments"][1]["verdict"] = "yes"
-    verdict = retention.parse_verdict(json.dumps(response), ["evidence-001", "evidence-002"], **contract)
+@pytest.mark.unit
+def test_semantic_parts_from_different_sub_trajectories_are_combined():
+    samples = [
+        _sample(0, 0, 3, response="<tool_response>First Alpha context.</tool_response>"),
+        _sample(0, 1, 3, response="<tool_response>Second Beta context.</tool_response>", summary="No answer."),
+        _sample(0, 2, 3),
+    ]
+    candidate = retention.build_candidates(samples, [_rollout_row(0)], point="base")[0][0]
+    evidence = {record["evidence_id"]: record for record in candidate["matching_tool_responses"]}
+    match_judgments = {}
+    for task in candidate["semantic_match_tasks"]:
+        is_first = "First" in evidence[task["evidence_id"]]["content"]
+        yes = (is_first and task["gold_part"] == "alpha") or (not is_first and task["gold_part"] == "beta")
+        match_judgments[task["match_id"]] = {
+            "verdict": _match_response(task["match_id"], "yes" if yes else "no")
+        }
+
+    verdict = retention.aggregate_candidate_verdict(
+        candidate,
+        match_judgments=match_judgments,
+        summary_judgment=None,
+        require_summary=False,
+    )
+
+    assert {part["verdict"] for part in verdict["part_assessments"]} == {"yes"}
     assert verdict["early_retrieval"] == "yes"
+    assert verdict["individually_confirmed_sub_traj_indices"] == []
 
 
 @pytest.mark.unit
 def test_judge_stage_is_resumable_and_report_formula_is_deterministic(tmp_path):
-    candidate = {
-        "schema_version": retention.SCHEMA_VERSION,
-        "prefilter_version": retention.PREFILTER_VERSION,
-        "candidate_id": "base:0",
-        "point": "base",
-        "rollout_id": 0,
-        "query_id": "q0",
-        "question": "Question",
-        "gold_answer": "Alpha",
-        "gold_parts": ["alpha"],
-        "final_answer": "Gamma",
-        "n_sub_trajs": 2,
-        "matching_tool_responses": [
-            {
-                "evidence_id": "evidence-001",
-                "tool": "search",
-                "docid": "1",
-                "matched_gold_parts": ["alpha"],
-                "content": "the answer is alpha",
-                "occurrences": [{"sub_traj_index": 0, "tool_response_index": 0}],
-            }
-        ],
-        "final_handover": {
-            "sub_traj_index": 0,
-            "outcome": "compressed",
-            "summary_source": "extracted",
-            "summary": "No answer yet.",
-        },
-    }
+    candidate = _staged_candidate()
     candidates_path = tmp_path / "candidates.jsonl"
     retention._write_jsonl(candidates_path, [candidate])
     retention._write_jsonl(
@@ -387,8 +456,15 @@ def test_judge_stage_is_resumable_and_report_formula_is_deterministic(tmp_path):
             "n_incorrect": 1,
             "n_judge_failures_excluded": 0,
             "n_model_failures": 1,
+            "n_failures_with_gold_docs": 1,
+            "n_failures_retrieved_gold_doc": 1,
+            "n_failures_opened_gold_doc": 0,
+            "n_failures_with_evidence_docs": 1,
+            "n_failures_retrieved_evidence_doc": 1,
+            "n_failures_opened_evidence_doc": 0,
             "n_compressed_model_failures": 1,
             "n_prefilter_candidates": 1,
+            "n_semantic_match_tasks": 1,
         },
     }
     retention._write_json(tmp_path / "stage_manifest.json", stage_manifest)
@@ -397,7 +473,10 @@ def test_judge_stage_is_resumable_and_report_formula_is_deterministic(tmp_path):
 
     async def fake_call(messages, model):
         calls.append((messages, model))
-        return json.dumps(_judge_response(["evidence-001"]))
+        if messages[0]["content"] == retention.MATCH_JUDGE_INSTRUCTIONS:
+            payload = json.loads(messages[1]["content"].split("MATCH:\n", 1)[1])
+            return json.dumps(_match_response(payload["match_id"]))
+        return json.dumps(_summary_response())
 
     asyncio.run(
         retention.judge_stage(
@@ -412,12 +491,15 @@ def test_judge_stage_is_resumable_and_report_formula_is_deterministic(tmp_path):
             call_model=fake_call,
         )
     )
-    assert len(calls) == 1
-    assert "do NOT require" in calls[0][0][0]["content"]
-    assert "different wrong" in calls[0][0][0]["content"]
-    assert "Do not use distorted when the gold" in calls[0][0][0]["content"]
-    assert "answer is entirely absent" in calls[0][0][0]["content"]
-    assert "matching_tool_responses" in calls[0][0][1]["content"]
+    assert len(calls) == 2
+    assert "Do not solve the question" in calls[0][0][0]["content"]
+    assert "matching_tool_response" in calls[0][0][1]["content"]
+    assert "earlier retrieval evidence" in calls[1][0][0]["content"]
+    assert "matching_tool_response" not in calls[1][0][1]["content"]
+    assert "question" not in calls[1][0][1]["content"]
+    assert "final_handover_summary" in calls[1][0][1]["content"]
+    assert len(retention._load_jsonl(tmp_path / "match_judgments.jsonl")) == 1
+    assert len(retention._load_jsonl(tmp_path / "summary_judgments.jsonl")) == 1
     assert "raw_response" not in retention._load_jsonl(tmp_path / "judgments.jsonl")[0]
 
     # A compatible rerun consumes the completed judgment without another API call.
@@ -434,7 +516,7 @@ def test_judge_stage_is_resumable_and_report_formula_is_deterministic(tmp_path):
             call_model=fake_call,
         )
     )
-    assert len(calls) == 1
+    assert len(calls) == 2
 
     with pytest.raises(ValueError, match="incompatible"):
         asyncio.run(
@@ -464,37 +546,94 @@ def test_judge_stage_is_resumable_and_report_formula_is_deterministic(tmp_path):
     assert (output / "summary_retention_report.md").is_file()
     assert (output / "summary_retention_metrics.csv").is_file()
 
+    comparison_output = tmp_path / "comparison"
+    comparison = retention.build_model_comparison(
+        [tmp_path],
+        [tmp_path],
+        comparison_output,
+        model_a_name="Judge A",
+        model_b_name="Judge B",
+    )
+    assert comparison["overall_agreement"]["match_pair_agreement_rate"] == 1.0
+    assert comparison["overall_agreement"]["early_retrieval_agreement_rate"] == 1.0
+    assert comparison["overall_agreement"]["summary_agreement_rate"] == 1.0
+    assert (comparison_output / "summary_retention_model_comparison.md").is_file()
+
+    summary_path = tmp_path / "summary_judgments.jsonl"
+    summary_rows = retention._load_jsonl(summary_path)
+    summary_rows[0]["verdict"] = _summary_response("carried")
+    retention._write_jsonl(summary_path, summary_rows)
+    with pytest.raises(ValueError, match="derived verdict does not match pair-level artifacts"):
+        retention.build_model_comparison(
+            [tmp_path],
+            [tmp_path],
+            comparison_output,
+            model_a_name="Judge A",
+            model_b_name="Judge B",
+        )
+
+
+@pytest.mark.unit
+def test_model_comparison_handles_empty_judgment_denominators(tmp_path):
+    analysis_dir = tmp_path / "empty"
+    analysis_dir.mkdir()
+    stage_counts = {
+        "n_rollouts": 1,
+        "n_model_failures": 0,
+        "n_prefilter_candidates": 0,
+        "n_semantic_match_tasks": 0,
+    }
+    retention._write_json(
+        analysis_dir / "stage_manifest.json",
+        {
+            "schema_version": retention.SCHEMA_VERSION,
+            "prefilter_version": retention.PREFILTER_VERSION,
+            "point": "base",
+            "counts": stage_counts,
+        },
+    )
+    retention._write_json(
+        analysis_dir / "judge_manifest.json",
+        {
+            "schema_version": retention.SCHEMA_VERSION,
+            "judge_protocol_version": retention.JUDGE_PROTOCOL_VERSION,
+            "judge_model": "judge-v1",
+            "point": "base",
+            "keep_raw_responses": False,
+        },
+    )
+    retention._write_json(analysis_dir / "_STAGED", {"status": "ok"})
+    retention._write_json(analysis_dir / "_JUDGED", {"status": "ok"})
+    for name in (
+        "candidates.jsonl",
+        "failure_retrieval.jsonl",
+        "match_judgments.jsonl",
+        "summary_judgments.jsonl",
+        "judgments.jsonl",
+    ):
+        retention._write_jsonl(analysis_dir / name, [])
+
+    comparison = retention.build_model_comparison(
+        [analysis_dir],
+        [analysis_dir],
+        tmp_path / "comparison",
+        model_a_name="Judge A",
+        model_b_name="Judge B",
+    )
+
+    assert comparison["overall_agreement"]["match_pair_agreement_rate"] is None
+    assert comparison["overall_agreement"]["early_retrieval_agreement_rate"] is None
+    assert comparison["overall_agreement"]["summary_agreement_rate"] is None
+    report = (tmp_path / "comparison" / "summary_retention_model_comparison.md").read_text()
+    assert "N/A" in report
+
 
 @pytest.mark.unit
 def test_judge_canary_limits_new_candidates_and_remains_resumable(tmp_path):
-    candidates = []
-    for rollout_id in range(2):
-        candidates.append(
-            {
-                "schema_version": retention.SCHEMA_VERSION,
-                "prefilter_version": retention.PREFILTER_VERSION,
-                "candidate_id": f"base:{rollout_id}",
-                "point": "base",
-                "rollout_id": rollout_id,
-                "query_id": f"q{rollout_id}",
-                "question": "Question",
-                "gold_answer": "Alpha",
-                "gold_parts": ["alpha"],
-                "final_answer": "Gamma",
-                "n_sub_trajs": 2,
-                "matching_tool_responses": [
-                    {
-                        "evidence_id": "evidence-001",
-                        "tool": "search",
-                        "docid": "1",
-                        "matched_gold_parts": ["alpha"],
-                        "content": "alpha occurs in an unrelated context",
-                        "occurrences": [{"sub_traj_index": 0, "tool_response_index": 0}],
-                    }
-                ],
-                "final_handover": {"summary": "No answer."},
-            }
-        )
+    candidates = [
+        _staged_candidate(rollout_id, content="Alpha occurs in an unrelated context.")
+        for rollout_id in range(2)
+    ]
     retention._write_jsonl(tmp_path / "candidates.jsonl", candidates)
     retention._write_json(
         tmp_path / "stage_manifest.json",
@@ -502,13 +641,14 @@ def test_judge_canary_limits_new_candidates_and_remains_resumable(tmp_path):
             "schema_version": retention.SCHEMA_VERSION,
             "prefilter_version": retention.PREFILTER_VERSION,
             "point": "base",
-            "counts": {"n_prefilter_candidates": 2},
+            "counts": {"n_prefilter_candidates": 2, "n_semantic_match_tasks": 2},
         },
     )
     retention._write_json(tmp_path / "_STAGED", {"status": "ok"})
 
     async def fake_call(messages, model):
-        return json.dumps(_judge_response(["evidence-001"], evidence_verdict="no"))
+        payload = json.loads(messages[1]["content"].split("MATCH:\n", 1)[1])
+        return json.dumps(_match_response(payload["match_id"], "no"))
 
     first = asyncio.run(
         retention.judge_stage(
@@ -550,36 +690,21 @@ def test_judge_canary_limits_new_candidates_and_remains_resumable(tmp_path):
 
 
 @pytest.mark.unit
-def test_large_candidate_batches_evidence_and_merges_one_judgment():
-    evidence = [
-        {
-            "evidence_id": f"evidence-{index:03d}",
-            "matched_gold_parts": ["alpha"],
-            "content": f"Alpha context {index}",
-        }
-        for index in range(1, 42)
-    ]
-    candidate = {
-        "candidate_id": "base:0",
-        "point": "base",
-        "rollout_id": 0,
-        "question": "Question",
-        "gold_answer": "Alpha",
-        "gold_parts": ["alpha"],
-        "matching_tool_responses": evidence,
-        "final_handover": {"summary": "No answer."},
-    }
+def test_match_judge_receives_one_part_and_the_complete_response():
+    content = "Alpha " + "context " * 2_000
+    candidate = _staged_candidate(content=content)
     calls = []
 
     async def fake_call(messages, model):
-        payload = json.loads(messages[1]["content"].split("CANDIDATE:\n", 1)[1])
-        ids = [record["evidence_id"] for record in payload["matching_tool_responses"]]
-        calls.append(ids)
-        return json.dumps(_judge_response(ids))
+        payload = json.loads(messages[1]["content"].split("MATCH:\n", 1)[1])
+        calls.append(payload)
+        return json.dumps(_match_response(payload["match_id"]))
 
     judgment = asyncio.run(
-        retention.judge_candidate(
+        retention.judge_match(
             candidate,
+            candidate["semantic_match_tasks"][0],
+            candidate["matching_tool_responses"][0],
             model="judge-v1",
             call_model=fake_call,
             max_retries=1,
@@ -587,12 +712,10 @@ def test_large_candidate_batches_evidence_and_merges_one_judgment():
         )
     )
 
-    assert [len(batch) for batch in calls] == [16, 16, 9]
-    assert judgment["request_batches"] == 3
-    assert judgment["attempts"] == 3
-    assert len(judgment["verdict"]["evidence_assessments"]) == 41
-    assert judgment["verdict"]["early_retrieval"] == "yes"
-    assert judgment["verdict"]["summary_retention"] == "dropped"
+    assert len(calls) == 1
+    assert calls[0]["gold_part"] == "alpha"
+    assert calls[0]["matching_tool_response"]["content"] == content
+    assert judgment["verdict"]["verdict"] == "yes"
 
 
 @pytest.mark.unit

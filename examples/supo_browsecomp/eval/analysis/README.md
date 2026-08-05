@@ -33,8 +33,8 @@ directly reads that completed point. The pre-filter selects only:
 
 1. strict model failures (`correct == false` and `judge_failed == false`),
 2. rollouts with at least two sub-trajectories, and
-3. rollouts where every normalized gold-answer part occurs in the tool
-   observations of at least one non-final sub-trajectory.
+3. rollouts where every normalized gold-answer part occurs somewhere across the
+   tool observations of non-final sub-trajectories.
 
 Gold parts are derived from `<qN>` answer fields when present, otherwise from a
 lenient comma/semicolon/`and` split. The match is deliberately high recall. It
@@ -50,7 +50,7 @@ Outputs:
   all filter counts.
 - `_STAGED`: completion marker written last.
 
-### 2. Judge every candidate
+### 2. Judge matches, then summaries
 
 ```bash
 export LLAMA_API_KEY=...
@@ -61,7 +61,7 @@ python examples/supo_browsecomp/eval/analysis/summary_retention.py judge \
   --concurrency 8
 ```
 
-For a judge sanity check, limit only the number of new judgments added by this
+For a judge sanity check, limit only the number of new candidates processed by this
 invocation:
 
 ```bash
@@ -71,52 +71,55 @@ python examples/supo_browsecomp/eval/analysis/summary_retention.py judge \
   --keep-raw-responses
 ```
 
-This leaves the analysis incomplete without `_JUDGED`. A later invocation
-resumes the remaining candidate IDs; remove the limit to finish the point.
+This leaves the analysis incomplete without `_JUDGED`. A later invocation resumes
+at the individual match or summary boundary; remove the limit to finish the point.
 
-Each candidate normally uses one request. Candidates with more than 40 evidence
-records are split into batches of 16; evidence verdicts are merged by stable ID,
-and the independently repeated summary label uses the unique batch majority.
 Search responses are split into individual matching document blocks; matching
-opened pages retain broader context. Repeated `(tool, docid)` evidence is
-deduplicated while preserving all occurrence locations and search queries. Every
-retained response has a stable `evidence_id` within its candidate. Its `content`
-is the complete response unit returned by the tool; the analysis does not apply
-a second length cap.
+opened pages retain broader context. Only byte-identical response units for the
+same tool/document are deduplicated, while all occurrence locations and search
+queries are preserved. Every response has a stable `evidence_id`. Every lexical
+`(gold_part, evidence_id)` pair has a stable `match_id`, including multiple parts
+matched by the same response. The response's `content` is the complete tool-returned
+unit; there is no second length cap.
 
-The judge performs only two tasks:
+Judging uses two separate prompts and API calls:
 
-1. For each `evidence_id`, decide whether the matched word, value, or fact has
-   the meaning intended by the gold answer: `yes`, `no`, or `unclear`.
-2. Label the final handover summary as `carried`, `dropped`, `distorted`, or
+1. Each `match_id` is judged independently as `yes`, `no`, or `unclear`. The
+   judge receives one gold part and one full matching response. It decides only
+   whether that occurrence has the part's intended semantic identity/value/role.
+2. Only after early retrieval is confirmed, a separate judge sees only the gold
+   answer and final handover and labels it `carried`, `dropped`, `distorted`, or
    `unclear`.
 
 `Dropped` means the gold answer itself is absent, even if the summary asserts a
 different wrong answer or retains related clues. `Distorted` is reserved for a
 recognizable gold answer that remains present but has been materially corrupted,
-partially lost, explicitly rejected, or assigned the wrong role. A clearly named
-usable gold candidate is `carried` even if the summary prefers another candidate.
+partially lost, or explicitly rejected. A clearly named usable gold candidate is
+`carried` even if the summary prefers another candidate.
 
-The code derives candidate-level `early_retrieval` by gold part. Every gold part
-must have at least one evidence-level `yes` for the aggregate to be `yes`; an
-unconfirmed part with an `unclear` match produces `unclear`, and a part with only
-`no` matches produces `no`. The judge does not classify source type, decide
-whether the evidence fully solves the question, or infer whether summary loss
-caused the final answer error. In particular, the gold answer is the reference identity: the
-judge must not independently solve the question, challenge the gold label, or
-require one matching response or all matching responses together to prove every
-clue. Other supplied matching responses are context for disambiguation only;
-search queries are not treated as factual evidence.
+The code derives candidate-level `early_retrieval` deterministically across all
+non-final sub-trajectories. Every required gold part must have at least one semantic
+`yes`, but those confirmations may come from different sub-trajectories. If every
+part has `yes|unclear` and at least one lacks `yes`, the aggregate is `unclear`;
+otherwise it is `no`.
 
-The command validates the exact schema and cross-field constraints, retries
-invalid responses, and atomically checkpoints completed judgments. Rerunning
-with the same candidate IDs, judge model, and protocol resumes missing
-candidates. A changed judge contract is rejected. Raw API responses are omitted
-by default; pass `--keep-raw-responses` only when debugging the judge.
+The match judge does not decide whether one response proves the whole question or
+whether retrieval caused the final error. The gold is authoritative; the question
+only identifies the part's semantic role. Search queries are retrieval metadata,
+not factual evidence. The summary judge receives no retrieval responses, so it
+cannot revise the early-retrieval decision or condition retention on evidence quality.
+
+The command validates the exact schema and cross-field constraints, retries invalid
+responses, and atomically checkpoints completed pair and summary judgments. Rerunning
+with the same staged data, judge model, and protocol resumes missing work. A changed
+judge contract is rejected. Raw API responses are omitted by default; pass
+`--keep-raw-responses` only when debugging.
 
 Outputs:
 
-- `judgments.jsonl`: structured verdict, provenance, and optional raw judge response.
+- `match_judgments.jsonl`: one resumable semantic verdict per `match_id`.
+- `summary_judgments.jsonl`: one resumable retention verdict per confirmed candidate.
+- `judgments.jsonl`: compact candidate verdict deterministically derived from the two files above.
 - `judge_manifest.json`: model, protocol version, and candidate/judgment counts.
 - `_JUDGED`: completion marker written only after one-to-one coverage.
 
@@ -130,8 +133,8 @@ python examples/supo_browsecomp/eval/analysis/summary_retention.py report \
   --output-dir /path/to/run/summary_retention_report
 ```
 
-All points must use the same pre-filter version, judge protocol, and judge
-model. Candidate and judgment IDs must match exactly.
+All points must use the same pre-filter version, judge protocol, and judge model.
+Candidate, match, summary, and derived-judgment coverage must match exactly.
 
 The primary metric is:
 
@@ -191,15 +194,37 @@ sub-trajectory, and answer-surface normalization misses.
 Outputs are `summary_retention_report.md`, `summary_retention_metrics.csv`,
 `summary_retention_metrics.json`, and `_SUMMARY_RETENTION_SUCCESS`.
 
+### 4. Compare two judge models
+
+After both model-specific reports complete, the `compare` command validates that
+they used identical staged candidates and match IDs, then reports pair-level,
+candidate-level, and summary-label agreement alongside both metric tables:
+
+```bash
+python examples/supo_browsecomp/eval/analysis/summary_retention.py compare \
+  --model-a-name GPT-5.4 \
+  --model-b-name Claude-4.8-Opus \
+  --model-a-analysis-dir /path/to/gpt/base \
+  --model-a-analysis-dir /path/to/gpt/iter04 \
+  --model-b-analysis-dir /path/to/opus/base \
+  --model-b-analysis-dir /path/to/opus/iter04 \
+  --output-dir /path/to/comparison
+```
+
+Repeat each analysis-dir option for every checkpoint. Outputs are
+`summary_retention_model_comparison.md`, its machine-readable JSON equivalent,
+and `_SUMMARY_RETENTION_COMPARISON_SUCCESS`. Summary-label agreement is computed
+only on candidates both judges confirmed as early retrieval; the report does not
+silently merge disagreements into a third label.
+
 ## Storage
 
-The analysis never copies `eval_0.pt` or full trajectories. It writes only
-matching search-document/open-page evidence, the final handover summary,
-compact structured verdicts, manifests, and aggregate reports. Matching
-response units keep their complete tool-returned content; non-matching tool
-responses and model reasoning are not copied. Raw judge responses are off by
-default. In practice these artifacts are usually only a few megabytes, while
-the existing raw rollout dump remains the dominant storage cost.
+The analysis never copies `eval_0.pt` or full trajectories. It writes each matching
+search-document/open-page response once in `candidates.jsonl`, plus the final handover,
+short pair/summary verdicts, manifests, and reports. Pair-level checkpoints do not
+duplicate tool-response content. Non-matching responses and model reasoning are not
+copied, and raw API responses are off by default. The existing raw rollout dump remains
+the dominant storage cost.
 
 ## Interpretation limits
 
