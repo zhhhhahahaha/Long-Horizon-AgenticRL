@@ -87,7 +87,11 @@
         {'test_file': 'test_bcplus_eval_pipeline.py', 'num_gpus': 0},
         {'test_file': 'test_bcplus_eval_watch.py', 'num_gpus': 0},
         {'test_file': 'test_bcplus_deepdive.py', 'num_gpus': 0},
-        {'test_file': 'test_bcplus_experiment_viewer.py', 'num_gpus': 0},
+        {
+          'test_file': 'test_bcplus_experiment_viewer.py',
+          'num_gpus': 0,
+          'extra_pip_dep': 'pyarrow',
+        },
         {'test_file': 'test_mast_wandb_online_smoke.py', 'num_gpus': 0},
         {'test_file': 'test_checkpoint_rotation.py', 'num_gpus': 0},
         {'test_file': 'test_checkpoint_slim.py', 'num_gpus': 0},
@@ -191,6 +195,10 @@ jobs:
         run: |
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install pytest numpy packaging pyyaml omegaconf tqdm httpx requests ray pybase64 pylatexenc sympy aiohttp pillow safetensors psutil
+          EXTRA_PIP_DEP="${{ matrix.info.extra_pip_dep || '' }}"
+          if [[ -n "${EXTRA_PIP_DEP}" ]]; then
+            pip install "${EXTRA_PIP_DEP}"
+          fi
 <% if config.get('extra_pip_deps') %>
           pip install << config.extra_pip_deps >>
 <% endif %>
